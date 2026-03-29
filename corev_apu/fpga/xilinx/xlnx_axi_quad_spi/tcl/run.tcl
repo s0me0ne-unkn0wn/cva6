@@ -12,5 +12,5 @@ set_property -dict [list CONFIG.C_USE_STARTUP {0} CONFIG.C_SCK_RATIO {4} CONFIG.
 generate_target {instantiation_template} [get_files ./$ipName.srcs/sources_1/ip/$ipName/$ipName.xci]
 generate_target all [get_files  ./$ipName.srcs/sources_1/ip/$ipName/$ipName.xci]
 create_ip_run [get_files -of_objects [get_fileset sources_1] ./$ipName.srcs/sources_1/ip/$ipName/$ipName.xci]
-launch_run -jobs 8 ${ipName}_synth_1
+launch_run -jobs 24 ${ipName}_synth_1
 wait_on_run ${ipName}_synth_1
