@@ -64,6 +64,8 @@ package config_pkg;
     int unsigned                 XLEN;
     // Virtual address Size (in bits)
     int unsigned                 VLEN;
+    // RV32E/RV64E base ISA - reduced register file (16 GPRs instead of 32)
+    bit                          RVE;
     // Atomic RISC-V extension
     bit                          RVA;
     // Bit manipulation RISC-V extension
@@ -297,6 +299,7 @@ package config_pkg;
     int unsigned AxiUserWidth;
     int unsigned MEM_TID_WIDTH;
     int unsigned NrLoadBufEntries;
+    bit          RVE;
     bit          RVF;
     bit          RVD;
     bit          XF16;
