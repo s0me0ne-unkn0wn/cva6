@@ -42,7 +42,7 @@ module ariane_regfile #(
     input  logic [CVA6Cfg.NrCommitPorts-1:0]                 we_i
 );
 
-  localparam ADDR_WIDTH = 5;
+  localparam ADDR_WIDTH = CVA6Cfg.RVE ? 4 : 5;
   localparam NUM_WORDS = 2 ** ADDR_WIDTH;
 
   logic [            NUM_WORDS-1:0][DATA_WIDTH-1:0] mem;
@@ -77,7 +77,7 @@ module ariane_regfile #(
   end
 
   for (genvar i = 0; i < NR_READ_PORTS; i++) begin
-    assign rdata_o[i] = mem[raddr_i[i]];
+    assign rdata_o[i] = mem[raddr_i[i][ADDR_WIDTH-1:0]];
   end
 
 endmodule

@@ -80,7 +80,7 @@ package cva6_config_pkg;
   localparam config_pkg::cva6_user_cfg_t cva6_cfg = '{
       XLEN: unsigned'(CVA6ConfigXlen),
       VLEN: unsigned'(64),
-      RVE: bit'(0),  // Phase 2: will set to 1
+      RVE: bit'(1),
       FpgaEn: bit'(0),
       FpgaAlteraEn: bit'(0),
       TechnoCut: bit'(0),
