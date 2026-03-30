@@ -390,6 +390,16 @@ module alu
         default: ;  // default case to suppress unique warning
       endcase
     end
+    // Xtheadcondmov: conditional move using old rd value (via imm field)
+    if (CVA6Cfg.XtheadCondMov) begin
+      unique case (fu_data_i.operation)
+        XHEAD_MVEQZ:
+        result_o = (|operand_b) ? fu_data_i.imm : operand_a;  // if rs2==0: rd=rs1, else rd unchanged
+        XHEAD_MVNEZ:
+        result_o = (|operand_b) ? operand_a : fu_data_i.imm;  // if rs2!=0: rd=rs1, else rd unchanged
+        default: ;
+      endcase
+    end
     // ZKN instructions
     if (CVA6Cfg.ZKN && CVA6Cfg.RVB) begin
       unique case (fu_data_i.operation)

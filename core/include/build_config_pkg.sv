@@ -4,7 +4,7 @@ package build_config_pkg;
     bit IS_XLEN32 = (CVA6Cfg.XLEN == 32) ? 1'b1 : 1'b0;
     bit IS_XLEN64 = (CVA6Cfg.XLEN == 32) ? 1'b0 : 1'b1;
     bit FpPresent = CVA6Cfg.RVF | CVA6Cfg.RVD | CVA6Cfg.XF16 | CVA6Cfg.XF16ALT | CVA6Cfg.XF8;
-    bit NSX = CVA6Cfg.XF16 | CVA6Cfg.XF16ALT | CVA6Cfg.XF8 | CVA6Cfg.XFVec;  // Are non-standard extensions present?
+    bit NSX = CVA6Cfg.XF16 | CVA6Cfg.XF16ALT | CVA6Cfg.XF8 | CVA6Cfg.XFVec | CVA6Cfg.XtheadCondMov;  // Are non-standard extensions present?
     int unsigned FLen = CVA6Cfg.RVD ? 64 :  // D ext.
     CVA6Cfg.RVF ? 32 :  // F ext.
     CVA6Cfg.XF16 ? 16 :  // Xf16 ext.
@@ -80,6 +80,7 @@ package build_config_pkg;
     cfg.CvxifEn = CVA6Cfg.CvxifEn;
     cfg.CoproType = CVA6Cfg.CoproType;
     cfg.RVZiCond = CVA6Cfg.RVZiCond;
+    cfg.XtheadCondMov = CVA6Cfg.XtheadCondMov;
     cfg.RVZiCbom = CVA6Cfg.RVZiCbom;
     cfg.RVZicntr = CVA6Cfg.RVZicntr;
     cfg.RVZihpm = CVA6Cfg.RVZihpm;
@@ -94,8 +95,8 @@ package build_config_pkg;
     cfg.XF16ALTVec = bit'(XF16ALTVec);
     cfg.XF8Vec = bit'(XF8Vec);
     // Can take 2 or 3 in single issue. 4 or 6 in dual issue.
-    cfg.NrRgprPorts = unsigned'(CVA6Cfg.SuperscalarEn ? 4 : 2);
-    // cfg.NrRgprPorts = unsigned'(CVA6Cfg.SuperscalarEn ? 6 : 3);
+    // 3 read ports needed when XtheadCondMov is enabled (rd old value as 3rd operand)
+    cfg.NrRgprPorts = unsigned'(CVA6Cfg.SuperscalarEn ? (CVA6Cfg.XtheadCondMov ? 6 : 4) : (CVA6Cfg.XtheadCondMov ? 3 : 2));
     cfg.NrWbPorts = unsigned'(NrWbPorts);
     cfg.EnableAccelerator = bit'(EnableAccelerator);
     cfg.PerfCounterEn = CVA6Cfg.PerfCounterEn;

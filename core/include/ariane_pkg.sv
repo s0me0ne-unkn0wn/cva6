@@ -496,6 +496,9 @@ package ariane_pkg;
     // Zicond instruction
     CZERO_EQZ,
     CZERO_NEZ,
+    // Xtheadcondmov instructions
+    XHEAD_MVEQZ,
+    XHEAD_MVNEZ,
     // Pack instructions
     PACK,
     PACK_H,

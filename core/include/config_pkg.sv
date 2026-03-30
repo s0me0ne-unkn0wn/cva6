@@ -86,6 +86,8 @@ package config_pkg;
     bit                          RVZCMT;
     // Zicond RISC-V extension
     bit                          RVZiCond;
+    // T-Head conditional move extension (th.mveqz / th.mvnez)
+    bit                          XtheadCondMov;
     // Zicbom RISC-V extension (cache management / CBO)
     bit                          RVZiCbom;
     // Zicntr RISC-V extension
@@ -318,6 +320,7 @@ package config_pkg;
     bit          CvxifEn;
     copro_type_t CoproType;
     bit          RVZiCond;
+    bit          XtheadCondMov;
     bit          RVZiCbom;
     bit          RVZicntr;
     bit          RVZihpm;

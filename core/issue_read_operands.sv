@@ -188,7 +188,7 @@ module issue_read_operands
   logic [ CVA6Cfg.NrIssuePorts-1:0]                                rs3_raw_check;
   logic [ CVA6Cfg.NrIssuePorts-1:0]                                rs3_has_raw;
   logic [ CVA6Cfg.NrIssuePorts-1:0]                                rs3_fpr;
-  logic [ CVA6Cfg.NrIssuePorts-1:0]                                rs3_gpr_cvxif;
+  logic [ CVA6Cfg.NrIssuePorts-1:0]                                rs3_gpr;
 
 
   logic [CVA6Cfg.NR_SB_ENTRIES-1:0][ariane_pkg::REG_ADDR_SIZE-1:0] rd_list;
@@ -468,8 +468,10 @@ module issue_read_operands
     assign rs1_fpr[i] = (CVA6Cfg.FpPresent && ariane_pkg::is_rs1_fpr(issue_instr_i[i].op));
     assign rs2_fpr[i] = (CVA6Cfg.FpPresent && ariane_pkg::is_rs2_fpr(issue_instr_i[i].op));
     assign rs3_fpr[i] = (CVA6Cfg.FpPresent && ariane_pkg::is_imm_fpr(issue_instr_i[i].op));
-    assign rs3_gpr_cvxif[i] = CVA6Cfg.CvxifEn && (OPERANDS_PER_INSTR == 3)
-        && issue_instr_i[i].op == OFFLOAD;
+    assign rs3_gpr[i] = (OPERANDS_PER_INSTR == 3)
+        && ((CVA6Cfg.CvxifEn && issue_instr_i[i].op == OFFLOAD)
+         || (CVA6Cfg.XtheadCondMov && (issue_instr_i[i].op == ariane_pkg::XHEAD_MVEQZ
+                                    || issue_instr_i[i].op == ariane_pkg::XHEAD_MVNEZ)));
   end
 
   // ----------------------------------
@@ -527,7 +529,7 @@ module issue_read_operands
         .idx_o(idx_hzd_rs3[i]),
         .valid_o(rs3_raw_check[i])
     );
-    assign rs3_has_raw[i] = rs3_raw_check[i] && (rs3_fpr[i] || rs3_gpr_cvxif[i]);
+    assign rs3_has_raw[i] = rs3_raw_check[i] && (rs3_fpr[i] || rs3_gpr[i]);
   end
 
   // ----------------------------------
@@ -580,7 +582,7 @@ module issue_read_operands
     // operand forwarding signals
     forward_rs1 = '0;
     forward_rs2 = '0;
-    forward_rs3 = '0;  // FPR and CV-X-IF only
+    forward_rs3 = '0;  // FPR, CV-X-IF, and XtheadCondMov
 
     for (int unsigned i = 0; i < CVA6Cfg.NrIssuePorts; i++) begin
       if (rs1_has_raw[i]) begin
@@ -655,13 +657,14 @@ module issue_read_operands
         end
       end
 
-      // Only check clobbered gpr for OFFLOADED instruction
+      // Only check clobbered gpr for OFFLOADED/XtheadCondMov instruction
       if ((CVA6Cfg.FpPresent && is_imm_fpr(
               issue_instr_i[1].op
           )) ? is_rd_fpr(
               issue_instr_i[0].op
           ) && issue_instr_i[0].rd == issue_instr_i[1].result[REG_ADDR_SIZE-1:0] :
-              issue_instr_i[1].op == OFFLOAD && OPERANDS_PER_INSTR == 3 ?
+              (issue_instr_i[1].op == OFFLOAD || issue_instr_i[1].op == ariane_pkg::XHEAD_MVEQZ
+               || issue_instr_i[1].op == ariane_pkg::XHEAD_MVNEZ) && OPERANDS_PER_INSTR == 3 ?
               issue_instr_i[0].rd == issue_instr_i[1].result[REG_ADDR_SIZE-1:0] : 1'b0) begin
         stall_raw[1] = 1'b1;
       end
@@ -689,7 +692,9 @@ module issue_read_operands
       if (OPERANDS_PER_INSTR == 3) begin
         fu_data_n[i].imm = (CVA6Cfg.FpPresent && is_imm_fpr(issue_instr_i[i].op)) ?
             {{CVA6Cfg.XLEN - CVA6Cfg.FLen{1'b0}}, operand_c_regfile[i]} :
-            issue_instr_i[i].op == OFFLOAD ? operand_c_regfile[i] : issue_instr_i[i].result;
+            (issue_instr_i[i].op == OFFLOAD
+             || issue_instr_i[i].op == ariane_pkg::XHEAD_MVEQZ
+             || issue_instr_i[i].op == ariane_pkg::XHEAD_MVNEZ) ? operand_c_regfile[i] : issue_instr_i[i].result;
       end else begin
         fu_data_n[i].imm = (CVA6Cfg.FpPresent && is_imm_fpr(issue_instr_i[i].op)) ?
             {{CVA6Cfg.XLEN - CVA6Cfg.FLen{1'b0}}, operand_c_regfile[i]} : issue_instr_i[i].result;
@@ -708,7 +713,7 @@ module issue_read_operands
       if (forward_rs2[i]) begin
         fu_data_n[i].operand_b = rs2_res[i];
       end
-      if ((CVA6Cfg.FpPresent || (CVA6Cfg.CvxifEn && OPERANDS_PER_INSTR == 3)) && forward_rs3[i]) begin
+      if ((CVA6Cfg.FpPresent || ((CVA6Cfg.CvxifEn || CVA6Cfg.XtheadCondMov) && OPERANDS_PER_INSTR == 3)) && forward_rs3[i]) begin
         fu_data_n[i].imm = imm_forward_rs3[i];
       end
 
@@ -1106,11 +1111,11 @@ module issue_read_operands
 
   //pragma translate_off
   initial begin
-    assert (OPERANDS_PER_INSTR == 2 || (OPERANDS_PER_INSTR == 3 && CVA6Cfg.CvxifEn))
+    assert (OPERANDS_PER_INSTR == 2 || (OPERANDS_PER_INSTR == 3 && (CVA6Cfg.CvxifEn || CVA6Cfg.XtheadCondMov)))
     else
       $fatal(
           1,
-          "If CVXIF is enable, ariane regfile can have either 2 or 3 read ports. Else it has 2 read ports."
+          "Regfile can have 3 read ports when CVXIF or XtheadCondMov is enabled. Else it has 2 read ports."
       );
   end
 

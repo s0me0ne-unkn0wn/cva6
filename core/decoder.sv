@@ -1061,6 +1061,26 @@ module decoder
         end
 
         // --------------------------
+        // Xtheadcondmov (CUSTOM-0)
+        // --------------------------
+        riscv::OpcodeCustom0: begin
+          if (CVA6Cfg.XtheadCondMov) begin
+            instruction_o.fu  = ALU;
+            instruction_o.rs1 = instr.rtype.rs1;
+            instruction_o.rs2 = instr.rtype.rs2;
+            instruction_o.rd  = instr.rtype.rd;
+            imm_select        = MUX_RD_RS3;  // old rd value as 3rd operand
+            unique case ({instr.rtype.funct7, instr.rtype.funct3})
+              {7'b010_0000, 3'b001}: instruction_o.op = ariane_pkg::XHEAD_MVEQZ;  // th.mveqz
+              {7'b010_0001, 3'b001}: instruction_o.op = ariane_pkg::XHEAD_MVNEZ;  // th.mvnez
+              default: illegal_instr = 1'b1;
+            endcase
+          end else begin
+            illegal_instr = 1'b1;
+          end
+        end
+
+        // --------------------------
         // 32bit Reg-Reg Operations
         // --------------------------
         riscv::OpcodeOp32: begin
