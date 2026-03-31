@@ -62,6 +62,24 @@ extern "C" void read_section (long long address, const svOpenArrayHandle buffer)
     }
 }
 
+extern "C" void read_section_void (long long address, void* buffer, uint64_t size = 0) {
+    auto it = mems.find(address);
+    if (it == mems.end())
+        return;
+    size_t avail = it->second.size();
+    size_t len = (size == 0 || size > avail) ? avail : size;
+    memcpy(buffer, it->second.data(), len);
+}
+
+extern "C" char read_symbol (const char* symbol_name, long long* address) {
+    auto it = symbols.find(symbol_name);
+    if (it != symbols.end()) {
+        *address = it->second;
+        return 0;
+    }
+    return 1;
+}
+
 extern "C" void read_elf(const char* filename) {
     int fd = open(filename, O_RDONLY);
     struct stat s;
@@ -81,7 +99,6 @@ extern "C" void read_elf(const char* filename) {
 
 
     std::vector<uint8_t> zeros;
-    std::map<std::string, uint64_t> symbols;
 
     #define LOAD_ELF(ehdr_t, phdr_t, shdr_t, sym_t) do { \
     ehdr_t* eh = (ehdr_t*)buf; \
