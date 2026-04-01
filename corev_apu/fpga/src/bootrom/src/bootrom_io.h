@@ -12,7 +12,6 @@
 // Generic I/O
 
 #include "bootrom_types.h"
-#include <stdio.h>
 
 
 static inline u8_t readb(volatile u32_t addr)

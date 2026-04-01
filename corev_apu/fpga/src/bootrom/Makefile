@@ -32,7 +32,7 @@ SED = sed
 PLATFORM_DEFINES = -DCLOCK_FREQUENCY=$(CLOCK_FREQUENCY) -DUART_BITRATE=$(UART_BITRATE) -D$(PLATFORM)  -DXLEN=$(XLEN)
 
 ifeq ($(XLEN), 64)
-CFLAGS = $(PLATFORM_DEFINES) -Os -ggdb -march=rv64im_zicsr -mabi=lp64 -Wall -mcmodel=medany -mexplicit-relocs -ffreestanding
+CFLAGS = $(PLATFORM_DEFINES) -Os -ggdb -march=rv64emac_zicsr -mabi=lp64e -Wall -mcmodel=medany -mexplicit-relocs -ffreestanding
 else
 CFLAGS = $(PLATFORM_DEFINES) -O2 -ggdb  -march=rv32im_zicsr -mabi=ilp32 -W -Wall -mcmodel=medany -mexplicit-relocs -fno-builtin -ffreestanding
 endif
@@ -107,5 +107,18 @@ clean:
 
 all: $(MAIN) $(MAIN_BIN) $(MAIN_IMG) $(MAIN_SV)
 	@echo "zero stage bootloader has been compiled!"
+
+# PolkaVM minimal bootrom (RV64E, asm-only, no SD/UART)
+POLKAVM_ELF = bootrom_polkavm.elf
+POLKAVM_BIN = bootrom_polkavm.bin
+POLKAVM_IMG = bootrom_polkavm.img
+POLKAVM_SV  = bootrom_polkavm.sv
+POLKAVM_CFLAGS = -march=rv64emac -mabi=lp64e -DXLEN=64 -mcmodel=medany -mexplicit-relocs -nostdlib -static
+
+$(POLKAVM_ELF): $(DTB) startup_polkavm.S linker.lds
+	$(CC) $(POLKAVM_CFLAGS) $(INCLUDES) -Tlinker.lds startup_polkavm.S -o $@
+
+polkavm: $(POLKAVM_ELF) $(POLKAVM_BIN) $(POLKAVM_IMG) $(POLKAVM_SV)
+	@echo "PolkaVM RV64E bootrom compiled!"
 
 # DO NOT DELETE THIS LINE -- make depend needs it
