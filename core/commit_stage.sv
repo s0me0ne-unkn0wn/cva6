@@ -111,23 +111,12 @@ module commit_stage
   end
 
   assign pc_o = commit_instr_i[0].pc;
-  // Dirty the FP state if we are committing anything related to the FPU
-  always_comb begin : dirty_fp_state
-    dirty_fp_state_o = 1'b0;
-    for (int i = 0; i < CVA6Cfg.NrCommitPorts; i++) begin
-      dirty_fp_state_o |= commit_ack_o[i] & ((commit_instr_i[i].fu inside {FPU, FPU_VEC} & CVA6Cfg.FpPresent & ariane_pkg::fd_changes_rd_state(
-          commit_instr_i[i].op
-      )) || (CVA6Cfg.FpPresent && ariane_pkg::is_rd_fpr(
-          commit_instr_i[i].op
-          // Check if we issued a vector floating-point instruction to the accelerator
-      ))) | (commit_instr_i[i].fu == ACCEL && commit_instr_i[i].vfp);
-    end
-  end
+  // FP and accelerator not present - no dirty FP state
+  assign dirty_fp_state_o = 1'b0;
 
   assign commit_tran_id_o = commit_instr_i[0].trans_id;
 
   logic instr_0_is_amo;
-  logic [CVA6Cfg.NrCommitPorts-1:0] commit_macro_ack;
   assign instr_0_is_amo = is_amo(commit_instr_i[0].op);
   // -------------------
   // Commit Instruction
@@ -136,7 +125,6 @@ module commit_stage
   always_comb begin : commit
     // default assignments
     commit_ack_o[0] = 1'b0;
-    commit_macro_ack[0] = 1'b0;
 
     amo_valid_commit_o = 1'b0;
 
@@ -167,18 +155,9 @@ module commit_stage
       end else begin
         commit_ack_o[0] = 1'b1;
 
-        if (CVA6Cfg.RVZCMP && commit_instr_i[0].is_macro_instr && commit_instr_i[0].is_last_macro_instr)
-          commit_macro_ack[0] = 1'b1;
-        else commit_macro_ack[0] = 1'b0;
-
         if (!commit_drop_i[0]) begin
           // we can definitely write the register file
-          // if the instruction is not committing anything the destination
-          if (CVA6Cfg.FpPresent && ariane_pkg::is_rd_fpr(commit_instr_i[0].op)) begin
-            we_fpr_o[0] = 1'b1;
-          end else begin
-            we_gpr_o[0] = 1'b1;
-          end
+          we_gpr_o[0] = 1'b1;
         end
 
         // check whether the instruction we retire was a store
@@ -189,18 +168,6 @@ module commit_stage
             // stall in case the store buffer is not able to accept anymore instructions
           end else begin
             commit_ack_o[0] = 1'b0;
-          end
-        end
-        // ---------
-        // FPU Flags
-        // ---------
-        if (CVA6Cfg.FpPresent) begin
-          if (commit_instr_i[0].fu inside {FPU, FPU_VEC}) begin
-            if (!commit_drop_i[0]) begin
-              // write the CSR with potential exception flags from retiring floating point instruction
-              csr_wdata_o = {{CVA6Cfg.XLEN - 5{1'b0}}, commit_instr_i[0].ex.cause[4:0]};
-              csr_write_fflags_o = 1'b1;
-            end
           end
         end
         // ---------
@@ -232,34 +199,6 @@ module commit_stage
           if (!commit_drop_i[0]) begin
             // no store pending so we can flush the TLBs and pipeline
             sfence_vma_o = no_st_pending_i;
-            // wait for the store buffer to drain until flushing the pipeline
-            commit_ack_o[0] = no_st_pending_i;
-          end
-        end
-        // ------------------
-        // HFENCE.VVMA Logic
-        // ------------------
-        // hfence.vvma is idempotent so we can safely re-execute it after returning
-        // from interrupt service routine
-        // check if this instruction was a HFENCE_VVMA
-        if (CVA6Cfg.RVH && commit_instr_i[0].op == HFENCE_VVMA) begin
-          if (!commit_drop_i[0]) begin
-            // no store pending so we can flush the TLBs and pipeline
-            hfence_vvma_o   = no_st_pending_i;
-            // wait for the store buffer to drain until flushing the pipeline
-            commit_ack_o[0] = no_st_pending_i;
-          end
-        end
-        // ------------------
-        // HFENCE.GVMA Logic
-        // ------------------
-        // hfence.gvma is idempotent so we can safely re-execute it after returning
-        // from interrupt service routine
-        // check if this instruction was a HFENCE_GVMA
-        if (CVA6Cfg.RVH && commit_instr_i[0].op == HFENCE_GVMA) begin
-          if (!commit_drop_i[0]) begin
-            // no store pending so we can flush the TLBs and pipeline
-            hfence_gvma_o   = no_st_pending_i;
             // wait for the store buffer to drain until flushing the pipeline
             commit_ack_o[0] = no_st_pending_i;
           end
@@ -304,60 +243,7 @@ module commit_stage
       end
     end
 
-    if (CVA6Cfg.NrCommitPorts > 1) begin
-      commit_macro_ack[1] = 1'b0;
-      commit_ack_o[1]     = 1'b0;
-      we_gpr_o[1]         = 1'b0;
-      wdata_o[1]          = commit_instr_i[1].result;
-
-      // -----------------
-      // Commit Port 2
-      // -----------------
-      // check if the second instruction can be committed as well and the first wasn't a CSR instruction
-      // also if we are in single step mode don't retire the second instruction
-      if (commit_ack_o[0] && commit_instr_i[1].valid
-                                && !halt_i
-                                && !(commit_instr_i[0].fu inside {CSR})
-                                && !flush_dcache_i
-                                && !(CVA6Cfg.RVA && instr_0_is_amo)
-                                && !single_step_i) begin
-        // only if the first instruction didn't throw an exception and this instruction won't throw an exception
-        // and the functional unit is of type ALU, LOAD, CTRL_FLOW, MULT, FPU or FPU_VEC
-        if (!commit_instr_i[1].ex.valid && (commit_instr_i[1].fu inside {ALU, LOAD, CTRL_FLOW, MULT, FPU, FPU_VEC})) begin
-
-          if (CVA6Cfg.RVZCMP && commit_instr_i[1].is_macro_instr && commit_instr_i[1].is_last_macro_instr)
-            commit_macro_ack[1] = 1'b1;
-          else commit_macro_ack[1] = 1'b0;
-
-          commit_ack_o[1] = 1'b1;
-
-          if (!commit_drop_i[1]) begin
-            if (CVA6Cfg.FpPresent && ariane_pkg::is_rd_fpr(commit_instr_i[1].op))
-              we_fpr_o[1] = 1'b1;
-            else we_gpr_o[1] = 1'b1;
-
-            // additionally check if we are retiring an FPU instruction because we need to make sure that we write all
-            // exception flags
-            if (CVA6Cfg.FpPresent) begin
-              if (commit_instr_i[1].fu inside {FPU, FPU_VEC}) begin
-                if (csr_write_fflags_o)
-                  csr_wdata_o = {
-                    {CVA6Cfg.XLEN - 5{1'b0}},
-                    (commit_instr_i[0].ex.cause[4:0] | commit_instr_i[1].ex.cause[4:0])
-                  };
-                else csr_wdata_o = {{CVA6Cfg.XLEN - 5{1'b0}}, commit_instr_i[1].ex.cause[4:0]};
-                csr_write_fflags_o = 1'b1;
-              end
-            end
-          end
-        end
-      end
-    end
-    if (CVA6Cfg.RVZCMP) begin
-      for (int i = 0; i < CVA6Cfg.NrCommitPorts; i++) begin
-        commit_macro_ack_o[i] = commit_instr_i[i].is_macro_instr ? commit_macro_ack[i] : commit_ack_o[i];
-      end
-    end else commit_macro_ack_o = commit_ack_o;
+    commit_macro_ack_o = commit_ack_o;
   end
 
   // -----------------------------
@@ -386,11 +272,6 @@ module commit_stage
         // the instruction bits from the ID stage. If a earlier exception happened we don't care
         // as we will overwrite it anyway in the next IF bl
         exception_o.tval = commit_instr_i[0].ex.tval;
-        if (CVA6Cfg.RVH) begin
-          exception_o.tinst = commit_instr_i[0].ex.tinst;
-          exception_o.tval2 = commit_instr_i[0].ex.tval2;
-          exception_o.gva   = commit_instr_i[0].ex.gva;
-        end
       end
       // ------------------------
       // Earlier Exceptions

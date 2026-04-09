@@ -124,14 +124,6 @@ module ex_stage
     output logic fpu_ready_o,
     // FPU instruction is ready - ISSUE_STAGE
     input logic [CVA6Cfg.NrIssuePorts-1:0] fpu_valid_i,
-    // FPU format - ISSUE_STAGE
-    input logic [1:0] fpu_fmt_i,
-    // FPU rm - ISSUE_STAGE
-    input logic [2:0] fpu_rm_i,
-    // FPU frm - ISSUE_STAGE
-    input logic [2:0] fpu_frm_i,
-    // FPU precision control - CSR_REGFILE
-    input logic [6:0] fpu_prec_i,
     // FPU transaction ID - ISSUE_STAGE
     output logic [CVA6Cfg.TRANS_ID_BITS-1:0] fpu_trans_id_o,
     // FPU result - ISSUE_STAGE
@@ -283,7 +275,7 @@ module ex_stage
   // from ALU to branch unit
   logic alu_branch_res;  // branch comparison result
   logic [CVA6Cfg.NrALUs-1:0][CVA6Cfg.XLEN-1:0] alu_result;
-  logic [CVA6Cfg.XLEN-1:0] csr_result, mult_result, aes_result;
+  logic [CVA6Cfg.XLEN-1:0] csr_result, mult_result;
   logic [CVA6Cfg.VLEN-1:0] branch_result;
   bp_resolve_t resolved_branch;
   logic csr_ready, mult_ready;
@@ -293,7 +285,7 @@ module ex_stage
   fu_data_t [CVA6Cfg.NrALUs-1:0] alu_data;
 
   logic [CVA6Cfg.NrIssuePorts-1:0] one_cycle_select;
-  assign one_cycle_select = alu_valid_i | branch_valid_i | csr_valid_i | aes_valid_i;
+  assign one_cycle_select = alu_valid_i | branch_valid_i | csr_valid_i;
 
   fu_data_t one_cycle_data;
   logic [CVA6Cfg.VLEN-1:0] rs1_forwarding;
@@ -316,15 +308,7 @@ module ex_stage
   // 1. ALU(s) (combinatorial)
   assign alu_data[0] = one_cycle_data;
 
-  if (CVA6Cfg.SuperscalarEn) begin : gen_alu2_data_sel
-    always_comb begin
-      unique case (1'b1)
-        alu2_valid_i[1]: alu_data[1] = fu_data_i[1];
-        alu2_valid_i[0]: alu_data[1] = fu_data_i[0];
-        default: alu_data[1] = '0;
-      endcase
-    end
-  end
+  // No ALU2 data selection (SuperscalarEn disabled)
 
   alu_wrapper #(
       .CVA6Cfg  (CVA6Cfg),
@@ -398,8 +382,6 @@ module ex_stage
     end else if (mult_valid) begin
       flu_result_o   = mult_result;
       flu_trans_id_o = mult_trans_id;
-    end else if (|aes_valid_i) begin
-      flu_result_o = aes_result;
     end
   end
 
@@ -436,78 +418,14 @@ module ex_stage
   );
 
   // ----------------
-  // FPU
+  // FPU (removed)
   // ----------------
-  logic fpu_valid;
-  logic [CVA6Cfg.TRANS_ID_BITS-1:0] fpu_trans_id;
-  logic [CVA6Cfg.XLEN-1:0] fpu_result;
-
-  generate
-    if (CVA6Cfg.FpPresent) begin : fpu_gen
-      fu_data_t fpu_data;
-      always_comb begin
-        fpu_data = fpu_valid_i[0] ? fu_data_i[0] : '0;
-        if (CVA6Cfg.SuperscalarEn) begin
-          if (fpu_valid_i[1]) begin
-            fpu_data = fu_data_i[1];
-          end
-        end
-      end
-
-      fpu_wrap #(
-          .CVA6Cfg(CVA6Cfg),
-          .exception_t(exception_t),
-          .fu_data_t(fu_data_t)
-      ) fpu_i (
-          .clk_i,
-          .rst_ni,
-          .flush_i,
-          .fpu_valid_i(|fpu_valid_i),
-          .fpu_ready_o,
-          .fu_data_i(fpu_data),
-          .fpu_fmt_i,
-          .fpu_rm_i,
-          .fpu_frm_i,
-          .fpu_prec_i,
-          .fpu_trans_id_o(fpu_trans_id),
-          .result_o(fpu_result),
-          .fpu_valid_o(fpu_valid),
-          .fpu_exception_o,
-          .fpu_early_valid_o
-      );
-    end else begin : no_fpu_gen
-      assign fpu_ready_o       = '0;
-      assign fpu_trans_id      = '0;
-      assign fpu_result        = '0;
-      assign fpu_valid         = '0;
-      assign fpu_exception_o   = '0;
-      assign fpu_early_valid_o = '0;
-    end
-  endgenerate
-
-  // result MUX
-  // This is really explicit so that synthesis tools can elide unused signals
-  if (CVA6Cfg.SuperscalarEn) begin
-    if (CVA6Cfg.FpPresent) begin
-      assign fpu_valid_o    = fpu_valid || |alu2_valid_i;
-      assign fpu_result_o   = fpu_valid ? fpu_result   : alu_result[1];
-      assign fpu_trans_id_o = fpu_valid ? fpu_trans_id : alu_data[1].trans_id;
-    end else begin
-      assign fpu_valid_o    = |alu2_valid_i;
-      assign fpu_result_o   = alu_result[1];
-      assign fpu_trans_id_o = alu_data[1].trans_id;
-    end
-  end else begin
-    if (CVA6Cfg.FpPresent) begin
-      assign fpu_valid_o    = fpu_valid;
-      assign fpu_result_o   = fpu_result;
-      assign fpu_trans_id_o = fpu_trans_id;
-    end else begin
-      assign fpu_valid_o    = '0;
-      assign fpu_result_o   = '0;
-      assign fpu_trans_id_o = '0;
-    end
-  end
+  assign fpu_ready_o       = '0;
+  assign fpu_exception_o   = '0;
+  assign fpu_early_valid_o = '0;
+  assign fpu_valid_o       = '0;
+  assign fpu_result_o      = '0;
+  assign fpu_trans_id_o    = '0;
 
   // ----------------
   // Load-Store Unit
@@ -615,49 +533,15 @@ module ex_stage
       .rvfi_mem_paddr_o
   );
 
-  if (CVA6Cfg.CvxifEn) begin : gen_cvxif
-    fu_data_t cvxif_data;
-    always_comb begin
-      cvxif_data = x_valid_i[0] ? fu_data_i[0] : '0;
-      if (CVA6Cfg.SuperscalarEn) begin
-        if (x_valid_i[1]) begin
-          cvxif_data = fu_data_i[1];
-        end
-      end
-    end
-
-    cvxif_fu #(
-        .CVA6Cfg(CVA6Cfg),
-        .exception_t(exception_t),
-        .x_result_t(x_result_t)
-    ) cvxif_fu_i (
-        .clk_i,
-        .rst_ni,
-        .v_i,
-        .x_valid_i(|x_valid_i),
-        .x_trans_id_i(cvxif_data.trans_id),
-        .x_illegal_i(x_transaction_rejected_i),
-        .x_off_instr_i,
-        .x_ready_o,
-        .x_trans_id_o,
-        .x_exception_o,
-        .x_result_o,
-        .x_valid_o,
-        .x_we_o,
-        .x_rd_o,
-        .result_valid_i(x_result_valid_i),
-        .result_i(x_result_i),
-        .result_ready_o(x_result_ready_o)
-    );
-  end else begin : gen_no_cvxif
-    assign x_result_ready_o = '0;
-    assign x_trans_id_o     = '0;
-    assign x_exception_o    = '0;
-    assign x_result_o       = '0;
-    assign x_valid_o        = '0;
-    assign x_we_o           = '0;
-    assign x_rd_o           = '0;
-  end
+  // CVXIF (removed)
+  assign x_ready_o        = '0;
+  assign x_result_ready_o = '0;
+  assign x_trans_id_o     = '0;
+  assign x_exception_o    = '0;
+  assign x_result_o       = '0;
+  assign x_valid_o        = '0;
+  assign x_we_o           = '0;
+  assign x_rd_o           = '0;
 
   if (CVA6Cfg.RVS) begin
     if (CVA6Cfg.RVH) begin
@@ -736,25 +620,5 @@ module ex_stage
     assign vmid_to_be_flushed                 = '0;
     assign gpaddr_to_be_flushed               = '0;
   end
-
-  // ----------------
-  // Scalar Cryptography Unit
-  // ----------------
-  generate
-    if (CVA6Cfg.ZKN) begin : aes_gen
-      aes #(
-          .CVA6Cfg  (CVA6Cfg),
-          .fu_data_t(fu_data_t)
-      ) aes_i (
-          .clk_i,
-          .rst_ni,
-          .fu_data_i     (one_cycle_data),
-          .result_o      (aes_result),
-          .orig_instr_aes(orig_instr_aes_i)
-      );
-    end else begin : no_aes_gen
-      assign aes_result = '0;
-    end
-  endgenerate
 
 endmodule

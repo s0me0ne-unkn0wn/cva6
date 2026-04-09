@@ -56,10 +56,6 @@ module ariane_regfile_fpga #(
   logic [CVA6Cfg.NrCommitPorts-1:0][NUM_WORDS-1:0] we_dec;
   logic [NUM_WORDS-1:0][LOG_NR_WRITE_PORTS-1:0] mem_block_sel;
   logic [NUM_WORDS-1:0][LOG_NR_WRITE_PORTS-1:0] mem_block_sel_q;
-  logic [CVA6Cfg.NrCommitPorts-1:0][DATA_WIDTH-1:0] wdata_reg;
-  logic [NR_READ_PORTS-1:0] read_after_write;
-
-  logic [NR_READ_PORTS-1:0][4:0] raddr_q;
   logic [NR_READ_PORTS-1:0][4:0] raddr;
 
   // write address decoder (for block selector)
@@ -94,40 +90,25 @@ module ariane_regfile_fpga #(
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
       mem_block_sel_q <= '0;
-      raddr_q <= '0;
     end else begin
       mem_block_sel_q <= mem_block_sel;
-      if (CVA6Cfg.FpgaAlteraEn) raddr_q <= raddr_i;
-      else raddr_q <= '0;
     end
   end
 
   // distributed RAM blocks
   logic [NR_READ_PORTS-1:0][DATA_WIDTH-1:0] mem_read[CVA6Cfg.NrCommitPorts];
-  logic [NR_READ_PORTS-1:0][DATA_WIDTH-1:0] mem_read_sync[CVA6Cfg.NrCommitPorts];
   for (genvar j = 0; j < CVA6Cfg.NrCommitPorts; j++) begin : regfile_ram_block
     always_ff @(posedge clk_i) begin
       if (we_i[j] && ~waddr_i[j] != 0) begin
         mem[j][waddr_i[j][ADDR_WIDTH-1:0]] <= wdata_i[j];
-        if (CVA6Cfg.FpgaAlteraEn)
-          wdata_reg[j] <= wdata_i[j];  // register data written in case is needed to read next cycle
-        else wdata_reg[j] <= '0;
-      end
-      if (CVA6Cfg.FpgaAlteraEn) begin
-        for (int k = 0; k < NR_READ_PORTS; k++) begin : block_read
-          mem_read_sync[j][k] = mem[j][raddr_i[k][ADDR_WIDTH-1:0]];  // synchronous RAM
-          read_after_write[k] <= '0;
-          if (waddr_i[j] == raddr_i[k])
-            read_after_write[k] <= we_i[j] && ~waddr_i[j] != 0; // Identify if we need to read the content that was written
-        end
       end
     end
     for (genvar k = 0; k < NR_READ_PORTS; k++) begin : block_read
-      assign mem_read[j][k] = CVA6Cfg.FpgaAlteraEn ? ( read_after_write[k] ? wdata_reg[j]: mem_read_sync[j][k]) : mem[j][raddr_i[k][ADDR_WIDTH-1:0]];
+      assign mem_read[j][k] = mem[j][raddr_i[k][ADDR_WIDTH-1:0]];
     end
   end
-  //with synchronous ram there is the need to adjust which address is used at the output MUX
-  assign raddr = CVA6Cfg.FpgaAlteraEn ? raddr_q : raddr_i;
+  //output MUX uses raddr_i directly (asynchronous read for Xilinx)
+  assign raddr = raddr_i;
 
   // output MUX
   logic [NR_READ_PORTS-1:0][LOG_NR_WRITE_PORTS-1:0] block_addr;
@@ -140,9 +121,7 @@ module ariane_regfile_fpga #(
   initial begin
     for (int i = 0; i < CVA6Cfg.NrCommitPorts; i++) begin
       for (int j = 0; j < NUM_WORDS; j++) begin
-        if (!CVA6Cfg.FpgaAlteraEn)
-          mem[i][j] = $random();  //quartus does not support this random statement on synthesis
-        else mem[i][j] = '0;
+        mem[i][j] = $random();
       end
     end
   end

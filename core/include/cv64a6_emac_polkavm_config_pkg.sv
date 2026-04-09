@@ -81,7 +81,7 @@ package cva6_config_pkg;
       XLEN: unsigned'(CVA6ConfigXlen),
       VLEN: unsigned'(64),
       RVE: bit'(1),
-      FpgaEn: bit'(0),
+      FpgaEn: bit'(1),
       FpgaAlteraEn: bit'(0),
       TechnoCut: bit'(0),
       SuperscalarEn: bit'(0),

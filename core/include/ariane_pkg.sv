@@ -16,13 +16,6 @@
  *              in one package.
  */
 
-// this is needed to propagate the
-// configuration in case Ariane is
-// instantiated in OpenPiton
-`ifdef PITON_ARIANE
-`include "l15.tmp.h"
-`endif
-
 /// This package contains `functions` and global defines for CVA6.
 /// *Note*: There are some parameters here as well which will eventually be
 /// moved out to favour a fully parameterizable core.
@@ -42,22 +35,12 @@ package ariane_pkg;
   // allocate more space for the commit buffer to be on the safe side, this needs to be a power of two
   localparam logic [2:0] DEPTH_COMMIT = 'd4;
 
-  // Transprecision float unit
-  localparam int unsigned LAT_COMP_FP32 = 'd2;
-  localparam int unsigned LAT_COMP_FP64 = 'd3;
-  localparam int unsigned LAT_COMP_FP16 = 'd1;
-  localparam int unsigned LAT_COMP_FP16ALT = 'd1;
-  localparam int unsigned LAT_COMP_FP8 = 'd1;
-  localparam int unsigned LAT_DIVSQRT = 'd2;
-  localparam int unsigned LAT_NONCOMP = 'd1;
-  localparam int unsigned LAT_CONV = 'd2;
-
   localparam logic [31:0] OPENHWGROUP_MVENDORID = 32'h0602;
   localparam logic [31:0] ARIANE_MARCHID = 32'd3;
   localparam logic [31:0] ARIANE_MIMPID = 32'd0;
 
-  // 32 registers
-  localparam REG_ADDR_SIZE = 5;
+  // 16 registers (RV64E)
+  localparam REG_ADDR_SIZE = 4;
 
   // Read ports for general purpose register files
   localparam NR_RGPR_PORTS = 2;
@@ -133,25 +116,6 @@ package ariane_pkg;
                                                     | riscv::SSTATUS_SUM
                                                     | riscv::SSTATUS_MXR;
 
-  localparam logic [63:0] HSTATUS_WRITE_MASK      = riscv::HSTATUS_VSBE
-                                                    | riscv::HSTATUS_GVA
-                                                    | riscv::HSTATUS_SPV
-                                                    | riscv::HSTATUS_SPVP
-                                                    | riscv::HSTATUS_HU
-                                                    | riscv::HSTATUS_VTVM
-                                                    | riscv::HSTATUS_VTW
-                                                    | riscv::HSTATUS_VTSR;
-
-  // hypervisor delegable interrupts
-  function automatic logic [31:0] hs_deleg_interrupts(config_pkg::cva6_cfg_t Cfg);
-    return riscv::MIP_VSSIP | riscv::MIP_VSTIP | riscv::MIP_VSEIP;
-  endfunction
-
-  // virtual supervisor delegable interrupts
-  function automatic logic [31:0] vs_deleg_interrupts(config_pkg::cva6_cfg_t Cfg);
-    return riscv::MIP_VSSIP | riscv::MIP_VSTIP | riscv::MIP_VSEIP;
-  endfunction
-
   // ---------------
   // AXI
   // ---------------
@@ -214,58 +178,6 @@ package ariane_pkg;
 
   localparam SupervisorIrq = 1;
   localparam MachineIrq = 0;
-
-  // ---------------
-  // Cache config
-  // ---------------
-
-  // for usage in OpenPiton we have to propagate the openpiton L15 configuration from l15.h
-`ifdef PITON_ARIANE
-
-`ifndef CONFIG_L1I_CACHELINE_WIDTH
-  `define CONFIG_L1I_CACHELINE_WIDTH 128
-`endif
-
-`ifndef CONFIG_L1I_ASSOCIATIVITY
-  `define CONFIG_L1I_ASSOCIATIVITY 4
-`endif
-
-`ifndef CONFIG_L1I_SIZE
-  `define CONFIG_L1I_SIZE 16*1024
-`endif
-
-`ifndef CONFIG_L1D_CACHELINE_WIDTH
-  `define CONFIG_L1D_CACHELINE_WIDTH 128
-`endif
-
-`ifndef CONFIG_L1D_ASSOCIATIVITY
-  `define CONFIG_L1D_ASSOCIATIVITY 8
-`endif
-
-`ifndef CONFIG_L1D_SIZE
-  `define CONFIG_L1D_SIZE 32*1024
-`endif
-
-`ifndef L15_THREADID_WIDTH
-  `define L15_THREADID_WIDTH 3
-`endif
-
-  // I$
-  localparam int unsigned ICACHE_LINE_WIDTH = `CONFIG_L1I_CACHELINE_WIDTH;
-  localparam int unsigned ICACHE_SET_ASSOC = `CONFIG_L1I_ASSOCIATIVITY;
-  localparam int unsigned ICACHE_INDEX_WIDTH = $clog2(`CONFIG_L1I_SIZE / ICACHE_SET_ASSOC);
-  localparam int unsigned ICACHE_TAG_WIDTH = riscv::PLEN - ICACHE_INDEX_WIDTH;
-  localparam int unsigned ICACHE_USER_LINE_WIDTH = (AXI_USER_WIDTH == 1) ? 4 : 128;  // in bit
-  // D$
-  localparam int unsigned DCACHE_LINE_WIDTH = `CONFIG_L1D_CACHELINE_WIDTH;
-  localparam int unsigned DCACHE_SET_ASSOC = `CONFIG_L1D_ASSOCIATIVITY;
-  localparam int unsigned DCACHE_INDEX_WIDTH = $clog2(`CONFIG_L1D_SIZE / DCACHE_SET_ASSOC);
-  localparam int unsigned DCACHE_TAG_WIDTH = riscv::PLEN - DCACHE_INDEX_WIDTH;
-  localparam int unsigned DCACHE_USER_LINE_WIDTH = (AXI_USER_WIDTH == 1) ? 4 : 128;  // in bit
-  localparam int unsigned DCACHE_USER_WIDTH = cva6_config_pkg::CVA6ConfigDataUserWidth;
-
-  localparam int unsigned MEM_TID_WIDTH = `L15_THREADID_WIDTH;
-`endif
 
   // ---------------
   // EX Stage
@@ -560,77 +472,29 @@ package ariane_pkg;
   // function used in instr_trace svh
   // is_rs1_fpr function is kept to allow cva6 compilation with instr_trace feature
   function automatic logic is_rs1_fpr(input fu_op op);
-    unique case (op) inside
-      [FMUL : FNMADD],  // Computational Operations (except ADD/SUB)
-      FCVT_F2I,  // Float-Int Casts
-      FCVT_F2F,  // Float-Float Casts
-      FSGNJ,  // Sign Injections
-      FMV_F2X,  // FPR-GPR Moves
-      FCMP,  // Comparisons
-      FCLASS,  // Classifications
-      [VFMIN : VFCPKCD_D],  // Additional Vectorial FP ops
-      ACCEL_OP_FS1:
-      return 1'b1;  // Accelerator instructions
-      default: return 1'b0;  // all other ops
-    endcase
+    return 1'b0;
   endfunction
 
   // function used in instr_trace svh
   // is_rs2_fpr function is kept to allow cva6 compilation with instr_trace feature
   function automatic logic is_rs2_fpr(input fu_op op);
-    unique case (op) inside
-      [FSD : FSB],  // FP Stores
-      [FADD : FMIN_MAX],  // Computational Operations (no sqrt)
-      [FMADD : FNMADD],  // Fused Computational Operations
-      FCVT_F2F,  // Vectorial F2F Conversions require target
-      [FSGNJ : FMV_F2X],  // Sign Injections and moves mapped to SGNJ
-      FCMP,  // Comparisons
-      [VFMIN : VFCPKCD_D]:
-      return 1'b1;  // Additional Vectorial FP ops
-      default: return 1'b0;  // all other ops
-    endcase
+    return 1'b0;
   endfunction
 
   // function used in instr_trace svh
   // is_imm_fpr function is kept to allow cva6 compilation with instr_trace feature
-  // ternary operations encode the rs3 address in the imm field, also add/sub
   function automatic logic is_imm_fpr(input fu_op op);
-    unique case (op) inside
-      [FADD : FSUB],  // ADD/SUB need inputs as Operand B/C
-      [FMADD : FNMADD],  // Fused Computational Operations
-      [VFCPKAB_S : VFCPKCD_D]:
-      return 1'b1;  // Vectorial FP cast and pack ops
-      default: return 1'b0;  // all other ops
-    endcase
+    return 1'b0;
   endfunction
 
   // function used in instr_trace svh
   // is_rd_fpr function is kept to allow cva6 compilation with instr_trace feature
   function automatic logic is_rd_fpr(input fu_op op);
-    unique case (op) inside
-      [FLD : FLB],  // FP Loads
-      [FADD : FNMADD],  // Computational Operations
-      FCVT_I2F,  // Int-Float Casts
-      FCVT_F2F,  // Float-Float Casts
-      FSGNJ,  // Sign Injections
-      FMV_X2F,  // GPR-FPR Moves
-      [VFMIN : VFSGNJX],  // Vectorial MIN/MAX and SGNJ
-      [VFCPKAB_S : VFCPKCD_D],  // Vectorial FP cast and pack ops
-      ACCEL_OP_FD:
-      return 1'b1;  // Accelerator instructions
-      default: return 1'b0;  // all other ops
-    endcase
+    return 1'b0;
   endfunction
 
   function automatic logic fd_changes_rd_state(input fu_op op);
-    unique case (op) inside
-      FSD, FSW, FSH, FSB,  // stores
-      FCVT_F2I,  // conversion to int
-      FMV_F2X,  // move as-is to int
-      FCLASS:  // classification (writes output to integer register)
-      return 1'b0;  // floating-point registers are only read
-      default: return 1'b1;  // other ops - floating-point registers are written as well
-    endcase
+    return 1'b0;
   endfunction
 
   function automatic logic is_amo(fu_op op);
@@ -662,9 +526,7 @@ package ariane_pkg;
     AMO_MAX  = 4'b1000,
     AMO_MAXU = 4'b1001,
     AMO_MIN  = 4'b1010,
-    AMO_MINU = 4'b1011,
-    AMO_CAS1 = 4'b1100,  // unused, not part of riscv spec, but provided in OpenPiton
-    AMO_CAS2 = 4'b1101   // unused, not part of riscv spec, but provided in OpenPiton
+    AMO_MINU = 4'b1011
   } amo_t;
 
   // Bits required for representation of physical address space as 4K pages
@@ -682,8 +544,7 @@ package ariane_pkg;
   typedef enum logic [1:0] {
     FE_NONE,
     FE_INSTR_ACCESS_FAULT,
-    FE_INSTR_PAGE_FAULT,
-    FE_INSTR_GUEST_PAGE_FAULT
+    FE_INSTR_PAGE_FAULT
   } frontend_exception_t;
 
   // AMO request going to cache. this request is unconditionally valid as soon
@@ -791,7 +652,7 @@ package ariane_pkg;
   // ----------------------
   function automatic logic [1:0] extract_transfer_size(fu_op op);
     case (op)
-      LD, HLV_D, SD, HSV_D, FLD, FSD,
+      LD, SD,
             AMO_LRD,   AMO_SCD,
             AMO_SWAPD, AMO_ADDD,
             AMO_ANDD,  AMO_ORD,
@@ -800,8 +661,7 @@ package ariane_pkg;
             AMO_MINDU: begin
         return 2'b11;
       end
-      LW, LWU, HLV_W, HLV_WU, HLVX_WU,
-            SW, HSV_W, FLW, FSW,
+      LW, LWU, SW,
             AMO_LRW,   AMO_SCW,
             AMO_SWAPW, AMO_ADDW,
             AMO_ANDW,  AMO_ORW,
@@ -810,63 +670,11 @@ package ariane_pkg;
             AMO_MINWU: begin
         return 2'b10;
       end
-      LH, LHU, HLV_H, HLV_HU, HLVX_HU, SH, HSV_H, FLH, FSH: return 2'b01;
-      LB, LBU, HLV_B, HLV_BU, SB, HSV_B, FLB, FSB:          return 2'b00;
-      CBO_CLEAN, CBO_FLUSH, CBO_INVAL:                      return 2'b00;
-      default:                                              return 2'b11;
+      LH, LHU, SH:    return 2'b01;
+      LB, LBU, SB:    return 2'b00;
+      default:         return 2'b11;
     endcase
   endfunction
-  // ----------------------
-  // MMU Functions
-  // ----------------------
-
-  // checks if final translation page size is 1G when H-extension is enabled
-  function automatic logic is_trans_1G(input logic s_st_enbl, input logic g_st_enbl,
-                                       input logic is_s_1G, input logic is_g_1G);
-    return (((is_s_1G && s_st_enbl) || !s_st_enbl) && ((is_g_1G && g_st_enbl) || !g_st_enbl));
-  endfunction : is_trans_1G
-
-  // checks if final translation page size is 2M when H-extension is enabled
-  function automatic logic is_trans_2M(input logic s_st_enbl, input logic g_st_enbl,
-                                       input logic is_s_1G, input logic is_s_2M,
-                                       input logic is_g_1G, input logic is_g_2M);
-    return  (s_st_enbl && g_st_enbl) ?
-                ((is_s_2M && (is_g_1G || is_g_2M)) || (is_g_2M && (is_s_1G || is_s_2M))) :
-                ((is_s_2M && s_st_enbl) || (is_g_2M && g_st_enbl));
-  endfunction : is_trans_2M
-
-  // computes the paddr based on the page size, ppn and offset
-  function automatic logic [40:0] make_gpaddr(input logic s_st_enbl, input logic is_1G,
-                                              input logic is_2M, input logic [63:0] vaddr,
-                                              input riscv::pte_t pte);
-    logic [40:0] gpaddr;
-    if (s_st_enbl) begin
-      gpaddr = {pte.ppn[28:0], vaddr[11:0]};
-      // Giga page
-      if (is_1G) gpaddr[29:12] = vaddr[29:12];
-      // Mega page
-      if (is_2M) gpaddr[20:12] = vaddr[20:12];
-    end else begin
-      gpaddr = vaddr[40:0];
-    end
-    return gpaddr;
-  endfunction : make_gpaddr
-
-  // computes the final gppn based on the guest physical address
-  function automatic logic [28:0] make_gppn(input logic s_st_enbl, input logic is_1G,
-                                            input logic is_2M, input logic [28:0] vpn,
-                                            input riscv::pte_t pte);
-    logic [28:0] gppn;
-    if (s_st_enbl) begin
-      gppn = pte.ppn[28:0];
-      if (is_2M) gppn[8:0] = vpn[8:0];
-      if (is_1G) gppn[17:0] = vpn[17:0];
-    end else begin
-      gppn = vpn;
-    end
-    return gppn;
-  endfunction : make_gppn
-
   // ----------------------
   // Helper functions
   // ----------------------

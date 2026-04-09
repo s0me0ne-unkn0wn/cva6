@@ -79,7 +79,7 @@ module alu
   logic adder_z_flag;
   logic [CVA6Cfg.XLEN:0] adder_in_a, adder_in_b;
   logic [CVA6Cfg.XLEN-1:0] adder_result;
-  logic [CVA6Cfg.XLEN-1:0] operand_a_bitmanip, bit_indx;
+  logic [CVA6Cfg.XLEN-1:0] operand_a_bitmanip;
   logic [CVA6Cfg.XLEN-1:0] operand_a_cpop;
 
   assign adder_op_b_negate = fu_data_i.operation inside {EQ, NE, SUB, SUBW, ANDN, ORN, XNOR};
@@ -91,19 +91,13 @@ module alu
     if (CVA6Cfg.RVB) begin
       if (CVA6Cfg.IS_XLEN64) begin
         unique case (fu_data_i.operation)
-          SH1ADDUW:    operand_a_bitmanip = operand_a[31:0] << 1;
-          SH2ADDUW:    operand_a_bitmanip = operand_a[31:0] << 2;
-          SH3ADDUW:    operand_a_bitmanip = operand_a[31:0] << 3;
-          CTZW:        operand_a_bitmanip = operand_a_rev32;
-          ADDUW, CLZW: operand_a_bitmanip = operand_a[31:0];
-          CPOPW:       operand_a_cpop = fu_data_cpop_i.operand_a[31:0];
-          default:     ;
+          CTZW:  operand_a_bitmanip = operand_a_rev32;
+          CLZW:  operand_a_bitmanip = operand_a[31:0];
+          CPOPW: operand_a_cpop = fu_data_cpop_i.operand_a[31:0];
+          default: ;
         endcase
       end
       unique case (fu_data_i.operation)
-        SH1ADD:  operand_a_bitmanip = operand_a << 1;
-        SH2ADD:  operand_a_bitmanip = operand_a << 2;
-        SH3ADD:  operand_a_bitmanip = operand_a << 3;
         CTZ:     operand_a_bitmanip = operand_a_rev;
         default: ;
       endcase
@@ -266,34 +260,12 @@ module alu
     end
   end
 
-  // ZKN gen block
-  if (CVA6Cfg.ZKN && CVA6Cfg.RVB) begin : zkn_gen_block
-    genvar i, m, n, q;
-    for (i = 0; i < (CVA6Cfg.XLEN / 8); i++) begin : brev8_xperm8_gen
-      // Generating xperm8_result by extracting bytes from operand a based on indices from operand b
-      assign xperm8_result[i << 3 +: 8] = (operand_b[i << 3 +: 8] < (CVA6Cfg.XLEN / 8)) ? operand_a[operand_b[i << 3 +: 8] << 3 +: 8] : 8'b0;
-      // Generate brev8_reversed by reversing bits within each byte
-      for (m = 0; m < 8; m++) begin : reverse_bits
-        // Reversing the order of bits within a single byte
-        assign brev8_reversed[(i<<3)+m] = operand_a[(i<<3)+(7-m)];
-      end
-    end
-    for (q = 0; q < (CVA6Cfg.XLEN / 4); q++) begin : xperm4_gen
-      // Generating xperm4_result by extracting nibbles from operand a based on indices from operand b
-      assign xperm4_result[q << 2 +: 4] = (operand_b[q << 2 +: 4] < (CVA6Cfg.XLEN / 4)) ? operand_a[{2'b0, operand_b[q << 2 +: 4]} << 2 +: 4] : 4'b0;
-    end
-    if (CVA6Cfg.IS_XLEN32) begin
-      // Generate zip and unzip results
-      for (n = 0; n < 16; n++) begin : zip_unzip_gen
-        // Assigning lower and upper half of operand into the even and odd positions of result
-        assign zip_gen[n<<1] = operand_a[n];
-        assign zip_gen[(n<<1)+1] = operand_a[n+16];
-        // Assigning even and odd bits of operand into lower and upper halves of result
-        assign unzip_gen[n] = operand_a[n<<1];
-        assign unzip_gen[n+16] = operand_a[(n<<1)+1];
-      end
-    end
-  end
+  // ZKN removed (CVA6Cfg.ZKN=0) - stub assigns for module-level signals
+  assign brev8_reversed = '0;
+  assign xperm8_result  = '0;
+  assign xperm4_result  = '0;
+  assign unzip_gen      = '0;
+  assign zip_gen        = '0;
 
   // -----------
   // Result MUX
@@ -304,7 +276,6 @@ module alu
       unique case (fu_data_i.operation)
         // Add word: Ignore the upper bits and sign extend to 64 bit
         ADDW, SUBW: result_o = {{CVA6Cfg.XLEN - 32{adder_result[31]}}, adder_result[31:0]};
-        SH1ADDUW, SH2ADDUW, SH3ADDUW: result_o = adder_result;
         // Shifts 32 bit
         SLLW, SRLW, SRAW:
         result_o = {{CVA6Cfg.XLEN - 32{shift_result32[31]}}, shift_result32[31:0]};
@@ -317,7 +288,7 @@ module alu
       ORL, ORN: result_o = operand_a | operand_b_neg[CVA6Cfg.XLEN:1];
       XORL, XNOR: result_o = operand_a ^ operand_b_neg[CVA6Cfg.XLEN:1];
       // Adder Operations
-      ADD, SUB, ADDUW, SH1ADD, SH2ADD, SH3ADD: result_o = adder_result;
+      ADD, SUB: result_o = adder_result;
       // Shift Operations
       SLL, SRL, SRA: result_o = (CVA6Cfg.IS_XLEN64) ? shift_result : shift_result32;
       // Comparison Operations
@@ -326,15 +297,13 @@ module alu
     endcase
 
     if (CVA6Cfg.RVB) begin
-      // Index for Bitwise Rotation
-      bit_indx = 1 << (operand_b & (CVA6Cfg.XLEN - 1));
       if (CVA6Cfg.IS_XLEN64) begin
         // rolw, roriw, rorw
         rolw = ({{CVA6Cfg.XLEN-32{1'b0}},operand_a[31:0]} << operand_b[4:0]) | ({{CVA6Cfg.XLEN-32{1'b0}},operand_a[31:0]} >> (CVA6Cfg.XLEN-32-operand_b[4:0]));
         rorw = ({{CVA6Cfg.XLEN-32{1'b0}},operand_a[31:0]} >> operand_b[4:0]) | ({{CVA6Cfg.XLEN-32{1'b0}},operand_a[31:0]} << (CVA6Cfg.XLEN-32-operand_b[4:0]));
         unique case (fu_data_i.operation)
           CLZW, CTZW:
-          result_o = (lz_tz_wempty) ? 32 : {{CVA6Cfg.XLEN - 5{1'b0}}, lz_tz_wcount};  // change
+          result_o = (lz_tz_wempty) ? 32 : {{CVA6Cfg.XLEN - 5{1'b0}}, lz_tz_wcount};
           ROLW: result_o = {{CVA6Cfg.XLEN - 32{rolw[31]}}, rolw};
           RORW, RORIW: result_o = {{CVA6Cfg.XLEN - 32{rorw[31]}}, rorw};
           default: ;
@@ -346,12 +315,6 @@ module alu
         MAXU: result_o = less ? operand_b : operand_a;
         MIN:  result_o = ~less ? operand_b : operand_a;
         MINU: result_o = ~less ? operand_b : operand_a;
-
-        // Single bit instructions operations
-        BCLR, BCLRI: result_o = operand_a & ~bit_indx;
-        BEXT, BEXTI: result_o = {{CVA6Cfg.XLEN - 1{1'b0}}, |(operand_a & bit_indx)};
-        BINV, BINVI: result_o = operand_a ^ bit_indx;
-        BSET, BSETI: result_o = operand_a | bit_indx;
 
         // Count Leading/Trailing Zeros
         CLZ, CTZ:
@@ -376,20 +339,10 @@ module alu
         ORCB: result_o = orcbw_result;
         REV8: result_o = rev8w_result;
 
-        default:
-        if (fu_data_i.operation == SLLIUW && CVA6Cfg.IS_XLEN64)
-          result_o = {{CVA6Cfg.XLEN-32{1'b0}}, operand_a[31:0]} << operand_b[5:0];  // Left Shift 32 bit unsigned
+        default: ;
       endcase
     end
-    if (CVA6Cfg.RVZiCond) begin
-      unique case (fu_data_i.operation)
-        CZERO_EQZ:
-        result_o = (|operand_b) ? operand_a : '0;  // move zero to rd if rs2 is equal to zero else rs1
-        CZERO_NEZ:
-        result_o = (|operand_b) ? '0 : operand_a;  // move zero to rd if rs2 is nonzero else rs1
-        default: ;  // default case to suppress unique warning
-      endcase
-    end
+    // RVZiCond removed (CVA6Cfg.RVZiCond=0)
     // Xtheadcondmov: conditional move using old rd value (via imm field)
     if (CVA6Cfg.XtheadCondMov) begin
       unique case (fu_data_i.operation)
@@ -400,24 +353,6 @@ module alu
         default: ;
       endcase
     end
-    // ZKN instructions
-    if (CVA6Cfg.ZKN && CVA6Cfg.RVB) begin
-      unique case (fu_data_i.operation)
-        PACK:
-        result_o = (CVA6Cfg.IS_XLEN32) ? ({operand_b[15:0], operand_a[15:0]}) : ({operand_b[31:0], operand_a[31:0]});
-        PACK_H:
-        result_o = (CVA6Cfg.IS_XLEN32) ? ({16'b0, operand_b[7:0], operand_a[7:0]}) : ({48'b0, operand_b[7:0], operand_a[7:0]});
-        BREV8: result_o = brev8_reversed;
-        XPERM8: result_o = xperm8_result;
-        XPERM4: result_o = xperm4_result;
-        default: ;
-      endcase
-      if (fu_data_i.operation == PACK_W && CVA6Cfg.IS_XLEN64)
-        result_o = {{32{operand_b[15]}}, {operand_b[15:0]}, {operand_a[15:0]}};
-      if (CVA6Cfg.IS_XLEN32) begin
-        if (fu_data_i.operation == UNZIP) result_o = unzip_gen;
-        if (fu_data_i.operation == ZIP) result_o = zip_gen;
-      end
-    end
+    // ZKN result mux removed (CVA6Cfg.ZKN=0)
   end
 endmodule

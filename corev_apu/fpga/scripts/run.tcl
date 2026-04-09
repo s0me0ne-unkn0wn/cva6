@@ -56,6 +56,7 @@ source scripts/add_sources.tcl
 set_property top ${project}_xilinx [current_fileset]
 
 if {$::env(BOARD) eq "genesys2"} {
+    set_property verilog_define {GENESYSII=1 KINTEX7=1} [current_fileset]
     read_verilog -sv {src/genesysii.svh ../../vendor/pulp-platform/common_cells/include/common_cells/registers.svh}
     set file "src/genesysii.svh"
     set registers "../../vendor/pulp-platform/common_cells/include/common_cells/registers.svh"
@@ -78,7 +79,7 @@ if {$::env(BOARD) eq "genesys2"} {
 set file_obj [get_files -of_objects [get_filesets sources_1] [list "*$file" "$registers"]]
 set_property -dict { file_type {Verilog Header} is_global_include 1} -objects $file_obj
 
-update_compile_order -fileset sources_1
+set_property source_mgmt_mode None [current_project]
 
 add_files -fileset constrs_1 -norecurse constraints/$project.xdc
 

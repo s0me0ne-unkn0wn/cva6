@@ -802,52 +802,15 @@ module cva6
   assign ex_ex_ex_id[FPU_WB]    = fpu_exception_ex_id;
   assign wt_valid_ex_id[FPU_WB] = fpu_valid_ex_id;
 
-  if (CVA6Cfg.CvxifEn) begin
-    always_comb begin : gen_cvxif_input_assignment
-      x_compressed_ready = cvxif_resp_i.compressed_ready;
-      x_compressed_resp  = cvxif_resp_i.compressed_resp;
-      x_issue_ready      = cvxif_resp_i.issue_ready;
-      x_issue_resp       = cvxif_resp_i.issue_resp;
-      x_register_ready   = cvxif_resp_i.register_ready;
-      x_result_valid     = cvxif_resp_i.result_valid;
-      x_result           = cvxif_resp_i.result;
-    end
-
-    always_comb begin : gen_cvxif_output_assignment
-      cvxif_req.compressed_valid = x_compressed_valid;
-      cvxif_req.compressed_req   = x_compressed_req;
-      cvxif_req.issue_valid      = x_issue_valid;
-      cvxif_req.issue_req        = x_issue_req;
-      cvxif_req.register_valid   = x_register_valid;
-      cvxif_req.register         = x_register;
-      cvxif_req.commit_valid     = x_commit_valid;
-      cvxif_req.commit           = x_commit;
-      cvxif_req.result_ready     = x_result_ready;
-    end
-    assign trans_id_ex_id[X_WB] = x_trans_id_ex_id;
-    assign wbdata_ex_id[X_WB]   = x_result_ex_id;
-    assign ex_ex_ex_id[X_WB]    = x_exception_ex_id;
-    assign wt_valid_ex_id[X_WB] = x_valid_ex_id;
-  end else if (CVA6Cfg.EnableAccelerator) begin
-    assign cvxif_req = '0;
-    assign trans_id_ex_id[ACC_WB] = acc_trans_id_ex_id;
-    assign wbdata_ex_id[ACC_WB]   = acc_result_ex_id;
-    assign ex_ex_ex_id[ACC_WB]    = acc_exception_ex_id;
-    assign wt_valid_ex_id[ACC_WB] = acc_valid_ex_id;
-  end else begin
-    assign cvxif_req = '0;
-    assign x_compressed_ready = '0;
-    assign x_compressed_resp = '0;
-    assign x_issue_ready = '0;
-    assign x_issue_resp = '0;
-    assign x_register_ready = '0;
-    assign x_result_valid = '0;
-    assign x_result = '0;
-  end
-
-  if (CVA6Cfg.CvxifEn && CVA6Cfg.EnableAccelerator) begin : gen_err_xif_and_acc
-    $error("X-interface and accelerator port cannot be enabled at the same time.");
-  end
+  // CVXIF and Accelerator disabled - default all X-interface signals to zero
+  assign cvxif_req = '0;
+  assign x_compressed_ready = '0;
+  assign x_compressed_resp = '0;
+  assign x_issue_ready = '0;
+  assign x_issue_resp = '0;
+  assign x_register_ready = '0;
+  assign x_result_valid = '0;
+  assign x_result = '0;
 
   // ---------
   // Issue
@@ -1032,10 +995,6 @@ module cva6
       // FPU
       .fpu_ready_o             (fpu_ready_ex_id),
       .fpu_valid_i             (fpu_valid_id_ex),
-      .fpu_fmt_i               (fpu_fmt_id_ex),
-      .fpu_rm_i                (fpu_rm_id_ex),
-      .fpu_frm_i               (frm_csr_id_issue_ex),
-      .fpu_prec_i              (fprec_csr_ex),
       .fpu_trans_id_o          (fpu_trans_id_ex_id),
       .fpu_result_o            (fpu_result_ex_id),
       .fpu_valid_o             (fpu_valid_ex_id),
@@ -1360,28 +1319,17 @@ module cva6
   dcache_req_o_t [NumPorts-1:0] dcache_req_from_cache;
 
   // D$ request
-  // Since ZCMT is only enabled for embedded class so MMU should be disabled.
-  // Cache port 0 is being utilized in implicit read access in ZCMT extension.
-  if (CVA6Cfg.RVZCMT & ~(CVA6Cfg.MmuPresent)) begin
-    assign dcache_req_to_cache[0] = dcache_req_ports_id_cache;
-  end else begin
-    assign dcache_req_to_cache[0] = dcache_req_ports_ex_cache[0];
-  end
+  // RVZCMT disabled - use standard cache port 0 routing
+  assign dcache_req_to_cache[0] = dcache_req_ports_ex_cache[0];
   assign dcache_req_to_cache[1] = dcache_req_ports_ex_cache[1];
   assign dcache_req_to_cache[2] = dcache_req_ports_acc_cache[0];
   assign dcache_req_to_cache[3] = dcache_req_ports_ex_cache[2].data_req ? dcache_req_ports_ex_cache [2] :
                                                                           dcache_req_ports_acc_cache[1];
 
   // D$ response
-  // Since ZCMT is only enabled for embedded class so MMU should be disabled.
-  // Cache port 0 is being utilized in implicit read access in ZCMT extension.
-  if (CVA6Cfg.RVZCMT & ~(CVA6Cfg.MmuPresent)) begin
-    assign dcache_req_ports_cache_id = dcache_req_from_cache[0];
-    assign dcache_req_ports_cache_ex[0] = '0;
-  end else begin
-    assign dcache_req_ports_cache_ex[0] = dcache_req_from_cache[0];
-    assign dcache_req_ports_cache_id = '0;
-  end
+  // RVZCMT disabled - use standard cache port 0 routing
+  assign dcache_req_ports_cache_ex[0] = dcache_req_from_cache[0];
+  assign dcache_req_ports_cache_id = '0;
   assign dcache_req_ports_cache_ex[1]  = dcache_req_from_cache[1];
   assign dcache_req_ports_cache_acc[0] = dcache_req_from_cache[2];
   always_comb begin : gen_dcache_req_store_data_gnt
@@ -1573,95 +1521,33 @@ module cva6
   // Accelerator
   // ----------------
 
-  if (CVA6Cfg.EnableAccelerator) begin : gen_accelerator
-    acc_dispatcher #(
-        .CVA6Cfg           (CVA6Cfg),
-        .fu_data_t         (fu_data_t),
-        .dcache_req_i_t    (dcache_req_i_t),
-        .dcache_req_o_t    (dcache_req_o_t),
-        .exception_t       (exception_t),
-        .scoreboard_entry_t(scoreboard_entry_t),
-        .acc_cfg_t         (acc_cfg_t),
-        .AccCfg            (AccCfg),
-        .acc_req_t         (cvxif_req_t),
-        .acc_resp_t        (cvxif_resp_t),
-        .accelerator_req_t (accelerator_req_t),
-        .accelerator_resp_t(accelerator_resp_t),
-        .acc_mmu_req_t     (acc_mmu_req_t),
-        .acc_mmu_resp_t    (acc_mmu_resp_t)
-    ) i_acc_dispatcher (
-        .clk_i                 (clk_i),
-        .rst_ni                (rst_ni),
-        .flush_unissued_instr_i(flush_unissued_instr_ctrl_id),
-        .flush_ex_i            (flush_ctrl_ex),
-        .flush_pipeline_o      (flush_acc),
-        .single_step_o         (single_step_acc_commit),
-        .acc_cons_en_i         (acc_cons_en_csr),
-        .acc_fflags_valid_o    (acc_resp_fflags_valid),
-        .acc_fflags_o          (acc_resp_fflags),
-        .ld_st_priv_lvl_i      (ld_st_priv_lvl_csr_ex),
-        .sum_i                 (sum_csr_ex),
-        .pmpcfg_i              (pmpcfg),
-        .pmpaddr_i             (pmpaddr),
-        .fcsr_frm_i            (frm_csr_id_issue_ex),
-        .acc_mmu_en_i          (enable_translation_csr_ex),
-        .dirty_v_state_o       (dirty_v_state),
-        .issue_instr_i         (issue_instr_id_acc),
-        .issue_instr_hs_i      (issue_instr_hs_id_acc),
-        .issue_stall_o         (stall_acc_id),
-        .fu_data_i             (fu_data_id_ex[0]),
-        .commit_instr_i        (commit_instr_id_commit),
-        .commit_st_barrier_i   (fence_i_commit_controller | fence_commit_controller),
-        .acc_trans_id_o        (acc_trans_id_ex_id),
-        .acc_result_o          (acc_result_ex_id),
-        .acc_valid_o           (acc_valid_ex_id),
-        .acc_exception_o       (acc_exception_ex_id),
-        .acc_valid_ex_o        (acc_valid_acc_ex),
-        .commit_ack_i          (commit_ack),
-        .acc_stall_st_pending_o(stall_st_pending_ex),
-        .acc_no_st_pending_i   (no_st_pending_commit),
-        .dcache_req_ports_i    (dcache_req_ports_ex_cache),
-        .acc_mmu_req_o         (acc_mmu_req),
-        .acc_mmu_resp_i        (acc_mmu_resp),
-        .ctrl_halt_o           (halt_acc_ctrl),
-        .csr_addr_i            (csr_addr_ex_csr),
-        .acc_dcache_req_ports_o(dcache_req_ports_acc_cache),
-        .acc_dcache_req_ports_i(dcache_req_ports_cache_acc),
-        .inval_ready_i         (inval_ready),
-        .inval_valid_o         (inval_valid),
-        .inval_addr_o          (inval_addr),
-        .acc_req_o             (cvxif_req_o),
-        .acc_resp_i            (cvxif_resp_i)
-    );
-  end : gen_accelerator
-  else begin : gen_no_accelerator
-    assign acc_trans_id_ex_id         = '0;
-    assign acc_result_ex_id           = '0;
-    assign acc_valid_ex_id            = '0;
-    assign acc_exception_ex_id        = '0;
-    assign acc_resp_fflags            = '0;
-    assign acc_resp_fflags_valid      = '0;
-    assign stall_acc_id               = '0;
-    assign dirty_v_state              = '0;
-    assign acc_valid_acc_ex           = '0;
-    assign halt_acc_ctrl              = '0;
-    assign stall_st_pending_ex        = '0;
-    assign flush_acc                  = '0;
-    assign single_step_acc_commit     = '0;
+  // Accelerator disabled - default all accelerator outputs to zero
+  assign acc_trans_id_ex_id         = '0;
+  assign acc_result_ex_id           = '0;
+  assign acc_valid_ex_id            = '0;
+  assign acc_exception_ex_id        = '0;
+  assign acc_resp_fflags            = '0;
+  assign acc_resp_fflags_valid      = '0;
+  assign stall_acc_id               = '0;
+  assign dirty_v_state              = '0;
+  assign acc_valid_acc_ex           = '0;
+  assign halt_acc_ctrl              = '0;
+  assign stall_st_pending_ex        = '0;
+  assign flush_acc                  = '0;
+  assign single_step_acc_commit     = '0;
 
-    // D$ connection is unused
-    assign dcache_req_ports_acc_cache = '0;
+  // D$ connection is unused
+  assign dcache_req_ports_acc_cache = '0;
 
-    // MMU access is unused
-    assign acc_mmu_req                = '0;
+  // MMU access is unused
+  assign acc_mmu_req                = '0;
 
-    // No invalidation interface
-    assign inval_valid                = '0;
-    assign inval_addr                 = '0;
+  // No invalidation interface
+  assign inval_valid                = '0;
+  assign inval_addr                 = '0;
 
-    // Feed through cvxif
-    assign cvxif_req_o                = cvxif_req;
-  end : gen_no_accelerator
+  // Feed through cvxif
+  assign cvxif_req_o                = cvxif_req;
 
   // -------------------
   // Parameter Check
@@ -1881,12 +1767,5 @@ module cva6
       .rvfi_probes_o(rvfi_probes_o)
 
   );
-
-  //pragma translate_off
-  initial begin
-    assert (!(CVA6Cfg.SuperscalarEn && CVA6Cfg.EnableAccelerator))
-    else $fatal(1, "Accelerator is not supported by superscalar pipeline");
-  end
-  //pragma translate_on
 
 endmodule  // ariane

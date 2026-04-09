@@ -71,24 +71,7 @@ module compressed_decoder #(
           end
 
           riscv::OpcodeC0Fld: begin
-            if (CVA6Cfg.FpPresent) begin
-              // c.fld -> fld rd', imm(rs1')
-              // CLD: | funct3 | imm[5:3] | rs1' | imm[7:6] | rd' | C0 |
-              instr_o = {
-                4'b0,
-                instr_i[6:5],
-                instr_i[12:10],
-                3'b000,
-                2'b01,
-                instr_i[9:7],
-                3'b011,
-                2'b01,
-                instr_i[4:2],
-                riscv::OpcodeLoadFp
-              };
-            end else begin
-              illegal_instr_o = 1'b1;
-            end
+            illegal_instr_o = 1'b1;
           end
 
           riscv::OpcodeC0Lw: begin
@@ -128,138 +111,17 @@ module compressed_decoder #(
                 riscv::OpcodeLoad
               };
             end else begin
-              if (CVA6Cfg.FpPresent) begin
-                // CFLW: | funct3 (change to LW) | imm[5:3] | rs1' | imm[2|6] | rd' | C0 |
-                instr_o = {
-                  5'b0,
-                  instr_i[5],
-                  instr_i[12:10],
-                  instr_i[6],
-                  2'b00,
-                  2'b01,
-                  instr_i[9:7],
-                  3'b010,
-                  2'b01,
-                  instr_i[4:2],
-                  riscv::OpcodeLoadFp
-                };
-              end else begin
-                illegal_instr_o = 1'b1;
-              end
+              illegal_instr_o = 1'b1;
             end
           end
 
           riscv::OpcodeC0Zcb: begin
-            if (CVA6Cfg.RVZCB) begin
-              unique case (instr_i[12:10])
-                3'b000: begin
-                  // c.lbu -> lbu rd', uimm(rs1')
-                  instr_o = {
-                    10'b0,
-                    instr_i[5],
-                    instr_i[6],
-                    2'b01,
-                    instr_i[9:7],
-                    3'b100,
-                    2'b01,
-                    instr_i[4:2],
-                    riscv::OpcodeLoad
-                  };
-                end
-
-                3'b001: begin
-                  if (instr_i[6]) begin
-                    // c.lh -> lh rd', uimm(rs1')
-                    instr_o = {
-                      10'b0,
-                      instr_i[5],
-                      1'b0,
-                      2'b01,
-                      instr_i[9:7],
-                      3'b001,
-                      2'b01,
-                      instr_i[4:2],
-                      riscv::OpcodeLoad
-                    };
-                  end else begin
-                    // c.lhu -> lhu rd', uimm(rs1')
-                    instr_o = {
-                      10'b0,
-                      instr_i[5],
-                      1'b0,
-                      2'b01,
-                      instr_i[9:7],
-                      3'b101,
-                      2'b01,
-                      instr_i[4:2],
-                      riscv::OpcodeLoad
-                    };
-                  end
-                end
-
-                3'b010: begin
-                  // c.sb -> sb rs2', uimm(rs1')
-                  instr_o = {
-                    7'b0,
-                    2'b01,
-                    instr_i[4:2],
-                    2'b01,
-                    instr_i[9:7],
-                    3'b000,
-                    3'b0,
-                    instr_i[5],
-                    instr_i[6],
-                    riscv::OpcodeStore
-                  };
-                end
-
-                3'b011: begin
-                  // c.sh -> sh rs2', uimm(rs1')
-                  instr_o = {
-                    7'b0,
-                    2'b01,
-                    instr_i[4:2],
-                    2'b01,
-                    instr_i[9:7],
-                    3'b001,
-                    3'b0,
-                    instr_i[5],
-                    1'b0,
-                    riscv::OpcodeStore
-                  };
-                  if (instr_i[6] == 1'b1) illegal_instr_o = 1'b1;
-                end
-
-                default: begin
-                  illegal_instr_o = 1'b1;
-                end
-              endcase
-
-            end else begin
-              instr_o = instr_i;
-              illegal_instr_o = 1'b1;
-            end
+            instr_o = instr_i;
+            illegal_instr_o = 1'b1;
           end
 
           riscv::OpcodeC0Fsd: begin
-            if (CVA6Cfg.FpPresent) begin
-              // c.fsd -> fsd rs2', imm(rs1')
-              instr_o = {
-                4'b0,
-                instr_i[6:5],
-                instr_i[12],
-                2'b01,
-                instr_i[4:2],
-                2'b01,
-                instr_i[9:7],
-                3'b011,
-                instr_i[11:10],
-                3'b000,
-                riscv::OpcodeStoreFp
-              };
-            end else begin
-              illegal_instr_o = 1'b1;
-            end
+            illegal_instr_o = 1'b1;
           end
 
           riscv::OpcodeC0Sw: begin
@@ -300,24 +162,7 @@ module compressed_decoder #(
                 riscv::OpcodeStore
               };
             end else begin
-              if (CVA6Cfg.FpPresent) begin
-                instr_o = {
-                  5'b0,
-                  instr_i[5],
-                  instr_i[12],
-                  2'b01,
-                  instr_i[4:2],
-                  2'b01,
-                  instr_i[9:7],
-                  3'b010,
-                  instr_i[11:10],
-                  instr_i[6],
-                  2'b00,
-                  riscv::OpcodeStoreFp
-                };
-              end else begin
-                illegal_instr_o = 1'b1;
-              end
+              illegal_instr_o = 1'b1;
             end
           end
 
@@ -559,144 +404,13 @@ module compressed_decoder #(
                   end
 
                   3'b110: begin
-                    if (CVA6Cfg.RVZCB) begin
-                      // c.mul -> mul rd', rd', rs2'
-                      instr_o = {
-                        6'b0,
-                        1'b1,
-                        2'b01,
-                        instr_i[4:2],
-                        2'b01,
-                        instr_i[9:7],
-                        3'b000,
-                        2'b01,
-                        instr_i[9:7],
-                        riscv::OpcodeOp
-                      };
-                    end else begin
-                      instr_o = instr_i;
-                      illegal_instr_o = 1'b1;
-                    end
+                    instr_o = instr_i;
+                    illegal_instr_o = 1'b1;
                   end
 
                   3'b111: begin
-                    if (CVA6Cfg.RVZCB) begin
-
-                      unique case (instr_i[4:2])
-                        3'b000: begin
-                          // c.zext.b -> andi rd', rd', 0xff
-                          instr_o = {
-                            4'b0,
-                            8'hFF,
-                            2'b01,
-                            instr_i[9:7],
-                            3'b111,
-                            2'b01,
-                            instr_i[9:7],
-                            riscv::OpcodeOpImm
-                          };
-                        end
-
-                        3'b001: begin
-                          if (CVA6Cfg.RVB) begin
-                            // c.sext.b -> sext.b rd', rd'
-                            instr_o = {
-                              7'h30,
-                              5'h4,
-                              2'b01,
-                              instr_i[9:7],
-                              3'b001,
-                              2'b01,
-                              instr_i[9:7],
-                              riscv::OpcodeOpImm
-                            };
-                          end else illegal_instr_o = 1'b1;
-                        end
-
-                        3'b010: begin
-                          if (CVA6Cfg.RVB) begin
-                            // c.zext.h -> zext.h rd', rd'
-                            if (CVA6Cfg.IS_XLEN64) begin
-                              instr_o = {
-                                7'h4,
-                                5'h0,
-                                2'b01,
-                                instr_i[9:7],
-                                3'b100,
-                                2'b01,
-                                instr_i[9:7],
-                                riscv::OpcodeOp32
-                              };
-                            end else begin
-                              instr_o = {
-                                7'h4,
-                                5'h0,
-                                2'b01,
-                                instr_i[9:7],
-                                3'b100,
-                                2'b01,
-                                instr_i[9:7],
-                                riscv::OpcodeOp
-                              };
-                            end
-                          end else illegal_instr_o = 1'b1;
-                        end
-
-                        3'b011: begin
-                          if (CVA6Cfg.RVB) begin
-                            // c.sext.h -> sext.h rd', rd'
-                            instr_o = {
-                              7'h30,
-                              5'h5,
-                              2'b01,
-                              instr_i[9:7],
-                              3'b001,
-                              2'b01,
-                              instr_i[9:7],
-                              riscv::OpcodeOpImm
-                            };
-                          end else illegal_instr_o = 1'b1;
-                        end
-
-                        3'b100: begin
-                          if (CVA6Cfg.RVB) begin
-                            // c.zext.w -> add.uw
-                            if (CVA6Cfg.IS_XLEN64) begin
-                              instr_o = {
-                                7'h4,
-                                5'h0,
-                                2'b01,
-                                instr_i[9:7],
-                                3'b000,
-                                2'b01,
-                                instr_i[9:7],
-                                riscv::OpcodeOp32
-                              };
-                            end else begin
-                              illegal_instr_o = 1'b1;
-                            end
-                          end else illegal_instr_o = 1'b1;
-                        end
-
-                        3'b101: begin
-                          // c.not -> xori rd', rd', -1
-                          instr_o = {
-                            12'hFFF,
-                            2'b01,
-                            instr_i[9:7],
-                            3'b100,
-                            2'b01,
-                            instr_i[9:7],
-                            riscv::OpcodeOpImm
-                          };
-                        end
-
-                        default: begin
-                          instr_o = instr_i;
-                          illegal_instr_o = 1;
-                        end
-                      endcase
-                    end
+                    instr_o = instr_i;
+                    illegal_instr_o = 1'b1;
                   end
                 endcase
               end
@@ -759,22 +473,7 @@ module compressed_decoder #(
           end
 
           riscv::OpcodeC2Fldsp: begin
-            if (CVA6Cfg.FpPresent) begin
-              // c.fldsp -> fld rd, imm(x2)
-              instr_o = {
-                3'b0,
-                instr_i[4:2],
-                instr_i[12],
-                instr_i[6:5],
-                3'b000,
-                5'h02,
-                3'b011,
-                instr_i[11:7],
-                riscv::OpcodeLoadFp
-              };
-            end else begin
-              illegal_instr_o = 1'b1;
-            end
+            illegal_instr_o = 1'b1;
           end
 
           riscv::OpcodeC2Lwsp: begin
@@ -812,21 +511,7 @@ module compressed_decoder #(
               };
               if (instr_i[11:7] == 5'b0) illegal_instr_o = 1'b1;
             end else begin
-              if (CVA6Cfg.FpPresent) begin
-                instr_o = {
-                  4'b0,
-                  instr_i[3:2],
-                  instr_i[12],
-                  instr_i[6:4],
-                  2'b00,
-                  5'h02,
-                  3'b010,
-                  instr_i[11:7],
-                  riscv::OpcodeLoadFp
-                };
-              end else begin
-                illegal_instr_o = 1'b1;
-              end
+              illegal_instr_o = 1'b1;
             end
           end
 
@@ -858,25 +543,7 @@ module compressed_decoder #(
           end
 
           riscv::OpcodeC2Fsdsp: begin
-            if (CVA6Cfg.FpPresent) begin
-              // c.fsdsp -> fsd rs2, imm(x2)
-              instr_o = {
-                3'b0,
-                instr_i[9:7],
-                instr_i[12],
-                instr_i[6:2],
-                5'h02,
-                3'b011,
-                instr_i[11:10],
-                3'b000,
-                riscv::OpcodeStoreFp
-              };
-            end else if (CVA6Cfg.RVZCMP && (instr_i[12:10] == 3'b110 || instr_i[12:10] == 3'b111 || instr_i[12:10] == 3'b011)) begin
-              is_macro_instr_o = 1;
-              instr_o = instr_i;
-            end else if (CVA6Cfg.RVZCMT && (instr_i[12:10] == 3'b000))  //jt/jalt instruction
-              is_zcmt_instr_o = 1'b1;
-            else illegal_instr_o = 1'b1;
+            illegal_instr_o = 1'b1;
           end
           riscv::OpcodeC2Swsp: begin
             // c.swsp -> sw rs2, imm(x2)
@@ -911,21 +578,7 @@ module compressed_decoder #(
                 riscv::OpcodeStore
               };
             end else begin
-              if (CVA6Cfg.FpPresent) begin
-                instr_o = {
-                  4'b0,
-                  instr_i[8:7],
-                  instr_i[12],
-                  instr_i[6:2],
-                  5'h02,
-                  3'b010,
-                  instr_i[11:9],
-                  2'b00,
-                  riscv::OpcodeStoreFp
-                };
-              end else begin
-                illegal_instr_o = 1'b1;
-              end
+              illegal_instr_o = 1'b1;
             end
           end
 

@@ -450,10 +450,8 @@ module frontend
           icache_gva_q    <= 1'b0;
         end
 
-        // Map the only three exceptions which can occur in the frontend to a two bit enum
-        if (CVA6Cfg.MmuPresent && icache_dreq_i.ex.cause == riscv::INSTR_GUEST_PAGE_FAULT) begin
-          icache_ex_valid_q <= ariane_pkg::FE_INSTR_GUEST_PAGE_FAULT;
-        end else if (CVA6Cfg.MmuPresent && icache_dreq_i.ex.cause == riscv::INSTR_PAGE_FAULT) begin
+        // Map the exceptions which can occur in the frontend to a two bit enum
+        if (CVA6Cfg.MmuPresent && icache_dreq_i.ex.cause == riscv::INSTR_PAGE_FAULT) begin
           icache_ex_valid_q <= ariane_pkg::FE_INSTR_PAGE_FAULT;
         end else if (icache_dreq_i.ex.cause == riscv::INSTR_ACCESS_FAULT) begin
           icache_ex_valid_q <= ariane_pkg::FE_INSTR_ACCESS_FAULT;
