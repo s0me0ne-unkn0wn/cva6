@@ -458,7 +458,7 @@ package config_pkg;
     assert (Cfg.NrExecuteRegionRules <= NrMaxRules);
     assert (Cfg.NrCachedRegionRules <= NrMaxRules);
     assert (Cfg.NrPMPEntries <= 64);
-    assert (Cfg.FETCH_WIDTH == 32 || Cfg.FETCH_WIDTH == 64)
+    assert (Cfg.FETCH_WIDTH == 32 || Cfg.FETCH_WIDTH == 64 || Cfg.FETCH_WIDTH == 128)
     else $fatal(1, "[frontend] fetch width != not supported");
     // Support for disabling MIP.MSIP and MIE.MSIE in Hypervisor and Supervisor mode is not supported
     // Software Interrupt can be disabled when there is only M machine mode in CVA6.

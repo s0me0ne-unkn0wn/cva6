@@ -172,7 +172,13 @@ package build_config_pkg;
     cfg.FETCH_USER_EN = CVA6Cfg.FetchUserEn;
     cfg.AXI_USER_EN = CVA6Cfg.DataUserEn | CVA6Cfg.FetchUserEn;
 
-    cfg.FETCH_WIDTH = unsigned'(CVA6Cfg.SuperscalarEn ? 64 : 32);
+    // ADR-10 / sub-phase 4.5: PVM config widens fetch to 128 bits (16 B aligned).
+    // The legacy assertion in config_pkg.sv now accepts 32|64|128.
+    // INSTR_PER_FETCH for PVM: 128/8 = 16 bytes per fetch; PVM has variable-
+    // length instructions so this value is used only for buffer sizing.
+    cfg.FETCH_WIDTH = cva6_config_pkg::CVA6ConfigUsePvmIsa
+                      ? unsigned'(128)
+                      : unsigned'(CVA6Cfg.SuperscalarEn ? 64 : 32);
     cfg.FETCH_ALIGN_BITS = $clog2(cfg.FETCH_WIDTH / 8);
     cfg.INSTR_PER_FETCH = cfg.FETCH_WIDTH / (CVA6Cfg.RVC ? 16 : 32);
     cfg.LOG2_INSTR_PER_FETCH = cfg.INSTR_PER_FETCH > 1 ? $clog2(cfg.INSTR_PER_FETCH) : 1;

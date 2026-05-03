@@ -108,7 +108,11 @@ module id_stage #(
     // Data cache request ouput - CACHE
     input dcache_req_o_t dcache_req_ports_i,
     // Data cache request input - CACHE
-    output dcache_req_i_t dcache_req_ports_o
+    output dcache_req_i_t dcache_req_ports_o,
+    // PVM fetch chunks from top-level pvm_frontend (sub-phase 3) - FRONTEND
+    input polkavm_pkg::pvm_fetch_chunk_t [CVA6Cfg.NrIssuePorts-1:0] pvm_fc_if_id_i,
+    // PVM PC from top-level pvm_frontend (sub-phase 3) - FRONTEND
+    input logic [CVA6Cfg.VLEN-1:0] pvm_fe_pc_i
 );
   // ID/ISSUE register stage
   typedef struct packed {
@@ -165,53 +169,13 @@ module id_stage #(
   logic              [CVA6Cfg.NrIssuePorts-1:0]       is_compressed_deco;
 
 
-  if (CVA6Cfg.RVC) begin
-    // ---------------------------------------------------------
-    // 1. Check if they are compressed and expand in case they are
-    // ---------------------------------------------------------
-    for (genvar i = 0; i < CVA6Cfg.NrIssuePorts; i++) begin
-      compressed_decoder #(
-          .CVA6Cfg(CVA6Cfg)
-      ) compressed_decoder_i (
-          .instr_i         (fetch_entry_i[i].instruction),
-          .instr_o         (instruction_rvc[i]),
-          .illegal_instr_o (is_illegal_rvc[i]),
-          .is_compressed_o (is_compressed_rvc[i]),
-          .is_macro_instr_o(is_macro_instr[i]),
-          .is_zcmt_instr_o (is_zcmt_instr[i])
-      );
-    end
-
-    if (CVA6Cfg.SuperscalarEn) begin
-      assign stall_instr_fetch[1] = is_illegal_rvc[1] || is_macro_instr[1] || is_zcmt_instr[1];
-    end
-
-    assign instruction_zcmp         = instruction_rvc;
-    assign is_illegal_zcmp          = is_illegal_rvc;
-    assign is_compressed_zcmp       = is_compressed_rvc;
-    assign stall_macro_deco_zcmp    = '0;
-    assign is_last_macro_instr      = '0;
-    assign is_double_rd_macro_instr = '0;
-
-    assign instruction_zcmt      = instruction_rvc;
-    assign is_illegal_zcmt       = is_illegal_rvc;
-    assign is_compressed_zcmt    = is_compressed_rvc;
-    assign stall_macro_deco_zcmt = '0;
-    assign jump_address          = '0;
-
-    assign instruction_cvxif_i = instruction_zcmp;
-    assign is_illegal_cvxif_i = is_illegal_zcmp;
-    assign is_compressed_cvxif_i = is_compressed_zcmp;
-    assign stall_macro_deco = stall_macro_deco_zcmp;
-
-    assign stall_instr_fetch[0] = stall_macro_deco;
-  end else begin
-    for (genvar i = 0; i < CVA6Cfg.NrIssuePorts; i++) begin
-      assign is_illegal_rvc[i] = 1'b0;
-      assign instruction_rvc[i] = fetch_entry_i[i].instruction;
-      assign is_compressed_rvc[i] = 1'b0;
-      assign stall_instr_fetch[i] = 1'b0;
-    end
+  // RVC permanently disabled in PVM-native build (sub-phase 9 deleted compressed_decoder.sv).
+  // Drive RVC-related signals to inert defaults so downstream consumers see no compressed input.
+  for (genvar i = 0; i < CVA6Cfg.NrIssuePorts; i++) begin : g_no_rvc
+    assign is_illegal_rvc[i]    = 1'b0;
+    assign instruction_rvc[i]   = fetch_entry_i[i].instruction;
+    assign is_compressed_rvc[i] = 1'b0;
+    assign stall_instr_fetch[i] = 1'b0;
   end
 
   // ---------------------------------------------------------
@@ -227,54 +191,128 @@ module id_stage #(
 
   assign rvfi_is_compressed_o = is_compressed_rvc;
 
-  for (genvar i = 0; i < CVA6Cfg.NrIssuePorts; i++) begin
-    decoder #(
-        .CVA6Cfg(CVA6Cfg),
-        .branchpredict_sbe_t(branchpredict_sbe_t),
-        .exception_t(exception_t),
-        .irq_ctrl_t(irq_ctrl_t),
-        .scoreboard_entry_t(scoreboard_entry_t),
-        .interrupts_t(interrupts_t),
-        .INTERRUPTS(INTERRUPTS)
-    ) decoder_i (
-        .debug_req_i,
-        .irq_ctrl_i,
-        .irq_i,
-        .pc_i                      (fetch_entry_i[i].address),
-        .is_compressed_i           (is_compressed_deco[i]),
-        .is_macro_instr_i          (is_macro_instr[i]),
-        .is_zcmt_i                 (is_zcmt_instr[i]),
-        .is_last_macro_instr_i     (is_last_macro_instr),
-        .is_double_rd_macro_instr_i(is_double_rd_macro_instr),
-        .jump_address_i            (jump_address),
-        .is_illegal_i              (is_illegal_deco[i]),
-        .instruction_i             (instruction_deco[i]),
-        .compressed_instr_i        (fetch_entry_i[i].instruction[15:0]),
-        .branch_predict_i          (fetch_entry_i[i].branch_predict),
-        .ex_i                      (fetch_entry_i[i].ex),
-        .priv_lvl_i                (priv_lvl_i),
-        .v_i                       (v_i),
-        .debug_mode_i              (debug_mode_i),
-        .fs_i,
-        .vfs_i,
-        .frm_i,
-        .vs_i,
-        .tvm_i,
-        .tw_i,
-        .vtw_i,
-        .tsr_i,
-        .hu_i,
-        .mcbie_i,
-        .scbie_i,
-        .hcbie_i,
-        .mcbcfe_i,
-        .scbcfe_i,
-        .hcbcfe_i,
-        .instruction_o             (decoded_instruction[i]),
-        .orig_instr_o              (orig_instr[i]),
-        .is_control_flow_instr_o   (is_control_flow_instr[i]),
-        .debug_from_trigger_i      (debug_from_trigger_i)
+  // PVM JAM v1 decoder active (CVA6ConfigUsePvmIsa=1).
+  // Legacy decoder.sv and compressed_decoder.sv deleted.
+  // Sub-phase 4: pvm_frontend provides the 128-bit instruction chunk,
+  // skip value (instruction_length - 1), and is_valid_opcode per ADR-10.
+  // ROM ports are tied to 0 here; real bootrom wiring is sub-phase 10.
+  // Branch redirect from execute is sub-phase 6+.
+
+  // Sub-phase 3: pvm_frontend, bootrom_code_64, bootrom_bitmask_64 moved to
+  // cva6.sv top level (ADR-O4 sub-option A.a). Chunk/pc arrive via ports.
+
+  for (genvar i = 0; i < CVA6Cfg.NrIssuePorts; i++) begin : g_pvm_dec_port
+    import polkavm_pkg::*;
+    import ariane_pkg::fu_t;
+    import ariane_pkg::fu_op;
+
+    pvm_op_t      pvm_op_w;
+    logic [3:0]   pvm_rs1_w, pvm_rs2_w, pvm_rd_w;
+    logic         pvm_has_rd_w, pvm_has_rs1_w, pvm_has_rs2_w;
+    logic [63:0]  pvm_imm_w, pvm_imm2_w;
+    logic         pvm_illegal_op_w, pvm_illegal_reg_w;
+    logic         pvm_is_ecalli_w;
+    logic         pvm_is_ecalli_mode_ret_w, pvm_is_ecalli_read_csr_w;
+    logic [4:0]   pvm_instr_len_w;
+    logic         pvm_is_bb_term_w;
+
+    pvm_decoder i_pvm_decoder (
+      .clk_i                            (clk_i),
+      .rst_ni                           (rst_ni),
+      // Sub-phase 3: chunk/skip/is_valid_opcode arrive via top-level ports.
+      // (Port i=0 gets the live frontend output; superscalar port i=1
+      //  is unused in PVM mode — NrIssuePorts=1 for RVE PVM config.)
+      .chunk_i                          (pvm_fc_if_id_i[i].chunk),
+      .skip_i                           ({1'b0, pvm_fc_if_id_i[i].skip}),
+      .is_valid_opcode_i                (pvm_fc_if_id_i[i].is_valid_opcode),
+      .is_s_mode_i                      (1'b0),
+      .pvm_op_o                         (pvm_op_w),
+      .rs1_o                            (pvm_rs1_w),
+      .rs2_o                            (pvm_rs2_w),
+      .rd_o                             (pvm_rd_w),
+      .imm_o                            (pvm_imm_w),
+      .imm2_o                           (pvm_imm2_w),
+      .is_illegal_op_o                  (pvm_illegal_op_w),
+      .is_illegal_reg_o                 (pvm_illegal_reg_w),
+      .is_ecalli_o                      (pvm_is_ecalli_w),
+      .is_ecalli_sentinel_mode_return_o (pvm_is_ecalli_mode_ret_w),
+      .is_ecalli_sentinel_read_csr_o    (pvm_is_ecalli_read_csr_w),
+      .instruction_length_o             (pvm_instr_len_w),
+      .has_rd_o                         (pvm_has_rd_w),
+      .has_rs1_o                        (pvm_has_rs1_w),
+      .has_rs2_o                        (pvm_has_rs2_w),
+      .is_basic_block_term_o            (pvm_is_bb_term_w)
     );
+
+    // Sub-phase 2: bridge pvm_decoder outputs → scoreboard_entry_t.
+    // Function pvm_op_to_fu_t_op() maps pvm_op_t to FU/op/pvm_alu_op.
+    pvm_decode_result_t pvm_dec_r;
+    always_comb begin : g_pvm_bridge
+      pvm_dec_r = pvm_op_to_fu_t_op(pvm_op_w);
+
+      decoded_instruction[i]          = '0;
+      decoded_instruction[i].fu       = fu_t'(pvm_dec_r.fu);
+      decoded_instruction[i].op       = fu_op'(pvm_dec_r.op);
+      decoded_instruction[i].pvm_alu_op = pvm_dec_r.pvm_alu_op;
+      decoded_instruction[i].is_pvm_op  = pvm_dec_r.is_pvm_op;
+      // PVM r0-r12 map to CVA6 x1-x13 (+1 offset) because CVA6 x0 is
+      // hardwired zero and PVM r0 is a general-purpose register.
+      // rs1/rs2/rd each get +1 only when the corresponding has_* flag is set;
+      // otherwise they map to x0 so the issue stage reads 0 / suppresses writeback.
+      // (Without this guard, default dec_rs1=0 → x1 instead of x0, causing
+      //  instructions like LOAD_IMM64 to read x1 as their source register.)
+      decoded_instruction[i].rs1      = pvm_has_rs1_w ? ({1'b0, pvm_rs1_w} + 5'd1) : 5'd0;
+      decoded_instruction[i].rs2      = pvm_has_rs2_w ? ({1'b0, pvm_rs2_w} + 5'd1) : 5'd0;
+      decoded_instruction[i].rd       = pvm_has_rd_w  ? ({1'b0, pvm_rd_w}  + 5'd1) : 5'd0;
+      // Immediate stored in result field (dual-purpose per cva6.sv:106).
+      // For store_imm_indirect_*: pack {imm2[31:0], imm1[31:0]} into result so
+      // issue_read_operands can extract address-offset (lower 32b) and store-data
+      // (upper 32b) separately.  rs2 is forced to x0 to avoid RAW stalls on the
+      // garbage b1[7:4] nibble that the decoder produces for this instruction group.
+      if (pvm_op_w == PVM_OP_STORE_IMM_INDIRECT_U8  ||
+          pvm_op_w == PVM_OP_STORE_IMM_INDIRECT_U16 ||
+          pvm_op_w == PVM_OP_STORE_IMM_INDIRECT_U32 ||
+          pvm_op_w == PVM_OP_STORE_IMM_INDIRECT_U64) begin
+        decoded_instruction[i].result  = {pvm_imm2_w[31:0], pvm_imm_w[31:0]};
+        decoded_instruction[i].rs2     = 5'd0;
+        decoded_instruction[i].use_imm = 1'b1;
+        decoded_instruction[i].is_pvm_op = 1'b1;
+      end else if (pvm_op_w == PVM_OP_BRANCH_EQ_IMM                    ||
+                   pvm_op_w == PVM_OP_BRANCH_NOT_EQ_IMM                 ||
+                   pvm_op_w == PVM_OP_BRANCH_LESS_UNSIGNED_IMM          ||
+                   pvm_op_w == PVM_OP_BRANCH_LESS_OR_EQUAL_UNSIGNED_IMM ||
+                   pvm_op_w == PVM_OP_BRANCH_GREATER_OR_EQUAL_UNSIGNED_IMM ||
+                   pvm_op_w == PVM_OP_BRANCH_GREATER_UNSIGNED_IMM       ||
+                   pvm_op_w == PVM_OP_BRANCH_LESS_SIGNED_IMM            ||
+                   pvm_op_w == PVM_OP_BRANCH_LESS_OR_EQUAL_SIGNED_IMM   ||
+                   pvm_op_w == PVM_OP_BRANCH_GREATER_OR_EQUAL_SIGNED_IMM ||
+                   pvm_op_w == PVM_OP_BRANCH_GREATER_SIGNED_IMM) begin
+        // Pack: result[31:0]  = imm2 (branch offset to add to PC),
+        //       result[63:32] = imm1 (comparand, sign-extended in issue stage).
+        // issue_read_operands will unpack for CTRL_FLOW pvm ops.
+        decoded_instruction[i].result        = {pvm_imm_w[31:0], pvm_imm2_w[31:0]};
+        decoded_instruction[i].use_imm       = 1'b1;
+        decoded_instruction[i].is_pvm_op     = 1'b1;
+        decoded_instruction[i].swap_operands = pvm_dec_r.swap_operands;
+      end else begin
+        decoded_instruction[i].result  = pvm_imm_w;
+        decoded_instruction[i].use_imm = pvm_dec_r.use_imm;
+      end
+      decoded_instruction[i].valid    = pvm_fc_if_id_i[i].valid & ~stall_instr_fetch[i];
+      decoded_instruction[i].pc       = pvm_fe_pc_i;
+      // Exception: illegal op, illegal reg, or function says illegal.
+      decoded_instruction[i].ex.valid = pvm_illegal_op_w
+                                      | pvm_illegal_reg_w
+                                      | pvm_dec_r.is_illegal;
+      decoded_instruction[i].ex.cause = riscv::ILLEGAL_INSTR;
+      // tval: lower 32 bits of the raw fetch chunk, zero-extended.
+      decoded_instruction[i].ex.tval  = {{(CVA6Cfg.XLEN-32){1'b0}},
+                                          pvm_fc_if_id_i[i].chunk[31:0]};
+      decoded_instruction[i].bp       = '0;
+    end
+
+    assign orig_instr[i]            = pvm_fc_if_id_i[i].chunk[31:0];
+    assign is_control_flow_instr[i] = pvm_is_bb_term_w;
   end
 
   // ------------------

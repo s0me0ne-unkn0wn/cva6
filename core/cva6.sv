@@ -17,6 +17,7 @@
 
 module cva6
   import ariane_pkg::*;
+  import polkavm_pkg::*;
 #(
     // CVA6 config
     parameter config_pkg::cva6_cfg_t CVA6Cfg = build_config_pkg::build_config(
@@ -119,6 +120,9 @@ module cva6
       logic is_double_rd_macro_instr;  // is double move decoded 32bit instruction of macro definition
       logic vfp;  // is this a vector floating-point instruction?
       logic is_zcmt;  //is a zcmt instruction
+      logic is_pvm_op;       // is a PolkaVM native operation (ADR-O1)
+      pvm_alu_op_e pvm_alu_op;  // PVM ALU op selector (ADR-O2; sub-phase 2)
+      logic swap_operands;  // swap rs1/comparand for reversed branch_*_imm ops
     },
     localparam type writeback_t = struct packed {
       logic valid;  // wb data is valid
@@ -178,6 +182,9 @@ module cva6
       logic [CVA6Cfg.XLEN-1:0]          operand_b;
       logic [CVA6Cfg.XLEN-1:0]          imm;
       logic [CVA6Cfg.TRANS_ID_BITS-1:0] trans_id;
+      logic                             is_pvm_op;        // ADR-O2: PVM operation flag
+      pvm_alu_op_e                      pvm_alu_op;       // ADR-O2: PVM ALU op selector
+      logic [CVA6Cfg.XLEN-1:0]          mul_upper_result; // ADR-O5: upper 64b of 128b product (sub-phase 1.5 decides side-channel)
     },
 
     localparam type icache_req_t = struct packed {
@@ -644,6 +651,14 @@ module cva6
   logic flush_commit;
   logic flush_acc;
 
+  // ecalli FSM handshake signals (PVM sub-phase 8; zero-width when USE_PVM_ISA=0)
+  logic                    ecalli_valid_commit_csr;
+  logic [31:0]             ecalli_imm_commit_csr;
+  logic [CVA6Cfg.VLEN-1:0] ecalli_pc_commit_csr;
+  logic                    ecalli_done_csr_commit;
+  logic [CVA6Cfg.VLEN-1:0] ecalli_redirect_pc_csr_commit;
+  riscv::priv_lvl_t        ecalli_redirect_priv_csr_commit;
+
   icache_areq_t icache_areq_ex_cache;
   icache_arsp_t icache_areq_cache_ex;
   icache_dreq_t icache_dreq_if_cache;
@@ -679,35 +694,120 @@ module cva6
   // --------------
   // Frontend
   // --------------
-  frontend #(
-      .CVA6Cfg(CVA6Cfg),
-      .bp_resolve_t(bp_resolve_t),
-      .fetch_entry_t(fetch_entry_t),
-      .icache_dreq_t(icache_dreq_t),
-      .icache_drsp_t(icache_drsp_t)
-  ) i_frontend (
-      .clk_i,
-      .rst_ni,
-      .boot_addr_i        (boot_addr_i[CVA6Cfg.VLEN-1:0]),
-      .flush_bp_i         (1'b0),
-      .flush_i            (flush_ctrl_if),                  // not entirely correct
-      .halt_i             (halt_ctrl),
-      .halt_frontend_i    (halt_frontend),
-      .set_pc_commit_i    (set_pc_ctrl_pcgen),
-      .pc_commit_i        (pc_commit),
-      .ex_valid_i         (ex_commit.valid),
-      .resolved_branch_i  (resolved_branch),
-      .eret_i             (eret),
-      .epc_i              (epc_commit_pcgen),
-      .trap_vector_base_i (trap_vector_base_commit_pcgen),
-      .set_debug_pc_i     (set_debug_pc),
-      .debug_mode_i       (debug_mode),
-      .icache_dreq_o      (icache_dreq_if_cache),
-      .icache_dreq_i      (icache_dreq_cache_if),
-      .fetch_entry_o      (fetch_entry_if_id),
-      .fetch_entry_valid_o(fetch_valid_if_id),
-      .fetch_entry_ready_i(fetch_ready_id_if)
+  // PVM frontend + bootrom (sub-phase 3): live at top-level for clean
+  // pvm_chunk fan-out and bootrom adjacency. ADR-O4 sub-option A.a.
+  pvm_fetch_chunk_t [CVA6Cfg.NrIssuePorts-1:0] pvm_fc_if_id;
+
+  logic [CVA6Cfg.VLEN-1:0] pvm_fe_code_addr_w;
+  logic [127:0]             pvm_fe_code_data_w;
+  logic [127:0]             pvm_fe_code_data_next_w;  // next 16-byte group for cross-boundary fetch
+  logic [CVA6Cfg.VLEN-1:0] pvm_fe_code_addr_next_w;  // = code_addr + 16
+  assign pvm_fe_code_addr_next_w = pvm_fe_code_addr_w + CVA6Cfg.VLEN'(16);
+  logic [CVA6Cfg.VLEN-1:0] pvm_fe_bitmask_addr_w;
+  logic [63:0]              pvm_fe_bitmask_data_w;
+  logic [CVA6Cfg.VLEN-1:0] pvm_fe_pc_w;
+  logic [4:0]               pvm_fe_skip_w;
+
+  // PVM frontend redirect (sub-phase 6): exception / eret / ecalli path.
+  // Priority: ecalli_done > eret > exception (ex_commit.valid).
+  logic                    pvm_fe_redirect_valid_w;
+  logic [CVA6Cfg.VLEN-1:0] pvm_fe_redirect_target_w;
+
+  always_comb begin : pvm_fe_redirect_mux
+    pvm_fe_redirect_valid_w  = 1'b0;
+    pvm_fe_redirect_target_w = '0;
+    if (ecalli_done_csr_commit) begin
+      pvm_fe_redirect_valid_w  = 1'b1;
+      pvm_fe_redirect_target_w = ecalli_redirect_pc_csr_commit;
+    end else if (eret) begin
+      pvm_fe_redirect_valid_w  = 1'b1;
+      pvm_fe_redirect_target_w = epc_commit_pcgen;
+    end else if (ex_commit.valid) begin
+      pvm_fe_redirect_valid_w  = 1'b1;
+      pvm_fe_redirect_target_w = trap_vector_base_commit_pcgen;
+    end else if (resolved_branch.valid && resolved_branch.is_taken) begin
+      pvm_fe_redirect_valid_w  = 1'b1;
+      pvm_fe_redirect_target_w = resolved_branch.target_address;
+    end
+  end
+
+  bootrom_code_64 i_bootrom_code (
+    .clk_i   (clk_i),
+    .req_i   (1'b1),
+    .addr_i  (pvm_fe_code_addr_w),
+    .rdata_o (pvm_fe_code_data_w)
   );
+
+  // Second ROM read for the next 16-byte group (cross-boundary instruction fetch).
+  bootrom_code_64 i_bootrom_code_next (
+    .clk_i   (clk_i),
+    .req_i   (1'b1),
+    .addr_i  (pvm_fe_code_addr_next_w),
+    .rdata_o (pvm_fe_code_data_next_w)
+  );
+
+  bootrom_bitmask_64 i_bootrom_bitmask (
+    .clk_i   (clk_i),
+    .req_i   (1'b1),
+    .addr_i  (pvm_fe_bitmask_addr_w),
+    .rdata_o (pvm_fe_bitmask_data_w)
+  );
+
+  pvm_frontend #(
+    .VirtualAddrSize(CVA6Cfg.VLEN)
+  ) i_pvm_frontend (
+    .clk_i                    (clk_i),
+    .rst_ni                   (rst_ni),
+    .code_addr_o              (pvm_fe_code_addr_w),
+    .code_data_i              (pvm_fe_code_data_w),
+    .code_data_next_i         (pvm_fe_code_data_next_w),
+    .bitmask_addr_o           (pvm_fe_bitmask_addr_w),
+    .bitmask_data_i           (pvm_fe_bitmask_data_w),
+    // Exception / eret / ecalli redirect (sub-phase 6):
+    .branch_redirect_valid_i  (pvm_fe_redirect_valid_w),
+    .branch_redirect_target_i (pvm_fe_redirect_target_w),
+    .valid_o                  (pvm_fc_if_id[0].valid),
+    .chunk_o                  (pvm_fc_if_id[0].chunk),
+    .skip_o                   (pvm_fe_skip_w),
+    .is_valid_opcode_o        (pvm_fc_if_id[0].is_valid_opcode),
+    .pc_o                     (pvm_fe_pc_w),
+    .ready_i                  (fetch_ready_id_if[0])
+  );
+
+  // skip field in struct is 4 bits; skip_o from frontend is 5 bits (0..15 fits in 4 bits).
+  assign pvm_fc_if_id[0].skip = pvm_fe_skip_w[3:0];
+
+  // If NrIssuePorts > 1, drive higher ports to inert defaults.
+  if (CVA6Cfg.NrIssuePorts > 1) begin : g_pvm_fc_extra
+    for (genvar i = 1; i < CVA6Cfg.NrIssuePorts; i++) begin
+      assign pvm_fc_if_id[i] = '0;
+    end
+  end
+
+  // Drive fetch_entry_if_id and fetch_valid_if_id from pvm_frontend output.
+  for (genvar i = 0; i < CVA6Cfg.NrIssuePorts; i++) begin : g_pvm_fetch
+    assign fetch_entry_if_id[i].address        = pvm_fe_pc_w;
+    assign fetch_entry_if_id[i].instruction    = pvm_fc_if_id[i].chunk[31:0];
+    assign fetch_entry_if_id[i].branch_predict = '0;
+    assign fetch_entry_if_id[i].ex             = '0;
+    assign fetch_valid_if_id[i]                = pvm_fc_if_id[i].valid;
+  end
+
+  // ADR-O1c lockstep assert: fetch_valid_if_id[i] ↔ pvm_fc_if_id[i].valid
+`ifndef SYNTHESIS
+  if (CVA6Cfg.FETCH_WIDTH == 128) begin : g_pvm_lockstep  // UsePvmIsa ↔ FETCH_WIDTH==128
+    for (genvar i = 0; i < CVA6Cfg.NrIssuePorts; i++) begin
+      a_pvm_lockstep_fwd: assert property (
+        @(posedge clk_i) disable iff (!rst_ni)
+        fetch_valid_if_id[i] |-> pvm_fc_if_id[i].valid
+      );
+      a_pvm_lockstep_rev: assert property (
+        @(posedge clk_i) disable iff (!rst_ni)
+        pvm_fc_if_id[i].valid |-> fetch_valid_if_id[i]
+      );
+    end
+  end
+`endif
 
   // ---------
   // ID
@@ -774,7 +874,10 @@ module cva6
       .debug_from_trigger_i(debug_from_trigger),
       // DCACHE interfaces
       .dcache_req_ports_i  (dcache_req_ports_cache_id),
-      .dcache_req_ports_o  (dcache_req_ports_id_cache)
+      .dcache_req_ports_o  (dcache_req_ports_id_cache),
+      // PVM frontend outputs (sub-phase 3)
+      .pvm_fc_if_id_i      (pvm_fc_if_id),
+      .pvm_fe_pc_i         (pvm_fe_pc_w)
   );
 
   logic [CVA6Cfg.NrWbPorts-1:0][CVA6Cfg.TRANS_ID_BITS-1:0] trans_id_ex_id;
@@ -1112,7 +1215,14 @@ module cva6
       .sfence_vma_o        (sfence_vma_commit_controller),
       .hfence_vvma_o       (hfence_vvma_commit_controller),
       .hfence_gvma_o       (hfence_gvma_commit_controller),
-      .break_from_trigger_i(break_from_trigger)
+      .break_from_trigger_i(break_from_trigger),
+      // ecalli FSM handshake (PVM sub-phase 8)
+      .ecalli_valid_o      (ecalli_valid_commit_csr),
+      .ecalli_imm_o        (ecalli_imm_commit_csr),
+      .ecalli_pc_o         (ecalli_pc_commit_csr),
+      .ecalli_done_i       (ecalli_done_csr_commit),
+      .ecalli_redirect_pc_i(ecalli_redirect_pc_csr_commit),
+      .ecalli_redirect_priv_i(ecalli_redirect_priv_csr_commit)
   );
 
   assign commit_ack = commit_macro_ack & ~commit_drop_id_commit;
@@ -1120,103 +1230,114 @@ module cva6
   // ---------
   // CSR
   // ---------
-  csr_regfile #(
-      .CVA6Cfg           (CVA6Cfg),
-      .exception_t       (exception_t),
-      .jvt_t             (jvt_t),
-      .irq_ctrl_t        (irq_ctrl_t),
-      .scoreboard_entry_t(scoreboard_entry_t),
-      .rvfi_probes_csr_t (rvfi_probes_csr_t),
-      .MHPMCounterNum    (MHPMCounterNum)
-  ) csr_regfile_i (
-      .clk_i,
-      .rst_ni,
-      .time_irq_i,
-      .flush_o                 (flush_csr_ctrl),
-      .halt_csr_o              (halt_csr_ctrl),
-      .commit_instr_i          (commit_instr_id_commit[0]),
-      .commit_ack_i            (commit_ack),
-      .boot_addr_i             (boot_addr_i[CVA6Cfg.VLEN-1:0]),
-      .hart_id_i               (hart_id_i[CVA6Cfg.XLEN-1:0]),
-      .ex_i                    (ex_commit),
-      .csr_op_i                (csr_op_commit_csr),
-      .csr_addr_i              (csr_addr_ex_csr),
-      .csr_wdata_i             (csr_wdata_commit_csr),
-      .csr_rdata_o             (csr_rdata_csr_commit),
-      .dirty_fp_state_i        (dirty_fp_state),
-      .csr_write_fflags_i      (csr_write_fflags_commit_cs),
-      .dirty_v_state_i         (dirty_v_state),
-      .pc_i                    (pc_commit),
-      .csr_exception_o         (csr_exception_csr_commit),
-      .epc_o                   (epc_commit_pcgen),
-      .eret_o                  (eret),
-      .trap_vector_base_o      (trap_vector_base_commit_pcgen),
-      .priv_lvl_o              (priv_lvl),
-      .mbe_o                   (mbe),
-      .v_o                     (v),
-      .acc_fflags_ex_i         (acc_resp_fflags),
-      .acc_fflags_ex_valid_i   (acc_resp_fflags_valid),
-      .fs_o                    (fs),
-      .vfs_o                   (vfs),
-      .fflags_o                (fflags_csr_commit),
-      .frm_o                   (frm_csr_id_issue_ex),
-      .fprec_o                 (fprec_csr_ex),
-      .vs_o                    (vs),
-      .irq_ctrl_o              (irq_ctrl_csr_id),
-      .en_translation_o        (enable_translation_csr_ex),
-      .en_g_translation_o      (enable_g_translation_csr_ex),
-      .en_ld_st_translation_o  (en_ld_st_translation_csr_ex),
-      .en_ld_st_g_translation_o(en_ld_st_g_translation_csr_ex),
-      .ld_st_priv_lvl_o        (ld_st_priv_lvl_csr_ex),
-      .ld_st_v_o               (ld_st_v_csr_ex),
-      .csr_hs_ld_st_inst_i     (csr_hs_ld_st_inst_ex),
-      .sum_o                   (sum_csr_ex),
-      .vs_sum_o                (vs_sum_csr_ex),
-      .mxr_o                   (mxr_csr_ex),
-      .vmxr_o                  (vmxr_csr_ex),
-      .satp_ppn_o              (satp_ppn_csr_ex),
-      .asid_o                  (asid_csr_ex),
-      .vsatp_ppn_o             (vsatp_ppn_csr_ex),
-      .vs_asid_o               (vs_asid_csr_ex),
-      .hgatp_ppn_o             (hgatp_ppn_csr_ex),
-      .vmid_o                  (vmid_csr_ex),
-      .irq_i,
-      .ipi_i,
-      .debug_req_i,
-      .set_debug_pc_o          (set_debug_pc),
-      .tvm_o                   (tvm_csr_id),
-      .tw_o                    (tw_csr_id),
-      .vtw_o                   (vtw_csr_id),
-      .tsr_o                   (tsr_csr_id),
-      .hu_o                    (hu),
-      .debug_mode_o            (debug_mode),
-      .single_step_o           (single_step_csr_commit),
-      .icache_en_o             (icache_en_csr),
-      .dcache_en_o             (dcache_en_csr_nbdcache),
-      .acc_cons_en_o           (acc_cons_en_csr),
-      .perf_addr_o             (addr_csr_perf),
-      .perf_data_o             (data_csr_perf),
-      .perf_data_i             (data_perf_csr),
-      .perf_we_o               (we_csr_perf),
-      .pmpcfg_o                (pmpcfg),
-      .pmpaddr_o               (pmpaddr),
-      .mcountinhibit_o         (mcountinhibit_csr_perf),
-      .mcbie_o                 (mcbie),
-      .scbie_o                 (scbie),
-      .hcbie_o                 (hcbie),
-      .mcbcfe_o                (mcbcfe),
-      .scbcfe_o                (scbcfe),
-      .hcbcfe_o                (hcbcfe),
-      .jvt_o                   (jvt),
-      //RVFI
-      .rvfi_csr_o              (rvfi_csr),
-      // Trigger Signals
-      .debug_from_trigger_o    (debug_from_trigger),
-      .vaddr_from_lsu_i        (rvfi_lsu_ctrl.vaddr),
-      .orig_instr_i            (orig_instr_id_issue),
-      .store_result_i          (store_result_ex_id),
-      .break_from_trigger_o    (break_from_trigger)
-  );
+  // ---------
+  // CSR
+  // ---------
+  // PVM CSR regfile active (CVA6ConfigUsePvmIsa=1). Legacy csr_regfile.sv deleted.
+  pvm_csr_regfile #(
+          .CVA6Cfg           (CVA6Cfg),
+          .exception_t       (exception_t),
+          .jvt_t             (jvt_t),
+          .irq_ctrl_t        (irq_ctrl_t),
+          .scoreboard_entry_t(scoreboard_entry_t),
+          .rvfi_probes_csr_t (rvfi_probes_csr_t),
+          .MHPMCounterNum    (MHPMCounterNum)
+      ) i_csr_regfile (
+          .clk_i,
+          .rst_ni,
+          .time_irq_i,
+          .flush_o                 (flush_csr_ctrl),
+          .halt_csr_o              (halt_csr_ctrl),
+          .commit_instr_i          (commit_instr_id_commit[0]),
+          .commit_ack_i            (commit_ack),
+          .boot_addr_i             (boot_addr_i[CVA6Cfg.VLEN-1:0]),
+          .hart_id_i               (hart_id_i[CVA6Cfg.XLEN-1:0]),
+          .ex_i                    (ex_commit),
+          .csr_op_i                (csr_op_commit_csr),
+          .csr_addr_i              (csr_addr_ex_csr),
+          .csr_wdata_i             (csr_wdata_commit_csr),
+          .csr_rdata_o             (csr_rdata_csr_commit),
+          .dirty_fp_state_i        (dirty_fp_state),
+          .csr_write_fflags_i      (csr_write_fflags_commit_cs),
+          .dirty_v_state_i         (dirty_v_state),
+          .pc_i                    (pc_commit),
+          .csr_exception_o         (csr_exception_csr_commit),
+          .epc_o                   (epc_commit_pcgen),
+          .eret_o                  (eret),
+          .trap_vector_base_o      (trap_vector_base_commit_pcgen),
+          .priv_lvl_o              (priv_lvl),
+          .mbe_o                   (mbe),
+          .v_o                     (v),
+          .acc_fflags_ex_i         (acc_resp_fflags),
+          .acc_fflags_ex_valid_i   (acc_resp_fflags_valid),
+          .fs_o                    (fs),
+          .vfs_o                   (vfs),
+          .fflags_o                (fflags_csr_commit),
+          .frm_o                   (frm_csr_id_issue_ex),
+          .fprec_o                 (fprec_csr_ex),
+          .vs_o                    (vs),
+          .irq_ctrl_o              (irq_ctrl_csr_id),
+          .en_translation_o        (enable_translation_csr_ex),
+          .en_g_translation_o      (enable_g_translation_csr_ex),
+          .en_ld_st_translation_o  (en_ld_st_translation_csr_ex),
+          .en_ld_st_g_translation_o(en_ld_st_g_translation_csr_ex),
+          .ld_st_priv_lvl_o        (ld_st_priv_lvl_csr_ex),
+          .ld_st_v_o               (ld_st_v_csr_ex),
+          .csr_hs_ld_st_inst_i     (csr_hs_ld_st_inst_ex),
+          .sum_o                   (sum_csr_ex),
+          .vs_sum_o                (vs_sum_csr_ex),
+          .mxr_o                   (mxr_csr_ex),
+          .vmxr_o                  (vmxr_csr_ex),
+          .satp_ppn_o              (satp_ppn_csr_ex),
+          .asid_o                  (asid_csr_ex),
+          .vsatp_ppn_o             (vsatp_ppn_csr_ex),
+          .vs_asid_o               (vs_asid_csr_ex),
+          .hgatp_ppn_o             (hgatp_ppn_csr_ex),
+          .vmid_o                  (vmid_csr_ex),
+          .irq_i,
+          .ipi_i,
+          .debug_req_i,
+          .set_debug_pc_o          (set_debug_pc),
+          .tvm_o                   (tvm_csr_id),
+          .tw_o                    (tw_csr_id),
+          .vtw_o                   (vtw_csr_id),
+          .tsr_o                   (tsr_csr_id),
+          .hu_o                    (hu),
+          .debug_mode_o            (debug_mode),
+          .single_step_o           (single_step_csr_commit),
+          .icache_en_o             (icache_en_csr),
+          .dcache_en_o             (dcache_en_csr_nbdcache),
+          .acc_cons_en_o           (acc_cons_en_csr),
+          .perf_addr_o             (addr_csr_perf),
+          .perf_data_o             (data_csr_perf),
+          .perf_data_i             (data_perf_csr),
+          .perf_we_o               (we_csr_perf),
+          .pmpcfg_o                (pmpcfg),
+          .pmpaddr_o               (pmpaddr),
+          .mcountinhibit_o         (mcountinhibit_csr_perf),
+          .mcbie_o                 (mcbie),
+          .scbie_o                 (scbie),
+          .hcbie_o                 (hcbie),
+          .mcbcfe_o                (mcbcfe),
+          .scbcfe_o                (scbcfe),
+          .hcbcfe_o                (hcbcfe),
+          .jvt_o                   (jvt),
+          //RVFI
+          .rvfi_csr_o              (rvfi_csr),
+          // Trigger Signals
+          .debug_from_trigger_o    (debug_from_trigger),
+          .vaddr_from_lsu_i        (rvfi_lsu_ctrl.vaddr),
+          .orig_instr_i            (orig_instr_id_issue),
+          .store_result_i          (store_result_ex_id),
+          .break_from_trigger_o    (break_from_trigger),
+          // ecalli FSM handshake (sub-phase 8)
+          .ecalli_valid_i          (ecalli_valid_commit_csr),
+          .ecalli_imm_i            (ecalli_imm_commit_csr),
+          .ecalli_pc_i             (ecalli_pc_commit_csr),
+          .ecalli_done_o           (ecalli_done_csr_commit),
+          .ecalli_redirect_pc_o    (ecalli_redirect_pc_csr_commit),
+          .ecalli_redirect_priv_o  (ecalli_redirect_priv_csr_commit)
+      );
 
   // ------------------------
   // Performance Counters
@@ -1721,6 +1842,12 @@ module cva6
     assign rvfi_fetch_instr[i] = fetch_entry_if_id[i].instruction;
   end
 
+  // RVFI pvm_chunk channel (ADR-O1, sub-phase 3).
+  logic [CVA6Cfg.NrIssuePorts-1:0][127:0] pvm_chunk_for_rvfi;
+  for (genvar i = 0; i < CVA6Cfg.NrIssuePorts; i++) begin
+    assign pvm_chunk_for_rvfi[i] = pvm_fc_if_id[i].chunk;
+  end
+
   cva6_rvfi_probes #(
       .CVA6Cfg            (CVA6Cfg),
       .exception_t        (exception_t),
@@ -1737,6 +1864,7 @@ module cva6
       .fetch_entry_valid_i(fetch_valid_if_id),
       .instruction_i      (rvfi_fetch_instr),
       .is_compressed_i    (rvfi_is_compressed),
+      .pvm_chunk_i        (pvm_chunk_for_rvfi),
 
       .issue_pointer_i (rvfi_issue_pointer),
       .commit_pointer_i(rvfi_commit_pointer),

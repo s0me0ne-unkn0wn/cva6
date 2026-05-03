@@ -230,7 +230,8 @@ module cva6_rvfi
   logic flush;
   logic [CVA6Cfg.NrIssuePorts-1:0] issue_instr_ack;
   logic [CVA6Cfg.NrIssuePorts-1:0] fetch_entry_valid;
-  logic [CVA6Cfg.NrIssuePorts-1:0][31:0] instruction;
+  logic [CVA6Cfg.NrIssuePorts-1:0][31:0]  instruction;
+  logic [CVA6Cfg.NrIssuePorts-1:0][127:0] pvm_chunk;
   logic [CVA6Cfg.NrIssuePorts-1:0] is_compressed;
   logic [CVA6Cfg.NrIssuePorts-1:0][31:0] truncated;
 
@@ -310,6 +311,7 @@ module cva6_rvfi
   assign issue_instr_ack = instr.issue_instr_ack;
   assign fetch_entry_valid = instr.fetch_entry_valid;
   assign instruction = instr.instruction;
+  assign pvm_chunk   = instr.pvm_chunk;
   assign is_compressed = instr.is_compressed;
 
   assign issue_pointer = instr.issue_pointer;

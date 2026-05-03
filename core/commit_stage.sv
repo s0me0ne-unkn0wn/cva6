@@ -15,6 +15,7 @@
 
 module commit_stage
   import ariane_pkg::*;
+  import polkavm_pkg::*;
 #(
     parameter config_pkg::cva6_cfg_t CVA6Cfg = config_pkg::cva6_cfg_empty,
     parameter type exception_t = logic,
@@ -89,7 +90,23 @@ module commit_stage
     // TO_BE_COMPLETED - CONTROLLER
     output logic hfence_gvma_o,
     // Breakpoint exception from trigger module
-    input logic break_from_trigger_i
+    input logic break_from_trigger_i,
+    // -------------------------------------------------------------------------
+    // ecalli FSM handshake (sub-phase 8; PVM only)
+    // -------------------------------------------------------------------------
+    // Pulse to pvm_csr_regfile when a non-sentinel ecalli retires.
+    output logic                                   ecalli_valid_o,
+    // 32-bit ecalli immediate forwarded to the FSM.
+    output logic [31:0]                            ecalli_imm_o,
+    // PC of the retiring ecalli instruction.
+    output logic [CVA6Cfg.VLEN-1:0]               ecalli_pc_o,
+    // FSM completion pulse — when asserted the ecalli is done and the
+    // redirect PC / priv are valid on the corresponding CSR outputs.
+    input  logic                                   ecalli_done_i,
+    // Redirect target PC produced by the FSM (handler addr or pepc).
+    input  logic [CVA6Cfg.VLEN-1:0]               ecalli_redirect_pc_i,
+    // Privilege level after redirect.
+    input  riscv::priv_lvl_t                       ecalli_redirect_priv_i
 );
 
   // ila_0 i_ila_commit (
@@ -244,6 +261,72 @@ module commit_stage
     end
 
     commit_macro_ack_o = commit_ack_o;
+
+    // ------------------------------------------------------------------
+    // PVM ecalli handling (sub-phase 8)
+    // ------------------------------------------------------------------
+    // Default ecalli outputs (driven to safe values; overridden below).
+    ecalli_valid_o = 1'b0;
+    ecalli_imm_o   = '0;
+    ecalli_pc_o    = commit_instr_i[0].pc;
+
+    if (cva6_config_pkg::CVA6ConfigUsePvmIsa) begin
+      if (commit_instr_i[0].valid && !halt_i && !commit_instr_i[0].ex.valid &&
+          !commit_drop_i[0] && commit_instr_i[0].fu == CSR) begin
+
+        // Ecalli sentinel: write_csr (0xFFFFFFFD) — route to CSR write port.
+        if (commit_instr_i[0].result[31:0] == PVM_ECALLI_SENTINEL_WRITE_CSR) begin
+          csr_op_o    = CSR_WRITE;
+          csr_wdata_o = commit_instr_i[0].result;
+        end
+
+        // Ecalli sentinel: mode_return (0xFFFFFFFF) — drive mret to CSR file.
+        // The FSM in pvm_csr_regfile handles state restore via the mret path.
+        if (commit_instr_i[0].result[31:0] == PVM_ECALLI_SENTINEL_MODE_RETURN) begin
+          csr_op_o       = MRET;
+          // Signal FSM immediately — no stall needed (1-cycle sentinel).
+          ecalli_valid_o = 1'b1;
+          ecalli_imm_o   = PVM_ECALLI_SENTINEL_MODE_RETURN;
+          ecalli_pc_o    = commit_instr_i[0].pc;
+          // Stall commit until FSM acks (ecalli_done_i fires same cycle
+          // since IDLE sentinel path emits done combinatorially).
+          if (!ecalli_done_i) begin
+            commit_ack_o[0]        = 1'b0;
+            commit_macro_ack_o[0]  = 1'b0;
+          end
+        end
+
+        // Ecalli sentinel: read_csr (0xFFFFFFFE) — return CSR value via rd.
+        if (commit_instr_i[0].result[31:0] == PVM_ECALLI_SENTINEL_READ_CSR) begin
+          csr_op_o       = CSR_READ;
+          // Signal FSM immediately — 1-cycle, no stall.
+          ecalli_valid_o = 1'b1;
+          ecalli_imm_o   = PVM_ECALLI_SENTINEL_READ_CSR;
+          ecalli_pc_o    = commit_instr_i[0].pc;
+          if (!ecalli_done_i) begin
+            commit_ack_o[0]       = 1'b0;
+            commit_macro_ack_o[0] = 1'b0;
+          end
+        end
+
+        // Non-sentinel ecalli: start handler-dispatch FSM.
+        // The ecalli imm is the regular dispatch index (not a sentinel).
+        // Stall commit until FSM completes (IDLE→DRAINED→TABLE_READ→JUMPED).
+        if (commit_instr_i[0].result[31:0] != PVM_ECALLI_SENTINEL_MODE_RETURN &&
+            commit_instr_i[0].result[31:0] != PVM_ECALLI_SENTINEL_READ_CSR    &&
+            commit_instr_i[0].result[31:0] != PVM_ECALLI_SENTINEL_WRITE_CSR) begin
+          // Fire ecalli_valid on the first cycle (ecalli_done_i not yet high).
+          // After that, stall until ecalli_done_i comes back.
+          ecalli_valid_o = !ecalli_done_i;
+          ecalli_imm_o   = commit_instr_i[0].result[31:0];
+          ecalli_pc_o    = commit_instr_i[0].pc;
+          if (!ecalli_done_i) begin
+            commit_ack_o[0]       = 1'b0;
+            commit_macro_ack_o[0] = 1'b0;
+          end
+        end
+      end
+    end
   end
 
   // -----------------------------

@@ -31,12 +31,15 @@ module alu_wrapper
       .HasBranch(1'b1),
       .fu_data_t(fu_data_t)
   ) alu_i (
-      .clk_i           (clk_i),
-      .rst_ni          (rst_ni),
-      .fu_data_i       (fu_data_i[0]),
-      .fu_data_cpop_i  (fu_data_i[0]),
-      .result_o        (result_o[0]),
-      .alu_branch_res_o(alu_branch_res_o)
+      .clk_i              (clk_i),
+      .rst_ni             (rst_ni),
+      .fu_data_i          (fu_data_i[0]),
+      .fu_data_cpop_i     (fu_data_i[0]),
+      .is_pvm_op_i        (fu_data_i[0].is_pvm_op),
+      .pvm_alu_op_i       (fu_data_i[0].pvm_alu_op),
+      .mul_upper_result_i (fu_data_i[0].mul_upper_result),
+      .result_o           (result_o[0]),
+      .alu_branch_res_o   (alu_branch_res_o)
   );
 
   if (CVA6Cfg.SuperscalarEn) begin : gen_alu2
@@ -59,12 +62,15 @@ module alu_wrapper
         .HasBranch(1'b0),
         .fu_data_t(fu_data_t)
     ) alu2_i (
-        .clk_i           (clk_i),
-        .rst_ni          (rst_ni),
-        .fu_data_i       (fu_data_bypass),
-        .fu_data_cpop_i  (fu_data_i[1]),
-        .result_o        (result_o[1]),
-        .alu_branch_res_o(  /* Unconnected */)
+        .clk_i              (clk_i),
+        .rst_ni             (rst_ni),
+        .fu_data_i          (fu_data_bypass),
+        .fu_data_cpop_i     (fu_data_i[1]),
+        .is_pvm_op_i        (fu_data_bypass.is_pvm_op),
+        .pvm_alu_op_i       (fu_data_bypass.pvm_alu_op),
+        .mul_upper_result_i (fu_data_bypass.mul_upper_result),
+        .result_o           (result_o[1]),
+        .alu_branch_res_o   (  /* Unconnected */)
     );
   end
 

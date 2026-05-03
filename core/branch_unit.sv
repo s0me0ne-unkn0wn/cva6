@@ -106,6 +106,11 @@ module branch_unit #(
         if (branch_predict_i.cf != ariane_pkg::Return)
           resolved_branch_o.cf_type = ariane_pkg::JumpR;
       end
+      // PVM unconditional BRANCH (JAL-like PC-relative jump): always mispredict so
+      // the controller flushes wrong-path instructions fetched after the branch.
+      if (fu_data_i.operation == ariane_pkg::BRANCH && branch_comp_res_i) begin
+        resolved_branch_o.is_mispredict = 1'b1;
+      end
       // to resolve the branch in ID
       resolve_branch_o = 1'b1;
     end

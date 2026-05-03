@@ -130,6 +130,7 @@
   logic is_taken; \
   logic [Cfg.XLEN-1:0] tval; \
   logic [Cfg.TRANS_ID_BITS-1:0] branch_trans_id; \
+  logic [Cfg.NrIssuePorts-1:0][127:0] pvm_chunk; \
 }
 
 `define RVFI_PROBES_CSR_T(Cfg) struct packed { \

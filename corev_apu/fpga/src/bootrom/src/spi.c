@@ -24,11 +24,11 @@ void spi_init()
     // reset the axi quadspi core
     write_reg(SPI_RESET_REG, 0x0a);
 
-    for (int i = 0; i < 10; i++)
-    {
-        __asm__ volatile(
-            "nop");
-    }
+    /* PVM port (sub-phase 10): replaced nop inline asm with C volatile delay.
+     * PVM has no nop opcode; the inert instruction is 'fallthrough' but there
+     * is no C intrinsic for it.  A volatile loop achieves the same delay effect
+     * without requiring RISC-V-specific inline assembly. */
+    for (volatile int _d = 0; _d < 10; _d++) { (void)_d; }
 
     write_reg(SPI_CONTROL_REG, 0x104);
 
@@ -57,11 +57,8 @@ uint8_t spi_txrx(uint8_t byte)
 
     write_reg(SPI_TRANSMIT_REG, byte);
 
-    for (int i = 0; i < 100; i++)
-    {
-        __asm__ volatile(
-            "nop");
-    }
+    /* PVM port (sub-phase 10): nop inline asm replaced with C volatile delay. */
+    for (volatile int _d = 0; _d < 100; _d++) { (void)_d; }
 
     // enable spi control master flag
     write_reg(SPI_CONTROL_REG, 0x106);
@@ -102,11 +99,8 @@ int spi_write_bytes(uint8_t *bytes, uint32_t len, uint8_t *ret)
         write_reg(SPI_TRANSMIT_REG, bytes[i] & 0xff);
     }
 
-    for (int i = 0; i < 50; i++)
-    {
-        __asm__ volatile(
-            "nop");
-    }
+    /* PVM port (sub-phase 10): nop inline asm replaced with C volatile delay. */
+    for (volatile int _d = 0; _d < 50; _d++) { (void)_d; }
 
     // enable spi control master flag
     write_reg(SPI_CONTROL_REG, 0x106);

@@ -504,9 +504,12 @@ module issue_read_operands
       end else begin
         fu_data_n[i].imm = issue_instr_i[i].result;
       end
-      fu_data_n[i].trans_id  = issue_instr_i[i].trans_id;
-      fu_data_n[i].fu        = issue_instr_i[i].fu;
-      fu_data_n[i].operation = issue_instr_i[i].op;
+      fu_data_n[i].trans_id    = issue_instr_i[i].trans_id;
+      fu_data_n[i].fu          = issue_instr_i[i].fu;
+      fu_data_n[i].operation   = issue_instr_i[i].op;
+      // Sub-phase 2: propagate PVM-specific fields to execution stage.
+      fu_data_n[i].is_pvm_op   = issue_instr_i[i].is_pvm_op;
+      fu_data_n[i].pvm_alu_op  = issue_instr_i[i].pvm_alu_op;
 
       // or should we forward
       if (forward_rs1[i]) begin
@@ -535,6 +538,33 @@ module issue_read_operands
       // also make sure operand B is not already used as an FP operand
       if (issue_instr_i[i].use_imm && (issue_instr_i[i].fu != STORE) && (issue_instr_i[i].fu != CTRL_FLOW) && (issue_instr_i[i].fu != ACCEL)) begin
         fu_data_n[i].operand_b = issue_instr_i[i].result;
+      end
+      // PVM store_imm_indirect_*: result holds {imm2[31:0], imm1[31:0]}.
+      // Unpack: address-offset = sext(result[31:0]) → imm,
+      //         store-data     = sext(result[63:32]) → operand_b.
+      if (issue_instr_i[i].use_imm && issue_instr_i[i].is_pvm_op &&
+          (issue_instr_i[i].fu == STORE)) begin
+        fu_data_n[i].imm       = {{32{issue_instr_i[i].result[31]}}, issue_instr_i[i].result[31:0]};
+        fu_data_n[i].operand_b = {{32{issue_instr_i[i].result[63]}}, issue_instr_i[i].result[63:32]};
+      end
+      // PVM branch_*_imm: result holds {imm1[31:0], imm2[31:0]}.
+      // Unpack: branch-offset = sext(result[31:0]) → imm (used by branch_unit for target = PC+imm),
+      //         comparand     = sext(result[63:32]) → operand_b (compared against rs1 via ALU).
+      // For reversed comparisons (LEU, GTU, LES, GTS): swap_operands causes comparand→operand_a
+      // and rs1→operand_b, so op(comparand, rs1) inverts the inequality direction.
+      if (issue_instr_i[i].use_imm && issue_instr_i[i].is_pvm_op &&
+          (issue_instr_i[i].fu == CTRL_FLOW)) begin
+        automatic logic [CVA6Cfg.XLEN-1:0] pvm_comparand;
+        automatic logic [CVA6Cfg.XLEN-1:0] pvm_rs1_val;
+        pvm_comparand = {{32{issue_instr_i[i].result[63]}}, issue_instr_i[i].result[63:32]};
+        pvm_rs1_val   = fu_data_n[i].operand_a;  // rs1 already resolved (regfile or forwarded)
+        fu_data_n[i].imm = {{32{issue_instr_i[i].result[31]}}, issue_instr_i[i].result[31:0]};
+        if (issue_instr_i[i].swap_operands) begin
+          fu_data_n[i].operand_a = pvm_comparand;
+          fu_data_n[i].operand_b = pvm_rs1_val;
+        end else begin
+          fu_data_n[i].operand_b = pvm_comparand;
+        end
       end
     end
   end

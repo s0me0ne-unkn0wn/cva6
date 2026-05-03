@@ -1,0 +1,13 @@
+// RO data = 0/0 bytes
+// RW data = 8/8 bytes
+// Stack size = 8192 bytes
+
+// Instructions = 4
+// Code size = 14 bytes
+
+<_start>:
+      : @0 [export #0: 'main']
+     0: a5 = i32 [0x20000]
+     5: i32 a5 = a5 + 0x2a
+     8: u32 [0x20004] = a5
+    13: trap

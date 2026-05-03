@@ -162,7 +162,7 @@ module store_buffer
     automatic logic [$clog2(DEPTH_COMMIT):0] commit_status_cnt;
     commit_status_cnt      = commit_status_cnt_q;
 
-    commit_ready_o         = (commit_status_cnt_q < DEPTH_COMMIT);
+    commit_ready_o         = (commit_status_cnt_q < DEPTH_COMMIT) && (speculative_status_cnt_q > 0);
     // no store is pending if we don't have any element in the commit queue e.g.: it is empty
     no_st_pending_o        = (commit_status_cnt_q == 0);
     // default assignments

@@ -1,0 +1,54 @@
+diff --git tools/polkatool/src/main.rs tools/polkatool/src/main.rs
+index 41f9c7c..b175278 100644
+--- tools/polkatool/src/main.rs
++++ tools/polkatool/src/main.rs
+@@ -94,6 +94,10 @@ enum Args {
+         #[clap(long)]
+         dispatch_table: Option<String>,
+ 
++        /// The target instruction set.
++        #[clap(short = 'i', long, default_value_t = Isa::Latest64)]
++        instruction_set: Isa,
++
+         /// The input file.
+         input: PathBuf,
+     },
+@@ -173,6 +177,7 @@ fn main() {
+             run_only_if_newer,
+             min_stack_size,
+             dispatch_table,
++            instruction_set,
+         } => main_link(
+             input,
+             output,
+@@ -182,6 +187,7 @@ fn main() {
+             run_only_if_newer,
+             min_stack_size,
+             dispatch_table,
++            instruction_set,
+         ),
+         Args::Disassemble {
+             output,
+@@ -235,6 +241,7 @@ fn main_link(
+     run_only_if_newer: bool,
+     min_stack_size: Option<u32>,
+     dispatch_table: Option<String>,
++    instruction_set: Isa,
+ ) -> Result<(), String> {
+     if run_only_if_newer {
+         if let Ok(output_mtime) = std::fs::metadata(&output).and_then(|m| m.modified()) {
+@@ -275,7 +282,13 @@ fn main_link(
+         }
+     };
+ 
+-    let blob = match polkavm_linker::program_from_elf(config, TargetInstructionSet::Latest, &data) {
++    let target_isa = match instruction_set {
++        Isa::ReviveV1 => TargetInstructionSet::ReviveV1,
++        Isa::JamV1 => TargetInstructionSet::JamV1,
++        Isa::Latest32 | Isa::Latest64 => TargetInstructionSet::Latest,
++    };
++
++    let blob = match polkavm_linker::program_from_elf(config, target_isa, &data) {
+         Ok(blob) => blob,
+         Err(error) => {
+             bail!("failed to link {input:?}: {error}");

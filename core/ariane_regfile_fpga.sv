@@ -124,6 +124,15 @@ module ariane_regfile_fpga #(
         mem[i][j] = $random();
       end
     end
+`ifdef PVM_SIM_SP_INIT
+    // PolkaVM runtime pre-initializes SP (PVM r1 = x2) before the first
+    // instruction.  In bare-simulation there is no runtime, so we set x2 here.
+    // This is a simulation-only path; initial blocks do not synthesize.
+    for (int i = 0; i < CVA6Cfg.NrCommitPorts; i++) begin
+      mem[i][2] = 64'h83ffffe8;
+    end
+    $display("[REGFILE] PVM_SIM_SP_INIT: x2 (SP) = 0x83ffffe8");
+`endif
   end
 
 endmodule

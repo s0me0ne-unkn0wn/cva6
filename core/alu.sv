@@ -16,10 +16,24 @@
 //
 // Date: 19.03.2017
 // Description: Ariane ALU based on RI5CY's ALU
+//
+// Sub-phase 5 additions (PVM ALU):
+//   - Added is_pvm_op_i / pvm_alu_op_i / mul_upper_result_i ports.
+//   - Added PVM-specific result mux at bottom of always_comb.
+//   - PVM intermediate signals declared at module scope (not inside always_comb).
+//   - Legacy RISC-V behaviour completely unchanged when is_pvm_op_i == 0.
+//
+// CMOV note (ADR-4): PVM cmov_if_zero/cmov_if_not_zero reuse XHEAD_MVEQZ/
+//   XHEAD_MVNEZ in fu_op.  The forwarding network delivers old_rd via
+//   fu_data_i.imm.  No changes to issue_read_operands.sv required.
+//
+// imm_alt shift variants share this ALU datapath with their non-alt
+//   counterparts; only decoder operand routing differs (sub-phase 3).
 
 
 module alu
   import ariane_pkg::*;
+  import polkavm_pkg::*;
 #(
     parameter config_pkg::cva6_cfg_t CVA6Cfg = config_pkg::cva6_cfg_empty,
     parameter bit HasBranch = 1'b1,
@@ -33,6 +47,15 @@ module alu
     input fu_data_t fu_data_i,
     // FU data needed to execute CPOP/CPOPW - ISSUE_STAGE
     input fu_data_t fu_data_cpop_i,
+    // PVM mode: when asserted, result mux selects on pvm_alu_op_i rather than
+    // fu_data_i.operation.  Decoder (sub-phase 3) drives this signal.
+    input logic                     is_pvm_op_i,
+    // PVM ALU operation selector (valid only when is_pvm_op_i == 1)
+    input pvm_alu_op_e              pvm_alu_op_i,
+    // Upper 64b of 128-bit multiply product from multiplier.sv.
+    // Used for PVM_ALU_MUL_UPPER_{SS,UU,SU}.  One-cycle registered latency
+    // in multiplier.sv; testbench must account for this.
+    input logic [CVA6Cfg.XLEN-1:0] mul_upper_result_i,
     // ALU result - ISSUE_STAGE
     output logic [CVA6Cfg.XLEN-1:0] result_o,
     // ALU branch compare result - branch_unit
@@ -267,6 +290,51 @@ module alu
   assign unzip_gen      = '0;
   assign zip_gen        = '0;
 
+  // ---------------------------------------------------------------------------
+  // PVM ALU intermediate signals (module scope, always computed)
+  // These are used in the PVM result mux below when is_pvm_op_i is asserted.
+  // ---------------------------------------------------------------------------
+
+  // 32-bit arithmetic intermediates
+  logic [31:0] pvm_add32_r, pvm_sub32_r, pvm_mul32_r;
+  assign pvm_add32_r = operand_a[31:0] + operand_b[31:0];
+  assign pvm_sub32_r = operand_a[31:0] - operand_b[31:0];
+  assign pvm_mul32_r = operand_a[31:0] * operand_b[31:0];
+
+  // negate_and_add_imm: (-rs1) + imm = ~rs1 + 1 + imm
+  // Decoder places imm on operand_b bus.
+  logic [CVA6Cfg.XLEN-1:0] pvm_neg64_r;
+  logic [31:0]              pvm_neg32_r;
+  assign pvm_neg64_r = (~operand_a) + {{CVA6Cfg.XLEN-1{1'b0}}, 1'b1} + operand_b;
+  assign pvm_neg32_r = (~operand_a[31:0]) + 32'd1 + operand_b[31:0];
+
+  // 32-bit shifts (operand_b holds amount; decoder masks to [4:0])
+  logic [31:0] pvm_sll32_r, pvm_srl32_r, pvm_sra32_r;
+  assign pvm_sll32_r = operand_a[31:0] << operand_b[4:0];
+  assign pvm_srl32_r = operand_a[31:0] >> operand_b[4:0];
+  assign pvm_sra32_r = $unsigned($signed(operand_a[31:0]) >>> operand_b[4:0]);
+
+  // 32-bit rotates
+  logic [31:0] pvm_rol32_r, pvm_ror32_r;
+  assign pvm_rol32_r = (operand_a[31:0] << operand_b[4:0]) |
+                       (operand_a[31:0] >> (6'd32 - {1'b0, operand_b[4:0]}));
+  assign pvm_ror32_r = (operand_a[31:0] >> operand_b[4:0]) |
+                       (operand_a[31:0] << (6'd32 - {1'b0, operand_b[4:0]}));
+
+  // PVM comparisons (full 64b signed/unsigned)
+  logic pvm_less_s, pvm_less_u;
+  assign pvm_less_s = $signed(operand_a) < $signed(operand_b);
+  assign pvm_less_u = operand_a < operand_b;
+
+  // set_greater_than_imm: rs1 > imm  <=>  imm < rs1
+  logic pvm_greater_s_imm, pvm_greater_u_imm;
+  assign pvm_greater_s_imm = $signed(operand_b) < $signed(operand_a);
+  assign pvm_greater_u_imm = operand_b < operand_a;
+
+  // reverse_byte_32: byte-reverse lower 32b (for PVM_ALU_REV_BYTE_32)
+  logic [31:0] pvm_rev32_r;
+  assign pvm_rev32_r = {operand_a[7:0], operand_a[15:8], operand_a[23:16], operand_a[31:24]};
+
   // -----------
   // Result MUX
   // -----------
@@ -343,7 +411,11 @@ module alu
       endcase
     end
     // RVZiCond removed (CVA6Cfg.RVZiCond=0)
-    // Xtheadcondmov: conditional move using old rd value (via imm field)
+    // Xtheadcondmov: conditional move using old rd value (via imm field).
+    // PVM cmov_if_zero/cmov_if_not_zero reuse these opcodes (ADR-4):
+    //   cmov_if_zero     -> XHEAD_MVEQZ: rd = (rs2==0) ? rs1 : old_rd
+    //   cmov_if_not_zero -> XHEAD_MVNEZ: rd = (rs2!=0) ? rs1 : old_rd
+    // The forwarding network delivers old_rd via fu_data_i.imm.
     if (CVA6Cfg.XtheadCondMov) begin
       unique case (fu_data_i.operation)
         XHEAD_MVEQZ:
@@ -354,5 +426,136 @@ module alu
       endcase
     end
     // ZKN result mux removed (CVA6Cfg.ZKN=0)
+
+    // -----------------------------------------------------------------------
+    // PVM-specific ALU result mux (sub-phase 5)
+    // -----------------------------------------------------------------------
+    // When is_pvm_op_i is asserted the PVM decoder has placed operands on the
+    // standard buses (operand_a = rs1, operand_b = rs2 or sign-extended imm)
+    // and set pvm_alu_op_i to the appropriate selector.  This mux overrides
+    // the result_o written by the legacy mux above.
+    //
+    // Ops that reuse the adder/shifter output unchanged (ADD_64, SLL_64, etc.)
+    // are included for completeness so the testbench can drive any pvm_alu_op_e
+    // and get a correct result even when is_pvm_op_i is asserted.
+    //
+    // imm_alt shift variants share the same pvm_alu_op_e as their non-alt
+    // counterparts; the decoder swaps operands before presenting them here.
+    // -----------------------------------------------------------------------
+    if (is_pvm_op_i) begin
+      unique case (pvm_alu_op_i)
+        // ---- 64-bit arithmetic --------------------------------------------
+        PVM_ALU_ADD_64:            result_o = adder_result;
+        PVM_ALU_SUB_64:            result_o = adder_result;
+        PVM_ALU_MUL_64:            result_o = operand_a * operand_b;
+        PVM_ALU_ADD_IMM_64:        result_o = adder_result;
+        PVM_ALU_MUL_IMM_64:        result_o = operand_a * operand_b;
+        PVM_ALU_NEGATE_ADD_IMM_64: result_o = pvm_neg64_r;
+
+        // ---- 32-bit arithmetic (sign-extend result to XLEN) ---------------
+        PVM_ALU_ADD_32:            result_o = {{CVA6Cfg.XLEN-32{pvm_add32_r[31]}}, pvm_add32_r};
+        PVM_ALU_SUB_32:            result_o = {{CVA6Cfg.XLEN-32{pvm_sub32_r[31]}}, pvm_sub32_r};
+        PVM_ALU_MUL_32:            result_o = {{CVA6Cfg.XLEN-32{pvm_mul32_r[31]}}, pvm_mul32_r};
+        PVM_ALU_ADD_IMM_32:        result_o = {{CVA6Cfg.XLEN-32{pvm_add32_r[31]}}, pvm_add32_r};
+        PVM_ALU_MUL_IMM_32:        result_o = {{CVA6Cfg.XLEN-32{pvm_mul32_r[31]}}, pvm_mul32_r};
+        PVM_ALU_NEGATE_ADD_IMM_32: result_o = {{CVA6Cfg.XLEN-32{pvm_neg32_r[31]}}, pvm_neg32_r};
+
+        // ---- Bitwise logic (full width) ------------------------------------
+        PVM_ALU_AND:               result_o = operand_a & operand_b;
+        PVM_ALU_OR:                result_o = operand_a | operand_b;
+        PVM_ALU_XOR:               result_o = operand_a ^ operand_b;
+        PVM_ALU_AND_IMM:           result_o = operand_a & operand_b;
+        PVM_ALU_OR_IMM:            result_o = operand_a | operand_b;
+        PVM_ALU_XOR_IMM:           result_o = operand_a ^ operand_b;
+        PVM_ALU_AND_INVERTED:      result_o = operand_a & ~operand_b;
+        PVM_ALU_OR_INVERTED:       result_o = operand_a | ~operand_b;
+        PVM_ALU_XNOR:              result_o = ~(operand_a ^ operand_b);
+
+        // ---- 64-bit shifts (legacy shifter result, correctly computed) -----
+        PVM_ALU_SLL_64:            result_o = shift_result;
+        PVM_ALU_SRL_64:            result_o = shift_result;
+        PVM_ALU_SRA_64:            result_o = shift_result;
+        PVM_ALU_SLL_IMM_64:        result_o = shift_result;
+        PVM_ALU_SRL_IMM_64:        result_o = shift_result;
+        PVM_ALU_SRA_IMM_64:        result_o = shift_result;
+
+        // ---- 32-bit shifts (sign-extend SLL/SRA; zero-extend SRL) ---------
+        PVM_ALU_SLL_32:            result_o = {{CVA6Cfg.XLEN-32{pvm_sll32_r[31]}}, pvm_sll32_r};
+        PVM_ALU_SRL_32:            result_o = {{CVA6Cfg.XLEN-32{1'b0}},            pvm_srl32_r};
+        PVM_ALU_SRA_32:            result_o = {{CVA6Cfg.XLEN-32{pvm_sra32_r[31]}}, pvm_sra32_r};
+        PVM_ALU_SLL_IMM_32:        result_o = {{CVA6Cfg.XLEN-32{pvm_sll32_r[31]}}, pvm_sll32_r};
+        PVM_ALU_SRL_IMM_32:        result_o = {{CVA6Cfg.XLEN-32{1'b0}},            pvm_srl32_r};
+        PVM_ALU_SRA_IMM_32:        result_o = {{CVA6Cfg.XLEN-32{pvm_sra32_r[31]}}, pvm_sra32_r};
+
+        // ---- Multiply-upper: upper 64b of 128b product --------------------
+        // mul_upper_result_i is registered (1-cycle latency in multiplier.sv).
+        PVM_ALU_MUL_UPPER_SS:      result_o = mul_upper_result_i;
+        PVM_ALU_MUL_UPPER_UU:      result_o = mul_upper_result_i;
+        PVM_ALU_MUL_UPPER_SU:      result_o = mul_upper_result_i;
+
+        // ---- Comparisons --------------------------------------------------
+        PVM_ALU_SLT_U:             result_o = {{CVA6Cfg.XLEN-1{1'b0}}, pvm_less_u};
+        PVM_ALU_SLT_S:             result_o = {{CVA6Cfg.XLEN-1{1'b0}}, pvm_less_s};
+        PVM_ALU_SLT_U_IMM:         result_o = {{CVA6Cfg.XLEN-1{1'b0}}, pvm_less_u};
+        PVM_ALU_SLT_S_IMM:         result_o = {{CVA6Cfg.XLEN-1{1'b0}}, pvm_less_s};
+        PVM_ALU_SGT_U_IMM:         result_o = {{CVA6Cfg.XLEN-1{1'b0}}, pvm_greater_u_imm};
+        PVM_ALU_SGT_S_IMM:         result_o = {{CVA6Cfg.XLEN-1{1'b0}}, pvm_greater_s_imm};
+
+        // ---- Min/Max ------------------------------------------------------
+        PVM_ALU_MAX_S:             result_o = pvm_less_s ? operand_b : operand_a;
+        PVM_ALU_MAX_U:             result_o = pvm_less_u ? operand_b : operand_a;
+        PVM_ALU_MIN_S:             result_o = pvm_less_s ? operand_a : operand_b;
+        PVM_ALU_MIN_U:             result_o = pvm_less_u ? operand_a : operand_b;
+
+        // ---- 64-bit rotates -----------------------------------------------
+        PVM_ALU_ROL_64:    result_o = (operand_a << operand_b[5:0]) | (operand_a >> (7'd64 - {1'b0, operand_b[5:0]}));
+        PVM_ALU_ROR_64:    result_o = (operand_a >> operand_b[5:0]) | (operand_a << (7'd64 - {1'b0, operand_b[5:0]}));
+        PVM_ALU_ROR_IMM_64:result_o = (operand_a >> operand_b[5:0]) | (operand_a << (7'd64 - {1'b0, operand_b[5:0]}));
+
+        // ---- 32-bit rotates (sign-extend result) --------------------------
+        PVM_ALU_ROL_32:    result_o = {{CVA6Cfg.XLEN-32{pvm_rol32_r[31]}}, pvm_rol32_r};
+        PVM_ALU_ROR_32:    result_o = {{CVA6Cfg.XLEN-32{pvm_ror32_r[31]}}, pvm_ror32_r};
+        PVM_ALU_ROR_IMM_32:result_o = {{CVA6Cfg.XLEN-32{pvm_ror32_r[31]}}, pvm_ror32_r};
+
+        // ---- Register/bit-extend operations (Group 11) --------------------
+        PVM_ALU_MOVE_REG:   result_o = operand_a;
+        PVM_ALU_ZERO_EXT_16:result_o = {{CVA6Cfg.XLEN-16{1'b0}}, operand_a[15:0]};
+
+        // reverse_byte_64: byte-reverse all 8 bytes (= REV8 / bswap64)
+        PVM_ALU_REV_BYTE_64: result_o = {operand_a[ 7: 0], operand_a[15: 8],
+                                          operand_a[23:16], operand_a[31:24],
+                                          operand_a[39:32], operand_a[47:40],
+                                          operand_a[55:48], operand_a[63:56]};
+
+        // reverse_byte_32: byte-reverse lower 32b, sign-extend to XLEN
+        PVM_ALU_REV_BYTE_32: result_o = {{CVA6Cfg.XLEN-32{pvm_rev32_r[31]}}, pvm_rev32_r};
+
+        // CLZ/CTZ/CPOP: reuse Zbb submodule results (valid when RVB=1)
+        PVM_ALU_CLZ_64: result_o = CVA6Cfg.RVB ?
+            ((lz_tz_empty) ?
+                ({{CVA6Cfg.XLEN-$clog2(CVA6Cfg.XLEN){1'b0}}, lz_tz_count} + 1) :
+                {{CVA6Cfg.XLEN-$clog2(CVA6Cfg.XLEN){1'b0}}, lz_tz_count}) : '0;
+        PVM_ALU_CTZ_64: result_o = CVA6Cfg.RVB ?
+            ((lz_tz_empty) ?
+                ({{CVA6Cfg.XLEN-$clog2(CVA6Cfg.XLEN){1'b0}}, lz_tz_count} + 1) :
+                {{CVA6Cfg.XLEN-$clog2(CVA6Cfg.XLEN){1'b0}}, lz_tz_count}) : '0;
+        PVM_ALU_CLZ_32: result_o = (CVA6Cfg.RVB && CVA6Cfg.IS_XLEN64) ?
+            ((lz_tz_wempty) ? {{CVA6Cfg.XLEN-6{1'b0}}, 6'd32} :
+                              {{CVA6Cfg.XLEN-5{1'b0}}, lz_tz_wcount}) : '0;
+        PVM_ALU_CTZ_32: result_o = (CVA6Cfg.RVB && CVA6Cfg.IS_XLEN64) ?
+            ((lz_tz_wempty) ? {{CVA6Cfg.XLEN-6{1'b0}}, 6'd32} :
+                              {{CVA6Cfg.XLEN-5{1'b0}}, lz_tz_wcount}) : '0;
+        PVM_ALU_CPOP_64: result_o = CVA6Cfg.RVB ?
+            {{(CVA6Cfg.XLEN-($clog2(CVA6Cfg.XLEN)+1)){1'b0}}, cpop} : '0;
+        PVM_ALU_CPOP_32: result_o = CVA6Cfg.RVB ?
+            {{(CVA6Cfg.XLEN-($clog2(CVA6Cfg.XLEN)+1)){1'b0}}, cpop} : '0;
+
+        // ---- Sign/zero extend ---------------------------------------------
+        PVM_ALU_SEXT_8:  result_o = {{CVA6Cfg.XLEN-8{operand_a[7]}},   operand_a[7:0]};
+        PVM_ALU_SEXT_16: result_o = {{CVA6Cfg.XLEN-16{operand_a[15]}}, operand_a[15:0]};
+
+        default: ; // unknown pvm_alu_op: result_o already set by legacy mux
+      endcase
+    end  // is_pvm_op_i
   end
 endmodule

@@ -178,4 +178,15 @@ package cva6_config_pkg;
       DcacheIdWidth: int'(CVA6ConfigDcacheIdWidth)
   };
 
+  // PolkaVM native-ISA mode switch (ADR-11).
+  // Default 0: existing RV64EMAC core elaborates unchanged.
+  // Set to 1 to activate PVM-ISA modules introduced in Phase 4 sub-phases 2+.
+  localparam CVA6ConfigUsePvmIsa = 1;
+
+  // Sub-phase 4.5 (ADR-10): PVM fetch port is 128 bits (16 B aligned groups).
+  // build_config_pkg.sv:175 reads CVA6ConfigUsePvmIsa to override FETCH_WIDTH.
+  // This localparam documents the intended width; the override is in build_config_pkg.sv.
+  // grep: FETCH_WIDTH = 128 when CVA6ConfigUsePvmIsa = 1.
+  localparam CVA6ConfigPvmFetchWidth = 128;
+
 endpackage

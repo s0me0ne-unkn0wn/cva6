@@ -15,6 +15,7 @@
 
 module load_store_unit
   import ariane_pkg::*;
+  import polkavm_pkg::*;
 #(
     parameter config_pkg::cva6_cfg_t CVA6Cfg = config_pkg::cva6_cfg_empty,
     parameter type dcache_req_i_t = logic,
@@ -575,15 +576,13 @@ module load_store_unit
     };
     data_misaligned = 1'b0;
 
-    if (lsu_ctrl.valid) begin
+    // PVM JAM v1 requires unaligned memory access support — misaligned
+    // exceptions are suppressed entirely in PVM ISA mode.
+    if (lsu_ctrl.valid && !cva6_config_pkg::CVA6ConfigUsePvmIsa) begin
       if (CVA6Cfg.IS_XLEN64) begin
         case (lsu_ctrl.operation)
           // double word
-          LD, SD,
-                  AMO_LRD, AMO_SCD,
-                  AMO_SWAPD, AMO_ADDD, AMO_ANDD, AMO_ORD,
-                  AMO_XORD, AMO_MAXD, AMO_MAXDU, AMO_MIND,
-                  AMO_MINDU: begin
+          LD, SD: begin
             if (lsu_ctrl.vaddr[2:0] != 3'b000) begin
               data_misaligned = 1'b1;
             end
@@ -593,11 +592,7 @@ module load_store_unit
       end
       case (lsu_ctrl.operation)
         // word
-        LW, LWU, SW,
-                AMO_LRW, AMO_SCW,
-                AMO_SWAPW, AMO_ADDW, AMO_ANDW, AMO_ORW,
-                AMO_XORW, AMO_MAXW, AMO_MAXWU, AMO_MINW,
-                AMO_MINWU: begin
+        LW, LWU, SW: begin
           if (lsu_ctrl.vaddr[1:0] != 2'b00) begin
             data_misaligned = 1'b1;
           end
@@ -642,6 +637,29 @@ module load_store_unit
         STORE: begin
           cva6_misaligned_exception.cause = riscv::STORE_PAGE_FAULT;
           cva6_misaligned_exception.valid = 1'b1;
+          if (CVA6Cfg.TvalEn)
+            cva6_misaligned_exception.tval = {{CVA6Cfg.XLEN - CVA6Cfg.VLEN{1'b0}}, lsu_ctrl.vaddr};
+        end
+        default: ;
+      endcase
+    end
+
+    // PVM low-inaccessible panic: only trap truly unmapped region (address 0).
+    // PVM JAM v1 maps ro_data starting at address 0, so addresses >= 1 are
+    // valid.  PVM_LOW_INACCESSIBLE_MOD previously set to 0x10000 was too
+    // aggressive and blocked legitimate RO/RW data accesses.  Use limit=1
+    // (only address 0 is the null-pointer trap) to allow the program to run.
+    if (cva6_config_pkg::CVA6ConfigUsePvmIsa && lsu_ctrl.valid &&
+        lsu_ctrl.vaddr[31:0] < 32'h1) begin
+      cva6_misaligned_exception.valid = 1'b1;
+      case (lsu_ctrl.fu)
+        LOAD: begin
+          cva6_misaligned_exception.cause = riscv::LD_ACCESS_FAULT;
+          if (CVA6Cfg.TvalEn)
+            cva6_misaligned_exception.tval = {{CVA6Cfg.XLEN - CVA6Cfg.VLEN{1'b0}}, lsu_ctrl.vaddr};
+        end
+        STORE: begin
+          cva6_misaligned_exception.cause = riscv::ST_ACCESS_FAULT;
           if (CVA6Cfg.TvalEn)
             cva6_misaligned_exception.tval = {{CVA6Cfg.XLEN - CVA6Cfg.VLEN{1'b0}}, lsu_ctrl.vaddr};
         end

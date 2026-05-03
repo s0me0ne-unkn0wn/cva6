@@ -304,6 +304,8 @@ xil_debug_filter += $(addprefix $(root-dir), corev_apu/riscv-dbg/src/dmi_vjtag.s
 src := $(filter-out $(xil_debug_filter), $(src))
 
 fpga_src += corev_apu/fpga/src/bootrom/bootrom_$(XLEN).sv
+fpga_src += corev_apu/fpga/src/bootrom/bootrom_code_$(XLEN).sv
+fpga_src += corev_apu/fpga/src/bootrom/bootrom_bitmask_$(XLEN).sv
 fpga_src := $(addprefix $(root-dir), $(fpga_src))
 
 # look for testbenches
