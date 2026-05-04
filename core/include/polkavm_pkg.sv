@@ -652,10 +652,13 @@ package polkavm_pkg;
       // -----------------------------------------------------------------------
       // Group 10: imm_imm — store_imm (absolute address + immediate value)
       // -----------------------------------------------------------------------
-      PVM_OP_STORE_IMM_U8:  begin r.fu = PVM_FU_STORE; r.op = PVM_OP_SB_FU; end
-      PVM_OP_STORE_IMM_U16: begin r.fu = PVM_FU_STORE; r.op = PVM_OP_SH_FU; end
-      PVM_OP_STORE_IMM_U32: begin r.fu = PVM_FU_STORE; r.op = PVM_OP_SW_FU; end
-      PVM_OP_STORE_IMM_U64: begin r.fu = PVM_FU_STORE; r.op = PVM_OP_SD_FU; end
+      // imm1 = absolute address (used as offset, base reg = x0 from decoder),
+      // imm2 = data byte. id_stage packs {imm2[31:0], imm1[31:0]} into
+      // result; issue_read_operands extracts result[63:32] as operand_b.
+      PVM_OP_STORE_IMM_U8:  begin r.fu = PVM_FU_STORE; r.op = PVM_OP_SB_FU; r.use_imm = 1'b1; r.is_pvm_op = 1'b1; end
+      PVM_OP_STORE_IMM_U16: begin r.fu = PVM_FU_STORE; r.op = PVM_OP_SH_FU; r.use_imm = 1'b1; r.is_pvm_op = 1'b1; end
+      PVM_OP_STORE_IMM_U32: begin r.fu = PVM_FU_STORE; r.op = PVM_OP_SW_FU; r.use_imm = 1'b1; r.is_pvm_op = 1'b1; end
+      PVM_OP_STORE_IMM_U64: begin r.fu = PVM_FU_STORE; r.op = PVM_OP_SD_FU; r.use_imm = 1'b1; r.is_pvm_op = 1'b1; end
 
       // -----------------------------------------------------------------------
       // Group 8: offset — jump (PC-relative unconditional)
@@ -691,10 +694,13 @@ package polkavm_pkg;
       // -----------------------------------------------------------------------
       // Group 4: store_imm_indirect (base reg + imm offset + imm value)
       // -----------------------------------------------------------------------
-      PVM_OP_STORE_IMM_INDIRECT_U8:  begin r.fu = PVM_FU_STORE; r.op = PVM_OP_SB_FU; end
-      PVM_OP_STORE_IMM_INDIRECT_U16: begin r.fu = PVM_FU_STORE; r.op = PVM_OP_SH_FU; end
-      PVM_OP_STORE_IMM_INDIRECT_U32: begin r.fu = PVM_FU_STORE; r.op = PVM_OP_SW_FU; end
-      PVM_OP_STORE_IMM_INDIRECT_U64: begin r.fu = PVM_FU_STORE; r.op = PVM_OP_SD_FU; end
+      // rs1 = base reg, imm1 = offset, imm2 = data byte. id_stage packs
+      // {imm2[31:0], imm1[31:0]} into result; LSU computes addr = rs1 + result[31:0],
+      // issue_read_operands extracts sext(result[63:32]) as operand_b (write data).
+      PVM_OP_STORE_IMM_INDIRECT_U8:  begin r.fu = PVM_FU_STORE; r.op = PVM_OP_SB_FU; r.use_imm = 1'b1; r.is_pvm_op = 1'b1; end
+      PVM_OP_STORE_IMM_INDIRECT_U16: begin r.fu = PVM_FU_STORE; r.op = PVM_OP_SH_FU; r.use_imm = 1'b1; r.is_pvm_op = 1'b1; end
+      PVM_OP_STORE_IMM_INDIRECT_U32: begin r.fu = PVM_FU_STORE; r.op = PVM_OP_SW_FU; r.use_imm = 1'b1; r.is_pvm_op = 1'b1; end
+      PVM_OP_STORE_IMM_INDIRECT_U64: begin r.fu = PVM_FU_STORE; r.op = PVM_OP_SD_FU; r.use_imm = 1'b1; r.is_pvm_op = 1'b1; end
 
       // -----------------------------------------------------------------------
       // Group 3: reg_imm_offset (conditional branches with immediate comparand,
@@ -797,13 +803,13 @@ package polkavm_pkg;
       PVM_OP_STORE_INDIRECT_U16: begin r.fu = PVM_FU_STORE; r.op = PVM_OP_SH_FU; end
       PVM_OP_STORE_INDIRECT_U32: begin r.fu = PVM_FU_STORE; r.op = PVM_OP_SW_FU; end
       PVM_OP_STORE_INDIRECT_U64: begin r.fu = PVM_FU_STORE; r.op = PVM_OP_SD_FU; end
-      PVM_OP_LOAD_INDIRECT_U8:  begin r.fu = PVM_FU_LOAD; r.op = PVM_OP_LBU_FU; end
-      PVM_OP_LOAD_INDIRECT_I8:  begin r.fu = PVM_FU_LOAD; r.op = PVM_OP_LB_FU;  end
-      PVM_OP_LOAD_INDIRECT_U16: begin r.fu = PVM_FU_LOAD; r.op = PVM_OP_LHU_FU; end
-      PVM_OP_LOAD_INDIRECT_I16: begin r.fu = PVM_FU_LOAD; r.op = PVM_OP_LH_FU;  end
-      PVM_OP_LOAD_INDIRECT_U32: begin r.fu = PVM_FU_LOAD; r.op = PVM_OP_LWU_FU; end
-      PVM_OP_LOAD_INDIRECT_I32: begin r.fu = PVM_FU_LOAD; r.op = PVM_OP_LW_FU;  end
-      PVM_OP_LOAD_INDIRECT_U64: begin r.fu = PVM_FU_LOAD; r.op = PVM_OP_LD_FU;  end
+      PVM_OP_LOAD_INDIRECT_U8:  begin r.fu = PVM_FU_LOAD; r.op = PVM_OP_LBU_FU; r.use_imm = 1'b1; r.is_pvm_op = 1'b1; end
+      PVM_OP_LOAD_INDIRECT_I8:  begin r.fu = PVM_FU_LOAD; r.op = PVM_OP_LB_FU;  r.use_imm = 1'b1; r.is_pvm_op = 1'b1; end
+      PVM_OP_LOAD_INDIRECT_U16: begin r.fu = PVM_FU_LOAD; r.op = PVM_OP_LHU_FU; r.use_imm = 1'b1; r.is_pvm_op = 1'b1; end
+      PVM_OP_LOAD_INDIRECT_I16: begin r.fu = PVM_FU_LOAD; r.op = PVM_OP_LH_FU;  r.use_imm = 1'b1; r.is_pvm_op = 1'b1; end
+      PVM_OP_LOAD_INDIRECT_U32: begin r.fu = PVM_FU_LOAD; r.op = PVM_OP_LWU_FU; r.use_imm = 1'b1; r.is_pvm_op = 1'b1; end
+      PVM_OP_LOAD_INDIRECT_I32: begin r.fu = PVM_FU_LOAD; r.op = PVM_OP_LW_FU;  r.use_imm = 1'b1; r.is_pvm_op = 1'b1; end
+      PVM_OP_LOAD_INDIRECT_U64: begin r.fu = PVM_FU_LOAD; r.op = PVM_OP_LD_FU;  r.use_imm = 1'b1; r.is_pvm_op = 1'b1; end
       PVM_OP_ADD_IMM_32: begin
         r.fu = PVM_FU_ALU; r.op = PVM_OP_ADD_FU;
         r.pvm_alu_op = PVM_ALU_ADD_IMM_32; r.is_pvm_op = 1'b1; r.use_imm = 1'b1;

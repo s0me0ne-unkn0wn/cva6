@@ -298,7 +298,12 @@ module id_stage #(
         decoded_instruction[i].result  = pvm_imm_w;
         decoded_instruction[i].use_imm = pvm_dec_r.use_imm;
       end
-      decoded_instruction[i].valid    = pvm_fc_if_id_i[i].valid & ~stall_instr_fetch[i];
+      // sbe.valid means "execution complete, ready to commit" — must be 0 at decode
+      // time so the scoreboard waits for the FU writeback (wt_valid_i) before
+      // committing.  Set to 1 only for illegal instructions so they can retire
+      // and raise their exception immediately.  This matches the standard CVA6
+      // decoder: `assign instruction_o.valid = instruction_o.ex.valid;`
+      decoded_instruction[i].valid    = pvm_dec_r.is_illegal | pvm_illegal_op_w | pvm_illegal_reg_w;
       decoded_instruction[i].pc       = pvm_fe_pc_i;
       // Exception: illegal op, illegal reg, or function says illegal.
       decoded_instruction[i].ex.valid = pvm_illegal_op_w

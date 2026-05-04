@@ -442,10 +442,9 @@ module pvm_decoder
           dec_op         = PVM_OP_JUMP;
           imm_len        = min4(skip_i);
           imm_raw        = read_imm_at(chunk_i, 4'd1, imm_len);
-          // PVM branch offsets are relative to next_pc (pc + instr_len).
-          // CVA6 branch_unit computes target = pc + imm, so adjust:
-          // dec_imm = raw_imm + (skip + 1) = raw_imm + instr_len.
-          dec_imm        = {{32{imm_raw[31]}}, imm_raw} + 64'(skip_i) + 64'd1;
+          // PVM branch offsets: polkatool encodes imm_raw = target - pc.
+          // CVA6 branch_unit computes target = pc + dec_imm, so dec_imm = imm_raw.
+          dec_imm        = {{32{imm_raw[31]}}, imm_raw};
           dec_is_bb_term = 1'b1;
         end
 
@@ -494,9 +493,9 @@ module pvm_decoder
 
         // -----------------------------------------------------------------
         // Group 4: store_imm_indirect — base_reg + imm_offset + imm_value
-        // read_args_regs2_imm2: b1[3:0]=reg1, b1[7:4]=reg2 (unused here),
-        //   b2[2:0]=imm1_len, imm1 from b3, imm2 after.
-        // TABLE_2 (offset=2): imm1_len=min(4,b2[2:0]), imm2_len=clamp(0,skip-imm1_len-2,4)
+        // read_args_reg_imm2: b1[3:0]=reg, b1[7:4]=imm1_len_aux (TABLE_1),
+        //   imm1 from b2, imm2 follows imm1.
+        // TABLE_1 (offset=1): imm1_len=min(4,b1[6:4]), imm2_len=clamp(0,skip-imm1_len-1,4)
         // For store_imm_indirect: reg=b1[3:0], offset_imm=imm1, value_imm=imm2
         // -----------------------------------------------------------------
         8'd70, 8'd71, 8'd72, 8'd73: begin  // store_imm_indirect_u*
@@ -508,16 +507,14 @@ module pvm_decoder
           endcase
           dec_rs1     = b1[3:0];
           dec_has_rs1 = 1'b1;
-          // b1[7:4] is NOT a register in this encoding (unused nibble).
-          // dec_rs2 / dec_has_rs2 remain at their defaults (0 / false).
-          // Clamp imm1_len to bytes actually available after b1,b2.
-          // Available = max(0, skip - 2); min with the declared length.
-          imm1_len = min4({2'b00, b2[2:0]});  // min(4, b2[2:0])
-          if (6'(imm1_len) > (skip_s - 6'd2))
-            imm1_len = clamp04(skip_s - 6'd2);  // clamp to available bytes
-          imm2_len = clamp04(skip_s - 6'(imm1_len) - 6'd2);
-          imm1_raw = read_imm_at(chunk_i, 4'd3, imm1_len);  // starts at b3
-          imm2_raw = read_imm_at(chunk_i, 4'd3 + {1'b0, imm1_len}, imm2_len);
+          // b1[7:4] encodes imm1_len (TABLE_1 aux nibble, NOT a register).
+          // imm1 (address offset) starts at b2; imm2 (store value) follows.
+          imm1_len = min4({2'b00, b1[6:4]});  // min(4, b1[6:4])
+          if (6'(imm1_len) > (skip_s - 6'd1))
+            imm1_len = clamp04(skip_s - 6'd1);  // clamp to available bytes
+          imm2_len = clamp04(skip_s - 6'(imm1_len) - 6'd1);
+          imm1_raw = read_imm_at(chunk_i, 4'd2, imm1_len);  // starts at b2
+          imm2_raw = read_imm_at(chunk_i, 4'd2 + {1'b0, imm1_len}, imm2_len);
           dec_imm  = {{32{imm1_raw[31]}}, imm1_raw};
           dec_imm2 = {{32{imm2_raw[31]}}, imm2_raw};
         end
@@ -550,8 +547,9 @@ module pvm_decoder
           imm1_raw = read_imm_at(chunk_i, 4'd2, imm1_len);  // from b2
           imm2_raw = read_imm_at(chunk_i, 4'd2 + {1'b0, imm1_len}, imm2_len);
           dec_imm  = {{32{imm1_raw[31]}}, imm1_raw};
-          // dec_imm2 = branch offset, relative to next_pc. Adjust for CVA6 pc+imm:
-          dec_imm2 = {{32{imm2_raw[31]}}, imm2_raw} + 64'(skip_i) + 64'd1;
+          // dec_imm2 = branch offset: polkatool encodes imm2_raw = target - pc.
+          // CVA6 branch_unit computes target = pc + dec_imm2, so dec_imm2 = imm2_raw.
+          dec_imm2 = {{32{imm2_raw[31]}}, imm2_raw};
         end
 
         // -----------------------------------------------------------------
@@ -712,8 +710,9 @@ module pvm_decoder
           dec_has_rs2    = 1'b1;
           imm_len        = clamp04(skip_s - 6'd1);
           imm_raw        = read_imm_at(chunk_i, 4'd2, imm_len);
-          // Branch offset relative to next_pc; adjust for CVA6 pc+imm convention.
-          dec_imm        = {{32{imm_raw[31]}}, imm_raw} + 64'(skip_i) + 64'd1;
+          // Branch offset: polkatool encodes imm_raw = target - pc.
+          // CVA6 branch_unit computes target = pc + dec_imm, so dec_imm = imm_raw.
+          dec_imm        = {{32{imm_raw[31]}}, imm_raw};
           dec_is_bb_term = 1'b1;
         end
 

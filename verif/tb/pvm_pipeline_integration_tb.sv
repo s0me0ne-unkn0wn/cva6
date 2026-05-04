@@ -262,6 +262,29 @@ module pvm_pipeline_integration_tb;
     end
   end
 
+  // -------------------------------------------------------------------------
+  // Simple RAM model — backs all AXI write/read traffic outside UART/ro_data.
+  // Byte-addressed associative array; only entries written are stored.
+  // -------------------------------------------------------------------------
+  logic [7:0] axi_ram [logic [63:0]];
+
+  // Helper task — commit one AXI write beat into the RAM.
+  task automatic ram_write(
+    input logic [AXI_AW-1:0] aw_addr,
+    input logic [63:0]        w_data,
+    input logic [7:0]         w_strb
+  );
+    for (int b = 0; b < 8; b++) begin
+      if (w_strb[b])
+        axi_ram[aw_addr + AXI_AW'(b)] = w_data[b*8 +: 8];
+    end
+  endtask
+
+  // Latch AW address for the ram_write path (mirrors pend_aw_addr used for UART).
+  // We reuse pend_aw_addr / pend_aw_valid which are already declared below, so
+  // the RAM write block runs in the same always_ff as the UART tracker.
+  // NOTE: ram_write() is called from the uart-tracker always_ff (see below).
+
   // --- Read path ---
   logic                      r_valid_q;
   logic [AXI_IDW-1:0]        r_id_q;
@@ -315,7 +338,13 @@ module pvm_pipeline_integration_tb;
       else
         r_data_comb = '0;
     end else begin
-      r_data_comb = '0;
+      // Return bytes from the RAM model; unwritten bytes default to 0.
+      for (int b = 0; b < 8; b++) begin
+        if (axi_ram.exists(r_addr_q + AXI_AW'(b)))
+          r_data_comb[b*8 +: 8] = axi_ram[r_addr_q + AXI_AW'(b)];
+        else
+          r_data_comb[b*8 +: 8] = 8'h00;
+      end
     end
   end
 
@@ -427,6 +456,7 @@ module pvm_pipeline_integration_tb;
       // Both AW and W accepted in the same cycle → immediate match.
       if (aw_fire && w_fire) begin
         uart_emit(noc_req.aw.addr, noc_req.w.data, noc_req.w.strb);
+        ram_write(noc_req.aw.addr, noc_req.w.data, noc_req.w.strb);
         pend_aw_valid <= 1'b0;
         pend_w_valid  <= 1'b0;
 
@@ -434,6 +464,7 @@ module pvm_pipeline_integration_tb;
       end else if (aw_fire) begin
         if (pend_w_valid) begin
           uart_emit(noc_req.aw.addr, pend_w_data, pend_w_strb);
+          ram_write(noc_req.aw.addr, pend_w_data, pend_w_strb);
           pend_w_valid  <= 1'b0;
         end else begin
           pend_aw_addr  <= noc_req.aw.addr;
@@ -444,6 +475,7 @@ module pvm_pipeline_integration_tb;
       end else if (w_fire) begin
         if (pend_aw_valid) begin
           uart_emit(pend_aw_addr, noc_req.w.data, noc_req.w.strb);
+          ram_write(pend_aw_addr, noc_req.w.data, noc_req.w.strb);
           pend_aw_valid <= 1'b0;
         end else begin
           pend_w_data  <= noc_req.w.data;
@@ -608,6 +640,17 @@ module pvm_pipeline_integration_tb;
   wire        cq1_vld = i_cva6.ex_stage_i.lsu_i.i_store_unit.store_buffer_i.commit_queue_q[1].valid;
   wire        cq2_vld = i_cva6.ex_stage_i.lsu_i.i_store_unit.store_buffer_i.commit_queue_q[2].valid;
   wire        cq3_vld = i_cva6.ex_stage_i.lsu_i.i_store_unit.store_buffer_i.commit_queue_q[3].valid;
+  // Probe SB entry addresses for forwarding analysis
+  wire [63:0] sq0_addr = i_cva6.ex_stage_i.lsu_i.i_store_unit.store_buffer_i.speculative_queue_q[0].address;
+  wire [63:0] sq1_addr = i_cva6.ex_stage_i.lsu_i.i_store_unit.store_buffer_i.speculative_queue_q[1].address;
+  wire [63:0] cq0_addr = i_cva6.ex_stage_i.lsu_i.i_store_unit.store_buffer_i.commit_queue_q[0].address;
+  wire [63:0] cq1_addr = i_cva6.ex_stage_i.lsu_i.i_store_unit.store_buffer_i.commit_queue_q[1].address;
+  wire [63:0] cq0_data = i_cva6.ex_stage_i.lsu_i.i_store_unit.store_buffer_i.commit_queue_q[0].data;
+  wire [63:0] cq1_data = i_cva6.ex_stage_i.lsu_i.i_store_unit.store_buffer_i.commit_queue_q[1].data;
+  wire [7:0]  cq0_be   = i_cva6.ex_stage_i.lsu_i.i_store_unit.store_buffer_i.commit_queue_q[0].be;
+  wire [7:0]  cq1_be   = i_cva6.ex_stage_i.lsu_i.i_store_unit.store_buffer_i.commit_queue_q[1].be;
+  wire        sb_page_off_match = i_cva6.ex_stage_i.lsu_i.i_store_unit.store_buffer_i.page_offset_matches_o;
+  wire [11:0] sb_page_off_in   = i_cva6.ex_stage_i.lsu_i.i_store_unit.store_buffer_i.page_offset_i;
 
   // Load unit probes
   wire        lu_valid_i  = i_cva6.ex_stage_i.lsu_i.i_load_unit.valid_i;
@@ -620,6 +663,39 @@ module pvm_pipeline_integration_tb;
   wire        lu_data_gnt = i_cva6.ex_stage_i.lsu_i.i_load_unit.req_port_i.data_gnt;
   wire        lu_ex_valid = i_cva6.ex_stage_i.lsu_i.i_load_unit.ex_i.valid;
   wire [63:0] lu_trans_id = {59'b0, i_cva6.ex_stage_i.lsu_i.i_load_unit.trans_id_o};
+  // Dcache load-port return data (port 1 = load unit)
+  wire [63:0] lu_dcache_rdata = i_cva6.dcache_req_ports_cache_ex[1].data_rdata;
+  wire        lu_dcache_rvalid = i_cva6.dcache_req_ports_cache_ex[1].data_rvalid;
+  // Dcache wbuffer not-idle
+  wire        dcache_wbuf_not_ni = i_cva6.gen_cache_wt.i_cache_subsystem.i_wt_dcache.wbuffer_not_ni_o;
+  // Scoreboard writeback port probes (LOAD_WB=2, STORE_WB=1, FLU_WB=0)
+  wire        wb_load_valid   = i_cva6.wt_valid_ex_id[2];
+  wire [4:0]  wb_load_tid     = i_cva6.trans_id_ex_id[2];
+  wire [63:0] wb_load_data    = i_cva6.wbdata_ex_id[2];
+  wire        wb_flu_valid    = i_cva6.wt_valid_ex_id[0];
+  wire [4:0]  wb_flu_tid      = i_cva6.trans_id_ex_id[0];
+  wire [63:0] wb_flu_data     = i_cva6.wbdata_ex_id[0];
+
+  // Dcache wbuffer entry probes (8 entries, WtDcacheWbufDepth=8)
+  // Each entry has: wtag, data, valid, dirty, txblock, checked, hit_oh
+  wire [63:0] wbuf0_data  = i_cva6.gen_cache_wt.i_cache_subsystem.i_wt_dcache.i_wt_dcache_wbuffer.wbuffer_q[0].data;
+  wire [7:0]  wbuf0_valid = i_cva6.gen_cache_wt.i_cache_subsystem.i_wt_dcache.i_wt_dcache_wbuffer.wbuffer_q[0].valid;
+  wire [7:0]  wbuf0_dirty = i_cva6.gen_cache_wt.i_cache_subsystem.i_wt_dcache.i_wt_dcache_wbuffer.wbuffer_q[0].dirty;
+  wire [7:0]  wbuf0_txblk = i_cva6.gen_cache_wt.i_cache_subsystem.i_wt_dcache.i_wt_dcache_wbuffer.wbuffer_q[0].txblock;
+  // wtag width = DCACHE_TAG_WIDTH + (DCACHE_INDEX_WIDTH - XLEN_ALIGN_BYTES) = 44+(12-3) = 53 bits
+  // Pack as 64-bit for display
+  wire [63:0] wbuf0_wtag  = {11'b0, i_cva6.gen_cache_wt.i_cache_subsystem.i_wt_dcache.i_wt_dcache_wbuffer.wbuffer_q[0].wtag};
+  wire [63:0] wbuf1_data  = i_cva6.gen_cache_wt.i_cache_subsystem.i_wt_dcache.i_wt_dcache_wbuffer.wbuffer_q[1].data;
+  wire [7:0]  wbuf1_valid = i_cva6.gen_cache_wt.i_cache_subsystem.i_wt_dcache.i_wt_dcache_wbuffer.wbuffer_q[1].valid;
+  wire [63:0] wbuf1_wtag  = {11'b0, i_cva6.gen_cache_wt.i_cache_subsystem.i_wt_dcache.i_wt_dcache_wbuffer.wbuffer_q[1].wtag};
+  wire [63:0] wbuf2_data  = i_cva6.gen_cache_wt.i_cache_subsystem.i_wt_dcache.i_wt_dcache_wbuffer.wbuffer_q[2].data;
+  wire [7:0]  wbuf2_valid = i_cva6.gen_cache_wt.i_cache_subsystem.i_wt_dcache.i_wt_dcache_wbuffer.wbuffer_q[2].valid;
+  wire [63:0] wbuf2_wtag  = {11'b0, i_cva6.gen_cache_wt.i_cache_subsystem.i_wt_dcache.i_wt_dcache_wbuffer.wbuffer_q[2].wtag};
+  // Load unit ldbuf address_offset (byte offset within dword for the current load)
+  wire [2:0]  lu_addr_off = i_cva6.ex_stage_i.lsu_i.i_load_unit.ldbuf_q[i_cva6.ex_stage_i.lsu_i.i_load_unit.ldbuf_rindex].address_offset;
+  // dcache forwarding hit signal from wt_dcache_mem (wbuffer_be = bytes forwarded from wbuf)
+  wire [7:0]  dcache_wbuf_be  = i_cva6.gen_cache_wt.i_cache_subsystem.i_wt_dcache.i_wt_dcache_mem.wbuffer_be;
+  wire [63:0] dcache_wbuf_rdata = i_cva6.gen_cache_wt.i_cache_subsystem.i_wt_dcache.i_wt_dcache_mem.wbuffer_rdata;
 
   // Issue-stage operand probes
   wire [63:0] iss_opa = i_cva6.issue_stage_i.i_issue_read_operands.fu_data_q[0].operand_a;
@@ -659,14 +735,25 @@ module pvm_pipeline_integration_tb;
   wire [63:0] iss_fwd_res  = i_cva6.issue_stage_i.i_issue_read_operands.fwd_res[iss_idx_rs1];
   wire        iss_fwd_valid= i_cva6.issue_stage_i.i_issue_read_operands.fwd_res_valid[iss_idx_rs1];
 
+  // Scoreboard commit-slot probes: track sbe.valid and sbe.result for commit pointer
+  wire [3:0]  sb_commit_ptr = i_cva6.issue_stage_i.i_scoreboard.commit_pointer_q[0];
+  wire        sb_cmt_valid  = i_cva6.issue_stage_i.i_scoreboard.mem_q[sb_commit_ptr].sbe.valid;
+  wire [63:0] sb_cmt_result = i_cva6.issue_stage_i.i_scoreboard.mem_q[sb_commit_ptr].sbe.result;
+  wire [63:0] sb_cmt_pc     = i_cva6.issue_stage_i.i_scoreboard.mem_q[sb_commit_ptr].sbe.pc;
+  wire [3:0]  sb_cmt_fu     = i_cva6.issue_stage_i.i_scoreboard.mem_q[sb_commit_ptr].sbe.fu;
+  // wt_valid_i array: all writeback ports visible to scoreboard
+  wire        sb_wt_ld      = i_cva6.wt_valid_ex_id[2];
+  wire        sb_wt_flu     = i_cva6.wt_valid_ex_id[0];
+  wire        sb_wt_st      = i_cva6.wt_valid_ex_id[1];
+
   always_ff @(posedge clk) begin
-    if (rst_ni && ((cycle_count >= 20 && cycle_count <= 40) || (cycle_count >= 305 && cycle_count <= 345))) begin
+    if (rst_ni && ((cycle_count >= 1 && cycle_count <= 45) || (cycle_count >= 255 && cycle_count <= 275) || (cycle_count >= 305 && cycle_count <= 345) || (cycle_count >= 499900 && cycle_count <= 500001))) begin
       $display("[ISS cy=%0d] pc=0x%0h rd=%0d rs1=%0d opa=0x%0h opb=0x%0h use_imm=%0b imm=0x%0h stall=%0b valid=%0b",
                cycle_count, iss_pc, iss_rd, iss_rs1, iss_opa, iss_opb, iss_use_imm, iss_result, iss_stall, iss_valid);
       $display("[FWD cy=%0d] rs1_raw=%0b fwd=%0b rs1_valid=%0b idx=%0d fwd_res=0x%0h fwd_vld=%0b rf_opa=0x%0h raddr=%0d blk8=%0d",
                cycle_count, iss_rs1_raw, fwd_rs1, iss_rs1_valid, iss_idx_rs1, iss_fwd_res, iss_fwd_valid, rf_opa_comb, rf_raddr0, rf_blksel8);
     end
-    if (rst_ni && ((cycle_count >= 20 && cycle_count <= 40) || (cycle_count >= 305 && cycle_count <= 345))) begin
+    if (rst_ni && ((cycle_count >= 1 && cycle_count <= 45) || (cycle_count >= 255 && cycle_count <= 275) || (cycle_count >= 305 && cycle_count <= 345) || (cycle_count >= 499900 && cycle_count <= 500001))) begin
       if (wbk_valid)
         $display("[WBK cy=%0d] rd=%0d data=0x%0h x8=0x%0h",
                  cycle_count, wbk_rd, wbk_data, rf_x8);
@@ -678,16 +765,68 @@ module pvm_pipeline_integration_tb;
       if (wbk1_valid && wbk1_rd == 5'd12)
         $display("[R11 cy=%0d port=1] data=0x%0h x12=0x%0h", cycle_count, wbk1_data, rf_x12);
     end
-    if (rst_ni && (cycle_count <= 40 || (cycle_count >= 305 && cycle_count <= 345))) begin
+    // Track all writes to x1 (ra / r0) — always active
+    if (rst_ni) begin
+      if (wbk_valid  && wbk_rd  == 5'd1)
+        $display("[RA  cy=%0d port=0] data=0x%0h", cycle_count, wbk_data);
+      if (wbk1_valid && wbk1_rd == 5'd1)
+        $display("[RA  cy=%0d port=1] data=0x%0h", cycle_count, wbk1_data);
+    end
+    // Always print SB state when any entry is valid (catches store drain timing)
+    if (rst_ni && (sq0_vld || sq1_vld || sq2_vld || sq3_vld || cq0_vld || cq1_vld || cq2_vld || cq3_vld || sb_valid_i || sb_commit_i)) begin
+      $display("[SB cy=%0d] sc=%0d cc=%0d rp=%0d wp=%0d sq_v=%0b%0b%0b%0b cq_v=%0b%0b%0b%0b valid_i=%0b commit_i=%0b paddr=0x%0h pg_match=%0b pg_off=0x%0h cq0:[v=%0b a=0x%0h d=0x%0h be=0x%02h] cq1:[v=%0b a=0x%0h d=0x%0h be=0x%02h]",
+               cycle_count, sb_spec_cnt, sb_commit_cnt, sb_commit_rptr, sb_commit_wptr,
+               sq3_vld, sq2_vld, sq1_vld, sq0_vld,
+               cq3_vld, cq2_vld, cq1_vld, cq0_vld,
+               sb_valid_i, sb_commit_i, sb_paddr_i,
+               sb_page_off_match, sb_page_off_in,
+               cq0_vld, cq0_addr, cq0_data, cq0_be,
+               cq1_vld, cq1_addr, cq1_data, cq1_be);
+    end
+    if (rst_ni && (cycle_count <= 45 || (cycle_count >= 255 && cycle_count <= 275) || (cycle_count >= 305 && cycle_count <= 345) || (cycle_count >= 499900 && cycle_count <= 500001))) begin
       $display("[SU cy=%0d] state=%0d vi=%0b vo=%0b stvld=%0b pop=%0b flush=%0b vaddr=0x%0h",
                cycle_count, su_state, su_valid_i, su_valid_o, su_st_valid, su_pop, su_flush, su_vaddr);
       $display("[LU cy=%0d] state=%0d vi=%0b vo=%0b vaddr=0x%0h result=0x%0h req=%0b gnt=%0b rvalid=%0b ex=%0b tid=%0d",
                cycle_count, lu_state, lu_valid_i, lu_valid_o, lu_vaddr, lu_result, lu_data_req, lu_data_gnt, lu_rvalid, lu_ex_valid, lu_trans_id);
-      $display("[SB cy=%0d] sc=%0d cc=%0d rp=%0d wp=%0d sq_v=%0b%0b%0b%0b cq_v=%0b%0b%0b%0b st_req=%0b valid_i=%0b commit_i=%0b rdy=%0b paddr=0x%0h",
-               cycle_count, sb_spec_cnt, sb_commit_cnt, sb_commit_rptr, sb_commit_wptr,
-               sq3_vld, sq2_vld, sq1_vld, sq0_vld,
-               cq3_vld, cq2_vld, cq1_vld, cq0_vld,
-               st_data_req, sb_valid_i, sb_commit_i, sb_ready_o, sb_paddr_i);
+    end
+    // Always log when dcache returns data to load unit
+    if (rst_ni && lu_dcache_rvalid)
+      $display("[DCACHE_R cy=%0d] rdata=0x%0h vaddr=0x%0h result=0x%0h wbuf_not_ni=%0b wbuf_be=0x%02h wbuf_fwd=0x%0h addr_off=%0d",
+               cycle_count, lu_dcache_rdata, lu_vaddr, lu_result, dcache_wbuf_not_ni, dcache_wbuf_be, dcache_wbuf_rdata, lu_addr_off);
+    // Log when load unit fires valid_o (writeback to scoreboard)
+    if (rst_ni && lu_valid_o)
+      $display("[LU_WB cy=%0d] valid_o=1 result=0x%0h vaddr=0x%0h rvalid=%0b dcache_rdata=0x%0h wbuf_be=0x%02h",
+               cycle_count, lu_result, lu_vaddr, lu_rvalid, lu_dcache_rdata, dcache_wbuf_be);
+    // Always log scoreboard writeback events (LOAD_WB and FLU_WB ports)
+    if (rst_ni && wb_load_valid)
+      $display("[SB_WB_LD cy=%0d] tid=%0d data=0x%0h", cycle_count, wb_load_tid, wb_load_data);
+    if (rst_ni && wb_flu_valid)
+      $display("[SB_WB_FLU cy=%0d] tid=%0d data=0x%0h", cycle_count, wb_flu_tid, wb_flu_data);
+    // Always log scoreboard commit-slot state transitions (valid going 0->1)
+    // and show the slot when any wt_valid fires
+    if (rst_ni && (sb_wt_ld || sb_wt_flu || sb_wt_st))
+      $display("[SB_WT cy=%0d] flu=%0b st=%0b ld=%0b | cmt_ptr=%0d cmt_valid=%0b cmt_fu=%0d cmt_pc=0x%0h cmt_res=0x%0h",
+               cycle_count, sb_wt_flu, sb_wt_st, sb_wt_ld,
+               sb_commit_ptr, sb_cmt_valid, sb_cmt_fu, sb_cmt_pc, sb_cmt_result);
+    // Dump all 8 scoreboard entries for key windows
+    if (rst_ni && ((cycle_count >= 38 && cycle_count <= 50) || (cycle_count >= 256 && cycle_count <= 265))) begin
+      for (int s = 0; s < 8; s++) begin
+        $display("[SB_SLOT cy=%0d slot=%0d] issued=%0b valid=%0b fu=%0d pc=0x%0h res=0x%0h",
+                 cycle_count, s,
+                 i_cva6.issue_stage_i.i_scoreboard.mem_q[s].issued,
+                 i_cva6.issue_stage_i.i_scoreboard.mem_q[s].sbe.valid,
+                 i_cva6.issue_stage_i.i_scoreboard.mem_q[s].sbe.fu,
+                 i_cva6.issue_stage_i.i_scoreboard.mem_q[s].sbe.pc,
+                 i_cva6.issue_stage_i.i_scoreboard.mem_q[s].sbe.result);
+      end
+    end
+    // Log wbuffer entry state around load-execution window
+    if (rst_ni && ((cycle_count >= 1 && cycle_count <= 45) || (cycle_count >= 255 && cycle_count <= 275))) begin
+      $display("[WBUF cy=%0d] e0:[vld=%02h dty=%02h tx=%02h wtag=0x%0h dat=0x%0h] e1:[vld=%02h wtag=0x%0h dat=0x%0h] e2:[vld=%02h wtag=0x%0h dat=0x%0h]",
+               cycle_count,
+               wbuf0_valid, wbuf0_dirty, wbuf0_txblk, wbuf0_wtag, wbuf0_data,
+               wbuf1_valid, wbuf1_wtag, wbuf1_data,
+               wbuf2_valid, wbuf2_wtag, wbuf2_data);
     end
     if (flush_ctrl_if || flush_ctrl_id || flush_ctrl_ex || flush_commit || set_pc)
       if (rst_ni && cycle_count <= 200)

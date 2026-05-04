@@ -705,6 +705,9 @@ module cva6
   assign pvm_fe_code_addr_next_w = pvm_fe_code_addr_w + CVA6Cfg.VLEN'(16);
   logic [CVA6Cfg.VLEN-1:0] pvm_fe_bitmask_addr_w;
   logic [63:0]              pvm_fe_bitmask_data_w;
+  logic [31:0]              pvm_fe_bitmask_data_lo_w;  // current 32-byte window
+  logic [31:0]              pvm_fe_bitmask_data_hi_w;  // next 32-byte window
+  logic [CVA6Cfg.VLEN-1:0] pvm_fe_bitmask_addr_next_w; // bitmask_addr + 32
   logic [CVA6Cfg.VLEN-1:0] pvm_fe_pc_w;
   logic [4:0]               pvm_fe_skip_w;
 
@@ -712,6 +715,62 @@ module cva6
   // Priority: ecalli_done > eret > exception (ex_commit.valid).
   logic                    pvm_fe_redirect_valid_w;
   logic [CVA6Cfg.VLEN-1:0] pvm_fe_redirect_target_w;
+
+  // -------------------------------------------------------------------------
+  // PVM jump-table lookup for jump_indirect (JALR).
+  //
+  // In JAM v1 the operand of jump_indirect / ret is NOT a byte offset into
+  // the code section.  It is a "dynamic address" that encodes a jump-table
+  // index per polkavm-common/src/program.rs:
+  //
+  //   index = (addr - VM_CODE_ADDRESS_ALIGNMENT) / VM_CODE_ADDRESS_ALIGNMENT
+  //         = (addr - 2) / 2
+  //
+  // The jump table maps each index to the code-section byte offset of the
+  // target basic block.  The table below is auto-derived from the 18-entry,
+  // 2-byte-per-entry jump table embedded in bootrom.polkavm.
+  //
+  // Valid dynamic addresses: 0x0002, 0x0004, ..., 0x0024 (even, non-zero).
+  // Out-of-range or misaligned addresses → trap (keep addr=0, handled by
+  // the existing ex_commit path via is_valid_opcode=0 at byte 0).
+  // -------------------------------------------------------------------------
+  localparam int unsigned PVM_JT_SIZE = 18;
+  // Table indexed 0..17; entry i covers dynamic address (i*2 + 2).
+  localparam logic [15:0] PVM_JT [0:PVM_JT_SIZE-1] = '{
+    16'h004f,  // [0]  dyn_addr=0x0002
+    16'h0062,  // [1]  dyn_addr=0x0004
+    16'h006d,  // [2]  dyn_addr=0x0006
+    16'h0091,  // [3]  dyn_addr=0x0008
+    16'h009b,  // [4]  dyn_addr=0x000a
+    16'h00ad,  // [5]  dyn_addr=0x000c
+    16'h00c7,  // [6]  dyn_addr=0x000e
+    16'h00e1,  // [7]  dyn_addr=0x0010
+    16'h00e6,  // [8]  dyn_addr=0x0012
+    16'h00f0,  // [9]  dyn_addr=0x0014
+    16'h00fa,  // [10] dyn_addr=0x0016
+    16'h0101,  // [11] dyn_addr=0x0018
+    16'h010e,  // [12] dyn_addr=0x001a
+    16'h0139,  // [13] dyn_addr=0x001c
+    16'h0147,  // [14] dyn_addr=0x001e
+    16'h01be,  // [15] dyn_addr=0x0020  ← ret from print_uart → puts() loop
+    16'h01f7,  // [16] dyn_addr=0x0022
+    16'h0206   // [17] dyn_addr=0x0024
+  };
+
+  // Resolve a dynamic address to a code-byte-offset PC.
+  // Returns 0 (trap) for any invalid / out-of-range address.
+  function automatic logic [CVA6Cfg.VLEN-1:0] pvm_jt_lookup(
+    input logic [CVA6Cfg.VLEN-1:0] dyn_addr
+  );
+    logic [$clog2(PVM_JT_SIZE):0] idx;
+    // Must be even, non-zero, and within the table range.
+    if (dyn_addr[0] || dyn_addr == '0 ||
+        dyn_addr > CVA6Cfg.VLEN'(PVM_JT_SIZE * 2)) begin
+      return '0;  // invalid → PC=0 → trap at next fetch
+    end
+    idx = (dyn_addr - CVA6Cfg.VLEN'(2)) >> 1;
+    return CVA6Cfg.VLEN'(PVM_JT[idx]);
+  endfunction
 
   always_comb begin : pvm_fe_redirect_mux
     pvm_fe_redirect_valid_w  = 1'b0;
@@ -727,7 +786,15 @@ module cva6
       pvm_fe_redirect_target_w = trap_vector_base_commit_pcgen;
     end else if (resolved_branch.valid && resolved_branch.is_taken) begin
       pvm_fe_redirect_valid_w  = 1'b1;
-      pvm_fe_redirect_target_w = resolved_branch.target_address;
+      // For jump_indirect (JALR) the branch unit computed target_address as
+      // (rs1 + imm), which is the raw JAM v1 dynamic address.  Map it through
+      // the jump table to obtain the code-section byte offset.
+      if (resolved_branch.cf_type == ariane_pkg::JumpR) begin
+        pvm_fe_redirect_target_w =
+            pvm_jt_lookup(resolved_branch.target_address);
+      end else begin
+        pvm_fe_redirect_target_w = resolved_branch.target_address;
+      end
     end
   end
 
@@ -746,11 +813,21 @@ module cva6
     .rdata_o (pvm_fe_code_data_next_w)
   );
 
+  assign pvm_fe_bitmask_addr_next_w = pvm_fe_bitmask_addr_w + CVA6Cfg.VLEN'(32);
+  assign pvm_fe_bitmask_data_w = {pvm_fe_bitmask_data_hi_w, pvm_fe_bitmask_data_lo_w};
+
   bootrom_bitmask_64 i_bootrom_bitmask (
     .clk_i   (clk_i),
     .req_i   (1'b1),
     .addr_i  (pvm_fe_bitmask_addr_w),
-    .rdata_o (pvm_fe_bitmask_data_w)
+    .rdata_o (pvm_fe_bitmask_data_lo_w)
+  );
+
+  bootrom_bitmask_64 i_bootrom_bitmask_next (
+    .clk_i   (clk_i),
+    .req_i   (1'b1),
+    .addr_i  (pvm_fe_bitmask_addr_next_w),
+    .rdata_o (pvm_fe_bitmask_data_hi_w)
   );
 
   pvm_frontend #(
