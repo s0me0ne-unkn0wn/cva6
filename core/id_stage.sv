@@ -226,6 +226,9 @@ module id_stage #(
       .skip_i                           ({1'b0, pvm_fc_if_id_i[i].skip}),
       .is_valid_opcode_i                (pvm_fc_if_id_i[i].is_valid_opcode),
       .is_s_mode_i                      (1'b0),
+      // Phase 5 sub-phase 2.1: priv-opcode (slots 231-240) M-mode guard.
+      // Priv opcodes raise is_illegal_op when mode_i != PRIV_LVL_M (2'b11).
+      .mode_i                           (priv_lvl_i),
       .pvm_op_o                         (pvm_op_w),
       .rs1_o                            (pvm_rs1_w),
       .rs2_o                            (pvm_rs2_w),

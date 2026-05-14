@@ -37,6 +37,11 @@ module pvm_decoder
     // is_s_mode_i: current privilege level is PVM S-mode (supervisor).
     // Used for ecalli sentinel constraints.
     input  logic         is_s_mode_i,
+    // Phase 5 sub-phase 2.1: RISC-V-encoded privilege level for M-mode
+    // priv-opcode (slots 231-240) U/S-mode illegality guard. ADR-1
+    // principle 1: priv opcodes raise IllegalOp when mode_i != PRIV_LVL_M.
+    // Encoding (matches riscv::priv_lvl_t): 2'b00 U, 2'b01 S, 2'b11 M.
+    input  logic [1:0]   mode_i,
 
     // ---------------------------------------------------------------------------
     // Decoded outputs
@@ -117,6 +122,21 @@ module pvm_decoder
     valid_opcode_lut[10]  = 1'b1;  // ecalli
     // Group 13: reg_imm64
     valid_opcode_lut[20]  = 1'b1;  // load_imm64
+    // Phase 5 sub-phase 2.1: M-mode privileged opcodes (slots 231-240).
+    // LUT marks them valid; the mode_i guard below in decode_main raises
+    // is_illegal_op when current privilege is not M (so polkavm-linker
+    // emission of these opcodes into a JAM v1 strict 0x03 blob, which
+    // would only run in U-mode, traps as required by ADR-1 principle 1).
+    valid_opcode_lut[231] = 1'b1;  // csrrw
+    valid_opcode_lut[232] = 1'b1;  // csrrs
+    valid_opcode_lut[233] = 1'b1;  // csrrc
+    valid_opcode_lut[234] = 1'b1;  // csrrwi
+    valid_opcode_lut[235] = 1'b1;  // csrrsi
+    valid_opcode_lut[236] = 1'b1;  // csrrci
+    valid_opcode_lut[237] = 1'b1;  // mret
+    valid_opcode_lut[238] = 1'b1;  // sret
+    valid_opcode_lut[239] = 1'b1;  // wfi
+    valid_opcode_lut[240] = 1'b1;  // sfence.vma
     // Group 10: imm_imm
     valid_opcode_lut[30]  = 1'b1;  // store_imm_u8
     valid_opcode_lut[31]  = 1'b1;  // store_imm_u16
@@ -800,6 +820,67 @@ module pvm_decoder
         end
 
         // -----------------------------------------------------------------
+        // Phase 5 sub-phase 2.1: M-mode privileged opcodes (slots 231-240).
+        // Per ADR-1.1:
+        //   CSR std (csrrw/rs/rc, 231-233): b1[7:4]=rd, b1[3:0]=rs1,
+        //     imm[11:0]=csr_addr from {b3[3:0], b2}. skip=3 (4 bytes).
+        //   CSR imm (csrrwi/rsi/rci, 234-236): b1[7:4]=rd,
+        //     b1[3:0]=zimm[3:0] (4-bit; OpenSBI v1.7 emits no zimm>15
+        //     per grep audit), imm[11:0]=csr_addr. skip=3.
+        //   MRET/SRET/WFI (237-239): no operands. skip=0 (1 byte).
+        //   SFENCE_VMA (240): b1[7:4]=rs1, b1[3:0]=rs2. skip=1 (2 bytes).
+        // U/S-mode illegality is gated post-case via mode_i.
+        // -----------------------------------------------------------------
+        8'd231, 8'd232, 8'd233: begin  // csrrw, csrrs, csrrc
+          case (opcode)
+            8'd231:  dec_op = PVM_OP_CSR_RW;
+            8'd232:  dec_op = PVM_OP_CSR_RS;
+            8'd233:  dec_op = PVM_OP_CSR_RC;
+            default: dec_op = PVM_OP_CSR_RW;
+          endcase
+          dec_rd      = b1[7:4];
+          dec_rs1     = b1[3:0];
+          dec_has_rd  = 1'b1;
+          dec_has_rs1 = 1'b1;
+          // csr_addr = {b3[3:0], b2} in imm[11:0]; upper bits zero.
+          dec_imm = {52'b0, b3[3:0], b2};
+        end
+        8'd234, 8'd235, 8'd236: begin  // csrrwi, csrrsi, csrrci
+          case (opcode)
+            8'd234:  dec_op = PVM_OP_CSR_RWI;
+            8'd235:  dec_op = PVM_OP_CSR_RSI;
+            8'd236:  dec_op = PVM_OP_CSR_RCI;
+            default: dec_op = PVM_OP_CSR_RWI;
+          endcase
+          dec_rd      = b1[7:4];
+          // zimm[3:0] lives in b1[3:0]; consumed by pvm_csr_regfile via
+          // use_imm path. rs1 not used for imm forms.
+          dec_has_rd  = 1'b1;
+          dec_has_rs1 = 1'b0;
+          dec_imm = {52'b0, b3[3:0], b2};
+        end
+        8'd237: begin  // mret
+          dec_op         = PVM_OP_MRET;
+          dec_is_bb_term = 1'b1;  // changes PC + privilege
+        end
+        8'd238: begin  // sret
+          dec_op         = PVM_OP_SRET;
+          dec_is_bb_term = 1'b1;
+        end
+        8'd239: begin  // wfi
+          dec_op         = PVM_OP_WFI;
+          // wfi may suspend execution; not a BB terminator in PVM model
+          // (continues with next instruction once unparked).
+        end
+        8'd240: begin  // sfence.vma rs1, rs2
+          dec_op       = PVM_OP_SFENCE_VMA;
+          dec_rs1      = b1[7:4];
+          dec_rs2      = b1[3:0];
+          dec_has_rs1  = 1'b1;
+          dec_has_rs2  = 1'b1;
+        end
+
+        // -----------------------------------------------------------------
         // Default: any remaining unmapped opcode is illegal
         // -----------------------------------------------------------------
         default: begin
@@ -809,6 +890,18 @@ module pvm_decoder
         end
 
       endcase  // unique casez (opcode)
+
+      // -------------------------------------------------------------------
+      // Phase 5 sub-phase 2.1: U/S-mode priv-opcode illegality guard
+      // -------------------------------------------------------------------
+      // Per ADR-1 principle 1: all 10 priv opcodes (231-240) require
+      // M-mode (mode_i == 2'b11). U-mode and S-mode see them as illegal.
+      // Phase 5 has no functional S-mode code (only used as trap target),
+      // so M-mode-only is the simplest gate. Phase 6 may relax sret for
+      // S-mode if Linux kernel needs it directly.
+      if (opcode >= 8'd231 && opcode <= 8'd240 && mode_i != 2'b11) begin
+        dec_illegal_op = 1'b1;
+      end
     end  // valid opcode check
   end  // always_comb decode_main
 

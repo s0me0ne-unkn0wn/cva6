@@ -320,7 +320,26 @@ package polkavm_pkg;
     PVM_OP_MAXIMUM                                = 8'd227,
     PVM_OP_MAXIMUM_UNSIGNED                       = 8'd228,
     PVM_OP_MINIMUM                                = 8'd229,
-    PVM_OP_MINIMUM_UNSIGNED                       = 8'd230
+    PVM_OP_MINIMUM_UNSIGNED                       = 8'd230,
+    // -----------------------------------------------------------------------
+    // Phase 5 sub-phase 2.1: M-mode privileged opcodes (ADR-1 + ADR-1.1).
+    // -----------------------------------------------------------------------
+    // Emitted by `polkatool link -i jam_v1 --privileged` (ISA byte 0x05).
+    // Decoded only when current privilege level is M (or S for sret); in
+    // U-mode the pvm_decoder mode_i guard raises illegal-instruction.
+    // csr_addr is packed into imm[11:0] per ADR-1.1 (sub-phase 0.2 contract).
+    // Bridge map (pvm_op_to_fu_t_op): all route to PVM_FU_CSR; the fu_op
+    // ordinal selects whether it is MRET/SRET/WFI/SFENCE/CSR_W/CSR_S/CSR_C.
+    PVM_OP_CSR_RW                                 = 8'd231,  // csrrw  rd, csr, rs1
+    PVM_OP_CSR_RS                                 = 8'd232,  // csrrs  rd, csr, rs1
+    PVM_OP_CSR_RC                                 = 8'd233,  // csrrc  rd, csr, rs1
+    PVM_OP_CSR_RWI                                = 8'd234,  // csrrwi rd, csr, zimm
+    PVM_OP_CSR_RSI                                = 8'd235,  // csrrsi rd, csr, zimm
+    PVM_OP_CSR_RCI                                = 8'd236,  // csrrci rd, csr, zimm
+    PVM_OP_MRET                                   = 8'd237,
+    PVM_OP_SRET                                   = 8'd238,
+    PVM_OP_WFI                                    = 8'd239,
+    PVM_OP_SFENCE_VMA                             = 8'd240
   } pvm_op_t;
 
   // ---------------------------------------------------------------------------
@@ -629,6 +648,17 @@ package polkavm_pkg;
   localparam logic [7:0] PVM_OP_MULH_FU   = 8'd88;  // ariane_pkg::MULH
   localparam logic [7:0] PVM_OP_MULHU_FU  = 8'd89;  // ariane_pkg::MULHU
   localparam logic [7:0] PVM_OP_MULHSU_FU = 8'd90;  // ariane_pkg::MULHSU
+
+  // Phase 5 sub-phase 2.1: M-mode privileged fu_op ordinals (verified vs
+  // ariane_pkg fu_op enum: ADD=0, ECALL=26, LD=37 ground-truth references).
+  localparam logic [7:0] PVM_OP_MRET_FU       = 8'd23;  // ariane_pkg::MRET
+  localparam logic [7:0] PVM_OP_SRET_FU       = 8'd24;  // ariane_pkg::SRET
+  localparam logic [7:0] PVM_OP_WFI_FU        = 8'd27;  // ariane_pkg::WFI
+  localparam logic [7:0] PVM_OP_SFENCE_VMA_FU = 8'd30;  // ariane_pkg::SFENCE_VMA
+  localparam logic [7:0] PVM_OP_CSR_WRITE_FU  = 8'd33;  // ariane_pkg::CSR_WRITE
+  localparam logic [7:0] PVM_OP_CSR_READ_FU   = 8'd34;  // ariane_pkg::CSR_READ
+  localparam logic [7:0] PVM_OP_CSR_SET_FU    = 8'd35;  // ariane_pkg::CSR_SET
+  localparam logic [7:0] PVM_OP_CSR_CLEAR_FU  = 8'd36;  // ariane_pkg::CSR_CLEAR
   localparam logic [7:0] PVM_OP_MULW_FU   = 8'd91;  // ariane_pkg::MULW
   localparam logic [7:0] PVM_OP_DIV_FU    = 8'd92;  // ariane_pkg::DIV
   localparam logic [7:0] PVM_OP_DIVU_FU   = 8'd93;  // ariane_pkg::DIVU
@@ -1151,6 +1181,49 @@ package polkavm_pkg;
       PVM_OP_MINIMUM_UNSIGNED: begin
         r.fu = PVM_FU_ALU; r.op = PVM_OP_ADD_FU;
         r.pvm_alu_op = PVM_ALU_MIN_U; r.is_pvm_op = 1'b1;
+      end
+
+      // -----------------------------------------------------------------------
+      // Phase 5 sub-phase 2.1: M-mode privileged opcodes (ADR-1)
+      // -----------------------------------------------------------------------
+      // All route to PVM_FU_CSR. The fu_op ordinal selects the operation
+      // (CSR read/write/set/clear, MRET, SRET, WFI, SFENCE_VMA). Mode
+      // enforcement (U-mode illegal-instruction for these) lives in
+      // pvm_decoder.sv via the mode_i input — sub-phase 2.1 step 5.
+      // Immediate-form CSRs (csrr*i) set use_imm=1 to carry zimm via the
+      // immediate path; csr_addr packing per ADR-1.1 imm[11:0].
+      PVM_OP_CSR_RW: begin
+        r.fu = PVM_FU_CSR; r.op = PVM_OP_CSR_WRITE_FU; r.is_pvm_op = 1'b1;
+      end
+      PVM_OP_CSR_RS: begin
+        r.fu = PVM_FU_CSR; r.op = PVM_OP_CSR_SET_FU;   r.is_pvm_op = 1'b1;
+      end
+      PVM_OP_CSR_RC: begin
+        r.fu = PVM_FU_CSR; r.op = PVM_OP_CSR_CLEAR_FU; r.is_pvm_op = 1'b1;
+      end
+      PVM_OP_CSR_RWI: begin
+        r.fu = PVM_FU_CSR; r.op = PVM_OP_CSR_WRITE_FU;
+        r.is_pvm_op = 1'b1; r.use_imm = 1'b1;
+      end
+      PVM_OP_CSR_RSI: begin
+        r.fu = PVM_FU_CSR; r.op = PVM_OP_CSR_SET_FU;
+        r.is_pvm_op = 1'b1; r.use_imm = 1'b1;
+      end
+      PVM_OP_CSR_RCI: begin
+        r.fu = PVM_FU_CSR; r.op = PVM_OP_CSR_CLEAR_FU;
+        r.is_pvm_op = 1'b1; r.use_imm = 1'b1;
+      end
+      PVM_OP_MRET: begin
+        r.fu = PVM_FU_CSR; r.op = PVM_OP_MRET_FU;      r.is_pvm_op = 1'b1;
+      end
+      PVM_OP_SRET: begin
+        r.fu = PVM_FU_CSR; r.op = PVM_OP_SRET_FU;      r.is_pvm_op = 1'b1;
+      end
+      PVM_OP_WFI: begin
+        r.fu = PVM_FU_CSR; r.op = PVM_OP_WFI_FU;       r.is_pvm_op = 1'b1;
+      end
+      PVM_OP_SFENCE_VMA: begin
+        r.fu = PVM_FU_CSR; r.op = PVM_OP_SFENCE_VMA_FU; r.is_pvm_op = 1'b1;
       end
 
       // -----------------------------------------------------------------------
