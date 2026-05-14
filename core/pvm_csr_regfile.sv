@@ -269,6 +269,41 @@ module pvm_csr_regfile
   //   pgas  reads-as-zero per ADR-2 (no register storage needed).
   logic [63:0]              pcycle_q;
 
+  // ---------------------------------------------------------------------------
+  // Phase 5 sub-phase 2.0: M-mode CSR storage registers (ADR-5 restoration)
+  // ---------------------------------------------------------------------------
+  // Restored from cva6-to-pvm:caf90f87:core/csr_regfile.sv per ADR-5.
+  // M-CSRs live at standard RISC-V addresses 0x300-0x344, 0x3A0-0x3B7, 0xF14,
+  // 0xB00, 0xB02. PVM CSRs are at 0xBC0-0xBC5 (relocated in sub-phase 0.2
+  // per ADR-12 iter 3); no collision.
+  //
+  // mcycle (0xB00) and minstret (0xB02) are READ-ONLY aliased to pcycle_q
+  // per B5 — writes raise illegal instruction. PMP entries (0x3A0-0x3B7) are
+  // stubbed (read-as-zero, writes silently ignored) so OpenSBI's cold-boot
+  // PMP configuration doesn't trap; full PMP wiring is deferred to Phase 6+.
+  //
+  // Sub-phase 2.0 (this commit) is the DATA PLANE ONLY: csrw stores, csrr
+  // retrieves. Sub-phase 2.2 wires trap delivery (exception → mepc/mcause/
+  // mstatus.MPP). Sub-phase 2.3 wires real mret/sret semantics (priv_lvl_d
+  // updates from mstatus.MPP, MIE↔MPIE swap). For 2.0 these registers exist
+  // but the trap/eret side effects on them are not yet implemented — the
+  // existing PVM-style pstatus/pepc/pcause trap path (lines 491-542) stays
+  // active for Phase 4.5 backward compatibility.
+  logic [CVA6Cfg.XLEN-1:0] mstatus_q,       mstatus_d;
+  logic [CVA6Cfg.XLEN-1:0] mtvec_q,         mtvec_d;
+  logic [CVA6Cfg.XLEN-1:0] medeleg_q,       medeleg_d;
+  logic [CVA6Cfg.XLEN-1:0] mideleg_q,       mideleg_d;
+  logic [CVA6Cfg.XLEN-1:0] mip_q,           mip_d;
+  logic [CVA6Cfg.XLEN-1:0] mie_q,           mie_d;
+  logic [CVA6Cfg.XLEN-1:0] mcounteren_q,    mcounteren_d;
+  logic [CVA6Cfg.XLEN-1:0] mscratch_q,      mscratch_d;
+  logic [CVA6Cfg.VLEN-1:0] mepc_q,          mepc_d;
+  logic [CVA6Cfg.XLEN-1:0] mcause_q,        mcause_d;
+  logic [CVA6Cfg.XLEN-1:0] mtval_q,         mtval_d;
+  // mcountinhibit: 3 bits for {minstret, mtime, mcycle}. No event counters
+  // in Phase 5 (PerfCounterEn=1 but the hpmcounters aren't restored here).
+  logic [2:0]              mcountinhibit_q, mcountinhibit_d;
+
   // Computed handler target: pevent_table_base + 8 * imm.
   // MVP: used directly as redirect target (no memory indirection; see note).
   logic [CVA6Cfg.VLEN-1:0] handler_addr;
@@ -457,16 +492,38 @@ module pvm_csr_regfile
     perf_addr_o           = csr_addr_i;
 
     if (csr_read) begin
-      unique case (pvm_csr_addr_t'(csr_addr_i))
-        PVM_CSR_PSTATUS:           csr_rdata = pstatus_q;
-        PVM_CSR_PEVENT_TABLE_BASE: csr_rdata = pevent_table_base_q;
-        PVM_CSR_PCYCLE: begin
-          // 64-bit counter; return full 64-bit value on RV64.
-          csr_rdata = CVA6Cfg.XLEN'(pcycle_q);
-        end
-        PVM_CSR_PEPC:              csr_rdata = CVA6Cfg.XLEN'(pepc_q);
-        PVM_CSR_PCAUSE:            csr_rdata = pcause_q;
-        PVM_CSR_PGAS:              csr_rdata = '0;  // reads-as-zero per ADR-2
+      unique case (csr_addr_i)
+        // -------- PVM CSRs (sub-phase 0.2 / ADR-12 iter 3: 0xBC0-0xBC5) --------
+        12'(PVM_CSR_PSTATUS):           csr_rdata = pstatus_q;
+        12'(PVM_CSR_PEPC):              csr_rdata = CVA6Cfg.XLEN'(pepc_q);
+        12'(PVM_CSR_PCAUSE):            csr_rdata = pcause_q;
+        12'(PVM_CSR_PGAS):              csr_rdata = '0;  // reads-as-zero per ADR-2
+        12'(PVM_CSR_PEVENT_TABLE_BASE): csr_rdata = pevent_table_base_q;
+        12'(PVM_CSR_PCYCLE):            csr_rdata = CVA6Cfg.XLEN'(pcycle_q);
+
+        // -------- Phase 5 sub-phase 2.0: M-mode CSRs (ADR-5) --------
+        riscv::CSR_MSTATUS:        csr_rdata = mstatus_q;
+        riscv::CSR_MEDELEG:        csr_rdata = medeleg_q;
+        riscv::CSR_MIDELEG:        csr_rdata = mideleg_q;
+        riscv::CSR_MIE:            csr_rdata = mie_q;
+        riscv::CSR_MTVEC:          csr_rdata = mtvec_q;
+        riscv::CSR_MCOUNTEREN:     csr_rdata = mcounteren_q;
+        riscv::CSR_MSCRATCH:       csr_rdata = mscratch_q;
+        riscv::CSR_MEPC:           csr_rdata = CVA6Cfg.XLEN'(mepc_q);
+        riscv::CSR_MCAUSE:         csr_rdata = mcause_q;
+        riscv::CSR_MTVAL:          csr_rdata = mtval_q;
+        riscv::CSR_MIP:            csr_rdata = mip_q;
+        riscv::CSR_MCOUNTINHIBIT:  csr_rdata = {{CVA6Cfg.XLEN-3{1'b0}}, mcountinhibit_q};
+        riscv::CSR_MHARTID:        csr_rdata = hart_id_i;  // single-hart core
+        // mcycle / minstret aliased to pcycle_q (B5) — read-only
+        riscv::CSR_MCYCLE,
+        riscv::CSR_MINSTRET:       csr_rdata = CVA6Cfg.XLEN'(pcycle_q);
+
+        // -------- PMP stub: read-as-zero (full PMP deferred to Phase 6+) --------
+        12'h3A0, 12'h3A1, 12'h3A2, 12'h3A3,                       // pmpcfg0-3
+        12'h3B0, 12'h3B1, 12'h3B2, 12'h3B3,                       // pmpaddr0-3
+        12'h3B4, 12'h3B5, 12'h3B6, 12'h3B7: csr_rdata = '0;       // pmpaddr4-7
+
         default:                   read_access_exception = 1'b1;
       endcase
     end
@@ -486,6 +543,19 @@ module pvm_csr_regfile
     priv_lvl_d               = priv_lvl_q;
     flush_o                  = 1'b0;
     eret_o                   = 1'b0;
+    // Phase 5 sub-phase 2.0: M-CSR _d defaults (hold current value)
+    mstatus_d                = mstatus_q;
+    mtvec_d                  = mtvec_q;
+    medeleg_d                = medeleg_q;
+    mideleg_d                = mideleg_q;
+    mip_d                    = mip_q;
+    mie_d                    = mie_q;
+    mcounteren_d             = mcounteren_q;
+    mscratch_d               = mscratch_q;
+    mepc_d                   = mepc_q;
+    mcause_d                 = mcause_q;
+    mtval_d                  = mtval_q;
+    mcountinhibit_d          = mcountinhibit_q;
 
     // ------------------------------------------------------------------
     // ecalli DRAINED: snapshot pepc and pstatus when entering S-mode handler
@@ -545,8 +615,9 @@ module pvm_csr_regfile
     // Explicit CSR writes
     // ------------------------------------------------------------------
     if (csr_we) begin
-      unique case (pvm_csr_addr_t'(csr_addr_i))
-        PVM_CSR_PSTATUS: begin
+      unique case (csr_addr_i)
+        // -------- PVM CSRs --------
+        12'(PVM_CSR_PSTATUS): begin
           // Only writable fields: MIE[3], MPIE[7], MPP[12:11].
           // WPRI bits are silently ignored.
           pstatus_d[3]     = csr_wdata[3];
@@ -554,24 +625,40 @@ module pvm_csr_regfile
           pstatus_d[12:11] = csr_wdata[12:11];
           flush_o          = 1'b1;
         end
-        PVM_CSR_PEVENT_TABLE_BASE: begin
+        12'(PVM_CSR_PEVENT_TABLE_BASE): begin
           pevent_table_base_d = csr_wdata;
           flush_o             = 1'b1;
         end
-        PVM_CSR_PCYCLE: begin
-          // pcycle is read-only in the MVP (free-running).
-          update_access_exception = 1'b1;
-        end
-        PVM_CSR_PEPC: begin
-          pepc_d = csr_wdata[CVA6Cfg.VLEN-1:0];
-        end
-        PVM_CSR_PCAUSE: begin
-          pcause_d = csr_wdata;
-        end
-        PVM_CSR_PGAS: begin
-          // pgas is read-only (reads-as-zero per ADR-2).
-          update_access_exception = 1'b1;
-        end
+        12'(PVM_CSR_PCYCLE):            update_access_exception = 1'b1;  // RO
+        12'(PVM_CSR_PEPC):              pepc_d   = csr_wdata[CVA6Cfg.VLEN-1:0];
+        12'(PVM_CSR_PCAUSE):            pcause_d = csr_wdata;
+        12'(PVM_CSR_PGAS):              update_access_exception = 1'b1;  // RO
+
+        // -------- Phase 5 sub-phase 2.0: M-mode CSR writes (ADR-5) --------
+        riscv::CSR_MSTATUS:        mstatus_d       = csr_wdata;
+        riscv::CSR_MEDELEG:        medeleg_d       = csr_wdata;
+        riscv::CSR_MIDELEG:        mideleg_d       = csr_wdata;
+        riscv::CSR_MIE:            mie_d           = csr_wdata;
+        riscv::CSR_MTVEC:          mtvec_d         = csr_wdata;
+        riscv::CSR_MCOUNTEREN:     mcounteren_d    = csr_wdata;
+        riscv::CSR_MSCRATCH:       mscratch_d      = csr_wdata;
+        riscv::CSR_MEPC:           mepc_d          = csr_wdata[CVA6Cfg.VLEN-1:0];
+        riscv::CSR_MCAUSE:         mcause_d        = csr_wdata;
+        riscv::CSR_MTVAL:          mtval_d         = csr_wdata;
+        riscv::CSR_MIP:            mip_d           = csr_wdata;
+        riscv::CSR_MCOUNTINHIBIT:  mcountinhibit_d = csr_wdata[2:0];
+
+        // mhartid is read-only; trap on write
+        riscv::CSR_MHARTID:        update_access_exception = 1'b1;
+        // mcycle/minstret aliased to pcycle_q — read-only per B5
+        riscv::CSR_MCYCLE,
+        riscv::CSR_MINSTRET:       update_access_exception = 1'b1;
+
+        // -------- PMP stub: writes silently ignored (no exception) --------
+        12'h3A0, 12'h3A1, 12'h3A2, 12'h3A3,                                   // pmpcfg0-3
+        12'h3B0, 12'h3B1, 12'h3B2, 12'h3B3,                                   // pmpaddr0-3
+        12'h3B4, 12'h3B5, 12'h3B6, 12'h3B7: /* write ignored, no trap */ ;    // pmpaddr4-7
+
         default: begin
           update_access_exception = 1'b1;
         end
@@ -613,11 +700,36 @@ module pvm_csr_regfile
       pepc_q              <= '0;
       pstatus_q           <= '0;
       pevent_table_base_q <= CVA6Cfg.XLEN'(boot_addr_i);
+      // Phase 5 sub-phase 2.0: M-CSR reset values
+      mstatus_q           <= '0;
+      mtvec_q             <= '0;
+      medeleg_q           <= '0;
+      mideleg_q           <= '0;
+      mip_q               <= '0;
+      mie_q               <= '0;
+      mcounteren_q        <= '0;
+      mscratch_q          <= '0;
+      mepc_q              <= '0;
+      mcause_q            <= '0;
+      mtval_q             <= '0;
+      mcountinhibit_q     <= '0;
     end else begin
       pcause_q            <= pcause_d;
       pepc_q              <= pepc_d;
       pstatus_q           <= pstatus_d;
       pevent_table_base_q <= pevent_table_base_d;
+      mstatus_q           <= mstatus_d;
+      mtvec_q             <= mtvec_d;
+      medeleg_q           <= medeleg_d;
+      mideleg_q           <= mideleg_d;
+      mip_q               <= mip_d;
+      mie_q               <= mie_d;
+      mcounteren_q        <= mcounteren_d;
+      mscratch_q          <= mscratch_d;
+      mepc_q              <= mepc_d;
+      mcause_q            <= mcause_d;
+      mtval_q             <= mtval_d;
+      mcountinhibit_q     <= mcountinhibit_d;
     end
   end
 
