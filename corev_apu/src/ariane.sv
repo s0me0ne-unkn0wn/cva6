@@ -75,7 +75,12 @@ module ariane import ariane_pkg::*; #(
   // Combinational selector for the wrapper's bootrom/DRAM-AXI mux
   // (sub-phase 1.2 will consume this in ariane_xilinx.sv).
   //   2'b00 BOOTROM, 2'b01 DRAM_M, 2'b10 DRAM_S
-  output logic [1:0]                   pvm_fetch_source_o
+  output logic [1:0]                   pvm_fetch_source_o,
+  // Phase 5 sub-phase 1.2b: dedicated AXI master pass-through for pvm_frontend
+  // DRAM fetch. Connects to slave[2] of the xbar at ariane_xilinx top.
+  // Tied off inside cva6 in 1.2b; activated with FSM in sub-phase 1.3 GATING.
+  output noc_req_t                     noc_pvm_fetch_req_o,
+  input  noc_resp_t                    noc_pvm_fetch_resp_i
 );
 
   cvxif_req_t  cvxif_req;
@@ -123,7 +128,10 @@ module ariane import ariane_pkg::*; #(
     .pvm_code_len_m_i     ( pvm_code_len_m_i          ),
     .pvm_code_base_s_i    ( pvm_code_base_s_i         ),
     .pvm_code_len_s_i     ( pvm_code_len_s_i          ),
-    .pvm_fetch_source_o   ( pvm_fetch_source_o        )
+    .pvm_fetch_source_o   ( pvm_fetch_source_o        ),
+    // Phase 5 sub-phase 1.2b: PVM-frontend DRAM fetch AXI master.
+    .noc_pvm_fetch_req_o  ( noc_pvm_fetch_req_o       ),
+    .noc_pvm_fetch_resp_i ( noc_pvm_fetch_resp_i      )
   );
 
   // CVXIF coprocessor removed (CvxifEn=0)

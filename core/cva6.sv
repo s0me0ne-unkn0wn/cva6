@@ -359,7 +359,16 @@ module cva6
     input  logic [31:0] pvm_code_len_s_i,
     // Combinational fetch-source selector for the wrapper's bootrom/DRAM-AXI
     // mux (sub-phase 1.2 will consume in ariane_xilinx.sv).
-    output logic [1:0]  pvm_fetch_source_o
+    output logic [1:0]  pvm_fetch_source_o,
+    // Phase 5 sub-phase 1.2b: dedicated AXI master for pvm_frontend DRAM
+    // fetch. Connects to slave[2] of the xbar via ariane.sv pass-through.
+    // In 1.2b this is tied off internally (no traffic emitted yet) so that
+    // slave[2] sees the same no-traffic state as in 1.2a. Sub-phase 1.3
+    // GATING adds the AXI master FSM (issue AR on fetch_source != BOOTROM,
+    // collect R, present data to pvm_frontend, stall pipeline on wait) and
+    // the Verilator integration TB that validates the round-trip.
+    output noc_req_t    noc_pvm_fetch_req_o,
+    input  noc_resp_t   noc_pvm_fetch_resp_i
 );
 
   localparam type interrupts_t = struct packed {
@@ -872,6 +881,12 @@ module cva6
 
   // skip field in struct is 4 bits; skip_o from frontend is 5 bits (0..15 fits in 4 bits).
   assign pvm_fc_if_id[0].skip = pvm_fe_skip_w[3:0];
+
+  // Phase 5 sub-phase 1.2b: noc_pvm_fetch_req_o tied off — no DRAM AXI traffic
+  // from pvm_frontend yet. Sub-phase 1.3 GATING will replace this with the
+  // actual AXI master FSM (driving AR when pvm_fetch_source_o != BOOTROM,
+  // collecting R beats, presenting data via internal mux into pvm_fe_code_data_w).
+  assign noc_pvm_fetch_req_o = '0;
 
   // If NrIssuePorts > 1, drive higher ports to inert defaults.
   if (CVA6Cfg.NrIssuePorts > 1) begin : g_pvm_fc_extra

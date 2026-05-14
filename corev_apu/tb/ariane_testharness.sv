@@ -109,41 +109,9 @@ module ariane_testharness #(
     .AXI_USER_WIDTH ( AXI_USER_WIDTH          )
   ) slave[ariane_soc::NrSlaves-1:0]();
 
-  // Phase 5 sub-phase 1.2a: slave[2] (pvm_frontend DRAM fetch master) tied
-  // off to no-traffic state. Same pattern as ariane_xilinx.sv. Sub-phase
-  // 1.2b will replace this with real AXI master signals from cva6.
-  assign slave[2].aw_id     = '0;
-  assign slave[2].aw_addr   = '0;
-  assign slave[2].aw_len    = '0;
-  assign slave[2].aw_size   = '0;
-  assign slave[2].aw_burst  = '0;
-  assign slave[2].aw_lock   = 1'b0;
-  assign slave[2].aw_cache  = '0;
-  assign slave[2].aw_prot   = '0;
-  assign slave[2].aw_qos    = '0;
-  assign slave[2].aw_region = '0;
-  assign slave[2].aw_atop   = '0;
-  assign slave[2].aw_user   = '0;
-  assign slave[2].aw_valid  = 1'b0;
-  assign slave[2].w_data    = '0;
-  assign slave[2].w_strb    = '0;
-  assign slave[2].w_last    = 1'b0;
-  assign slave[2].w_user    = '0;
-  assign slave[2].w_valid   = 1'b0;
-  assign slave[2].b_ready   = 1'b1;
-  assign slave[2].ar_id     = '0;
-  assign slave[2].ar_addr   = '0;
-  assign slave[2].ar_len    = '0;
-  assign slave[2].ar_size   = '0;
-  assign slave[2].ar_burst  = '0;
-  assign slave[2].ar_lock   = 1'b0;
-  assign slave[2].ar_cache  = '0;
-  assign slave[2].ar_prot   = '0;
-  assign slave[2].ar_qos    = '0;
-  assign slave[2].ar_region = '0;
-  assign slave[2].ar_user   = '0;
-  assign slave[2].ar_valid  = 1'b0;
-  assign slave[2].r_ready   = 1'b1;
+  // Phase 5 sub-phase 1.2b: slave[2] is connected via AXI_ASSIGN below
+  // (where the i_ariane noc_pvm_fetch_req_o is hooked up). 1.2a's explicit
+  // tie-off block was deleted — cva6 ties the req struct to '0 internally.
 
   AXI_BUS #(
     .AXI_ADDR_WIDTH ( AXI_ADDRESS_WIDTH            ),
@@ -661,6 +629,11 @@ module ariane_testharness #(
   // ---------------
   ariane_axi::req_t    axi_ariane_req;
   ariane_axi::resp_t   axi_ariane_resp;
+
+  // Phase 5 sub-phase 1.2b: PVM-frontend DRAM-fetch AXI master wires.
+  // Driven from ariane.sv noc_pvm_fetch_req_o / .noc_pvm_fetch_resp_i.
+  ariane_axi::req_t    axi_pvm_fetch_req;
+  ariane_axi::resp_t   axi_pvm_fetch_resp;
   rvfi_probes_t rvfi_probes;
   rvfi_csr_t rvfi_csr;
   rvfi_instr_t [CVA6Cfg.NrCommitPorts-1:0]  rvfi_instr;
@@ -690,11 +663,28 @@ module ariane_testharness #(
     .debug_req_i          ( debug_req_core      ),
 `endif
     .noc_req_o            ( axi_ariane_req      ),
-    .noc_resp_i           ( axi_ariane_resp     )
+    .noc_resp_i           ( axi_ariane_resp     ),
+    // Phase 5 sub-phase 1.1 + 1.2b: PVM-frontend DRAM-fetch wiring.
+    // Testharness has no pvm_config_regs equivalent, so M/S section bounds
+    // are tied to 0 (frontend bounds check fails → fetch_source stays
+    // BOOTROM). pvm_fetch_source_o is captured for observability.
+    .pvm_code_base_m_i    ( 32'h0               ),
+    .pvm_code_len_m_i     ( 32'h0               ),
+    .pvm_code_base_s_i    ( 32'h0               ),
+    .pvm_code_len_s_i     ( 32'h0               ),
+    .pvm_fetch_source_o   ( /* unused */        ),
+    .noc_pvm_fetch_req_o  ( axi_pvm_fetch_req   ),
+    .noc_pvm_fetch_resp_i ( axi_pvm_fetch_resp  )
   );
 
   `AXI_ASSIGN_FROM_REQ(slave[0], axi_ariane_req)
   `AXI_ASSIGN_TO_RESP(axi_ariane_resp, slave[0])
+
+  // Phase 5 sub-phase 1.2b: connect ariane DRAM-fetch AXI master to slave[2].
+  // (Replaces 1.2a tie-off below.) Functionally identical until 1.3 GATING
+  // adds the AXI master FSM inside cva6 that drives the req signals.
+  `AXI_ASSIGN_FROM_REQ(slave[2], axi_pvm_fetch_req)
+  `AXI_ASSIGN_TO_RESP(axi_pvm_fetch_resp, slave[2])
 
   // -------------
   // Simulation Helper Functions

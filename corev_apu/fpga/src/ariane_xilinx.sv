@@ -259,46 +259,20 @@ AXI_BUS #(
 ) slave[NBSlave-1:0]();
 
 // ---------------------------------------------------------------------------
-// Phase 5 sub-phase 1.2a: slave[2] tie-off (no traffic).
+// Phase 5 sub-phase 1.2b: slave[2] connected to pvm_frontend DRAM fetch
+// AXI master (replaces 1.2a tie-off).
 // ---------------------------------------------------------------------------
-// slave[2] is reserved for the pvm_frontend DRAM fetch master. In 1.2a it is
-// tied off to a no-traffic state — aw/w/ar_valid all 0, b/r_ready all 1
-// (drain any spurious responses). Sub-phase 1.2b will replace these
-// assignments with the real AXI master signals driven from new cva6 ports.
-// The xbar still sees a valid AXI slave port at index 2 with consistent ID
-// width (AxiIdWidthMaster=4), so synthesis and elaboration pass cleanly.
-assign slave[2].aw_id     = '0;
-assign slave[2].aw_addr   = '0;
-assign slave[2].aw_len    = '0;
-assign slave[2].aw_size   = '0;
-assign slave[2].aw_burst  = '0;
-assign slave[2].aw_lock   = 1'b0;
-assign slave[2].aw_cache  = '0;
-assign slave[2].aw_prot   = '0;
-assign slave[2].aw_qos    = '0;
-assign slave[2].aw_region = '0;
-assign slave[2].aw_atop   = '0;
-assign slave[2].aw_user   = '0;
-assign slave[2].aw_valid  = 1'b0;
-assign slave[2].w_data    = '0;
-assign slave[2].w_strb    = '0;
-assign slave[2].w_last    = 1'b0;
-assign slave[2].w_user    = '0;
-assign slave[2].w_valid   = 1'b0;
-assign slave[2].b_ready   = 1'b1;
-assign slave[2].ar_id     = '0;
-assign slave[2].ar_addr   = '0;
-assign slave[2].ar_len    = '0;
-assign slave[2].ar_size   = '0;
-assign slave[2].ar_burst  = '0;
-assign slave[2].ar_lock   = 1'b0;
-assign slave[2].ar_cache  = '0;
-assign slave[2].ar_prot   = '0;
-assign slave[2].ar_qos    = '0;
-assign slave[2].ar_region = '0;
-assign slave[2].ar_user   = '0;
-assign slave[2].ar_valid  = 1'b0;
-assign slave[2].r_ready   = 1'b1;
+// The req/resp wires are driven by i_ariane.noc_pvm_fetch_req_o /
+// .noc_pvm_fetch_resp_i (via cva6.sv pass-through). In 1.2b cva6 ties the
+// req struct to '0 — so functionally identical to 1.2a's tie-off (no AW/AR
+// asserted). Sub-phase 1.3 GATING adds the AXI master FSM inside cva6.sv
+// that drives the req signals when pvm_fetch_source_o != BOOTROM, and the
+// Verilator integration TB that validates end-to-end DRAM fetch.
+ariane_axi::req_t    axi_pvm_fetch_req;
+ariane_axi::resp_t   axi_pvm_fetch_resp;
+
+`AXI_ASSIGN_FROM_REQ(slave[2], axi_pvm_fetch_req)
+`AXI_ASSIGN_TO_RESP(axi_pvm_fetch_resp, slave[2])
 
 AXI_BUS #(
     .AXI_ADDR_WIDTH ( AxiAddrWidth     ),
@@ -851,11 +825,14 @@ ariane #(
     .noc_req_o    ( axi_ariane_req      ),
     .noc_resp_i   ( axi_ariane_resp     ),
     // Phase 5 sub-phase 1.1: DRAM section bounds from pvm_config_regs.
-    .pvm_code_base_m_i  ( pvm_code_base_m   ),
-    .pvm_code_len_m_i   ( pvm_code_len_m    ),
-    .pvm_code_base_s_i  ( pvm_code_base_s   ),
-    .pvm_code_len_s_i   ( pvm_code_len_s    ),
-    .pvm_fetch_source_o ( pvm_fetch_source  )  // consumed by sub-phase 1.2
+    .pvm_code_base_m_i   ( pvm_code_base_m     ),
+    .pvm_code_len_m_i    ( pvm_code_len_m      ),
+    .pvm_code_base_s_i   ( pvm_code_base_s     ),
+    .pvm_code_len_s_i    ( pvm_code_len_s      ),
+    .pvm_fetch_source_o  ( pvm_fetch_source    ),
+    // Phase 5 sub-phase 1.2b: AXI master to slave[2] (DRAM fetch).
+    .noc_pvm_fetch_req_o ( axi_pvm_fetch_req   ),
+    .noc_pvm_fetch_resp_i( axi_pvm_fetch_resp  )
 );
 
 `AXI_ASSIGN_FROM_REQ(slave[0], axi_ariane_req)
