@@ -586,6 +586,7 @@ module pvm_csr_regfile
     // Trap: take exception from commit stage
     // ------------------------------------------------------------------
     if (ex_i.valid) begin
+      // ---- PVM-style trap delivery (Phase 4.5 backward compat) ----
       // Save PC of faulting instruction into pepc.
       pepc_d   = ex_i.tval[CVA6Cfg.VLEN-1:0];  // tval holds faulting VA/PC
       // Save cause.
@@ -598,6 +599,32 @@ module pvm_csr_regfile
       // Switch to M-mode on trap (PVM S-mode is represented as M-mode
       // in the underlying CVA6 pipeline; sub-phase 9 refines this).
       priv_lvl_d = riscv::PRIV_LVL_M;
+
+      // -------------------------------------------------------------
+      // Phase 5 sub-phase 2.2: M-mode RISC-V trap delivery (ADR-4)
+      // -------------------------------------------------------------
+      // When USE_PVM_PRIV=1 and the exception fires in non-M-mode, also
+      // mirror state into the M-CSRs so OpenSBI's RISC-V trap handler
+      // can read mepc/mcause and resume via mret.  Phase 5 scope only
+      // wires mcause=2 (illegal instruction) per ADR-4 iter 3; other
+      // causes (panic/fault/oog) flow through here too but their
+      // semantic interpretation by OpenSBI is undefined in Phase 5 —
+      // OpenSBI's _trap_vector inspects mcause directly and prints
+      // whatever value lands there.  trap_vector_base_o mux (below)
+      // routes the frontend redirect to mtvec_q when USE_PVM_PRIV=1.
+      // The existing PVM trap path (above) keeps pstatus/pepc/pcause
+      // updated in parallel for Phase 4.5 backward compat — both
+      // touch separate CSRs, no field conflict.  priv_lvl_d already
+      // set to M by the PVM path.
+      if (cva6_config_pkg::USE_PVM_PRIV &&
+          priv_lvl_q != riscv::PRIV_LVL_M) begin
+        mepc_d           = ex_i.tval[CVA6Cfg.VLEN-1:0];
+        mcause_d         = ex_i.cause;
+        // mstatus side effects per RISC-V Privileged ISA:
+        mstatus_d[12:11] = priv_lvl_q;   // MPP  ← previous priv
+        mstatus_d[7]     = mstatus_q[3]; // MPIE ← previous MIE
+        mstatus_d[3]     = 1'b0;         // MIE  ← 0
+      end
     end
 
     // ------------------------------------------------------------------
@@ -737,10 +764,17 @@ module pvm_csr_regfile
   // Output assignments
   // ---------------------------------------------------------------------------
 
-  // Core outputs used by the pipeline
+  // Core outputs used by the pipeline.
+  // Phase 5 sub-phase 2.2: trap_vector_base_o muxes on USE_PVM_PRIV.
+  //   USE_PVM_PRIV=0 (Phase 4.5): PVM ecalli-style handler at pevent_table_base.
+  //   USE_PVM_PRIV=1 (Phase 5):    RISC-V trap vector at mtvec.
+  // epc_o still routes to pepc_q in 2.2 — sub-phase 2.3 mret/sret will mux
+  // it to mepc_q when USE_PVM_PRIV=1.
   assign priv_lvl_o         = priv_lvl_q;
   assign epc_o              = pepc_q;
-  assign trap_vector_base_o = pevent_table_base_q;
+  assign trap_vector_base_o = cva6_config_pkg::USE_PVM_PRIV
+                            ? mtvec_q[CVA6Cfg.VLEN-1:0]
+                            : pevent_table_base_q[CVA6Cfg.VLEN-1:0];
   assign halt_csr_o         = 1'b0;
 
   // Privilege / translation outputs — no MMU in PVM MVP
