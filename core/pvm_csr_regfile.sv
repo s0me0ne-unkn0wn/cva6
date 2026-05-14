@@ -636,6 +636,26 @@ module pvm_csr_regfile
       pstatus_d[3]   = pstatus_q[7];     // MIE  ← MPIE
       pstatus_d[7]   = 1'b1;             // MPIE ← 1
       priv_lvl_d     = riscv::priv_lvl_t'(pstatus_q[12:11]);
+
+      // -------------------------------------------------------------
+      // Phase 5 sub-phase 2.3: M-mode RISC-V mret semantics (ADR-4)
+      // -------------------------------------------------------------
+      // Standard RISC-V Privileged ISA Vol II §3.1.6.1:
+      //   - MIE  ← MPIE
+      //   - MPIE ← 1
+      //   - priv ← MPP
+      //   - MPP  ← U (or M if U not supported — we always have U)
+      //   - PC   ← mepc (via epc_o → frontend redirect, mux below)
+      // priv_lvl_d assignment here OVERRIDES the PVM-style write above
+      // because USE_PVM_PRIV=1 has the M-CSR file as the authoritative
+      // source. When USE_PVM_PRIV=0 (Phase 4.5), this block is dead-code
+      // eliminated by elaboration and the legacy PVM path stands.
+      if (cva6_config_pkg::USE_PVM_PRIV) begin
+        mstatus_d[3]     = mstatus_q[7];   // MIE  ← MPIE
+        mstatus_d[7]     = 1'b1;            // MPIE ← 1
+        mstatus_d[12:11] = riscv::PRIV_LVL_U;  // MPP ← U
+        priv_lvl_d       = riscv::priv_lvl_t'(mstatus_q[12:11]);
+      end
     end
 
     // ------------------------------------------------------------------
@@ -770,8 +790,13 @@ module pvm_csr_regfile
   //   USE_PVM_PRIV=1 (Phase 5):    RISC-V trap vector at mtvec.
   // epc_o still routes to pepc_q in 2.2 — sub-phase 2.3 mret/sret will mux
   // it to mepc_q when USE_PVM_PRIV=1.
+  // Phase 5 sub-phase 2.3: epc_o muxes on USE_PVM_PRIV symmetric with
+  // trap_vector_base_o (2.2). On mret, frontend redirects to mepc_q for
+  // Phase 5 (USE_PVM_PRIV=1) or pepc_q for Phase 4.5 (USE_PVM_PRIV=0).
   assign priv_lvl_o         = priv_lvl_q;
-  assign epc_o              = pepc_q;
+  assign epc_o              = cva6_config_pkg::USE_PVM_PRIV
+                            ? mepc_q
+                            : pepc_q;
   assign trap_vector_base_o = cva6_config_pkg::USE_PVM_PRIV
                             ? mtvec_q[CVA6Cfg.VLEN-1:0]
                             : pevent_table_base_q[CVA6Cfg.VLEN-1:0];
