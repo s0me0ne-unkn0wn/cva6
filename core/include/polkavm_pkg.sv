@@ -367,33 +367,75 @@ package polkavm_pkg;
   endfunction
 
   // ---------------------------------------------------------------------------
-  // pvm_csr_addr_t — PVM CSR address space
+  // pvm_csr_addr_t — PVM CSR address space (Phase 5 ADR-12 iter 3 relocation)
   // ---------------------------------------------------------------------------
-  // CSR address assignment rationale (ADR-5):
-  //   We mirror RISC-V mtvec/mcause/mepc/mstatus addresses so hardware
-  //   engineers familiar with CVA6 find the analogues intuitive.
-  //   The 0x300-range (M-mode) is repurposed for PVM supervisor (S-mode)
-  //   CSRs since the underlying CVA6 CSR file also lives in that range.
-  //   `pgas` reads as 0 in the MVP (gas deferred to Phase 5 per ADR-2).
-  //   `pcycle` substitutes for the `csrr cycle` in bootrom/src/main.c:15.
+  // CSR address assignment rationale (ADR-12, supersedes Phase 4 ADR-5):
+  //   The Phase 4 mirror-RISC-V layout (0x300/0x304/0x305/0x341/0x342/0x343)
+  //   is FORBIDDEN starting with Phase 5 because those addresses are reserved
+  //   for restored RISC-V M-mode CSRs:
+  //     mstatus=0x300, mie=0x304, mtvec=0x305, mepc=0x341, mcause=0x342,
+  //     mtval=0x343 (all 6 collide; see riscv_pkg.sv:448-489). The Phase 4
+  //     "repurpose the 0x300 range" rationale was correct under minimization
+  //     but breaks once M-mode is added back for OpenSBI in Phase 5.
   //
-  //   Address mapping:
-  //     0x300 → pstatus      (analogous to mstatus)
-  //     0x304 → pevent_table_base (analogous to mie / mtvec+4; holds
-  //                           pointer to ecalli handler table)
-  //     0x305 → pcycle       (analogous to mcycle; bootrom uses this)
-  //     0x341 → pepc         (analogous to mepc)
-  //     0x342 → pcause       (analogous to mcause)
-  //     0x343 → pgas         (MVP reads 0; analogous to mtval slot)
+  //   The 0x7C0-0x7FF "user/M-RW custom" range was REJECTED in iter 3 because
+  //   CVA6 already declares CSR_ICACHE=12'h7C0, CSR_DCACHE=12'h7C1, and
+  //   CSR_ACC_CONS=12'h7C2 (see riscv_pkg.sv:644-647) — the same silent-shadow
+  //   failure mode that ADR-12 is meant to eliminate.
+  //
+  //   The 0xBC0-0xBFF "M-mode custom RW" range (RISC-V Privileged ISA Vol II
+  //   Table 2.1) was CHOSEN — verified empty in CVA6 via
+  //   `grep -E "12'h[Bb][Cc]" core/include/riscv_pkg.sv` returning 0 hits.
+  //   Reserves 58 slots (0xBC6..0xBFF) for Phase 6 S-mode/MMU and future
+  //   extensions, eliminating further relocation churn.
+  //
+  //   New mapping (ADR-12 iter 3):
+  //     0xBC0 → pstatus            (was 0x300, collided with mstatus)
+  //     0xBC1 → pepc               (was 0x341, collided with mepc)
+  //     0xBC2 → pcause             (was 0x342, collided with mcause)
+  //     0xBC3 → pgas               (was 0x343, collided with mtval; MVP=0)
+  //     0xBC4 → pevent_table_base  (was 0x304, collided with mie)
+  //     0xBC5 → pcycle             (was 0x305, collided with mtvec;
+  //                                 bootrom/src/main.c:15 csrr-cycle subst.)
   //
   typedef enum logic [11:0] {
-    PVM_CSR_PSTATUS           = 12'h300,  // PVM supervisor status register
-    PVM_CSR_PEVENT_TABLE_BASE = 12'h304,  // ecalli handler table base pointer
-    PVM_CSR_PCYCLE            = 12'h305,  // cycle counter (bootrom compat.)
-    PVM_CSR_PEPC              = 12'h341,  // PVM exception program counter
-    PVM_CSR_PCAUSE            = 12'h342,  // PVM exception cause code
-    PVM_CSR_PGAS              = 12'h343   // PVM gas remaining (MVP = 0)
+    PVM_CSR_PSTATUS           = 12'hBC0,  // PVM supervisor status register
+    PVM_CSR_PEPC              = 12'hBC1,  // PVM exception program counter
+    PVM_CSR_PCAUSE            = 12'hBC2,  // PVM exception cause code
+    PVM_CSR_PGAS              = 12'hBC3,  // PVM gas remaining (MVP = 0)
+    PVM_CSR_PEVENT_TABLE_BASE = 12'hBC4,  // ecalli handler table base pointer
+    PVM_CSR_PCYCLE            = 12'hBC5   // cycle counter (bootrom compat.)
   } pvm_csr_addr_t;
+
+  // ---------------------------------------------------------------------------
+  // Phase 5 privileged-opcode csr_addr field encoding contract (ADR-1.1)
+  // ---------------------------------------------------------------------------
+  //   PVM_OP_CSR_RW / RS / RC and immediate variants (opcodes 231..236 — to be
+  //   added in sub-phase 2.1) carry the 12-bit csr_addr in imm[11:0]:
+  //     • Standard form (csrrw/csrrs/csrrc):
+  //         rA = dst (4-bit reg id), rB = src1 (4-bit reg id),
+  //         imm[11:0] = csr_addr
+  //     • Immediate form (csrrwi/csrrsi/csrrci):
+  //         rA = dst (4-bit reg id), rB = zimm[4:0] (only low 5 bits used —
+  //         RV64E reg-field is 4 bits, so zimm > 15 is not encodable in this
+  //         scheme; OpenSBI v1.7 emits NO immediate-form CSR ops with zimm>15
+  //         per grep audit — confirmed by sub-phase 4.0 step 0),
+  //         imm[11:0] = csr_addr
+  //     • PVM_OP_MRET (237), PVM_OP_SRET (238), PVM_OP_WFI (239): no operands,
+  //         no immediate
+  //     • PVM_OP_SFENCE_VMA (240): rA = rs1, rB = rs2, no immediate
+  //
+  //   REJECTED alternative (iter 2): split csr_addr across imm[11:5] +
+  //   imm[4:0] with zimm in imm[4:0] — encoding splits across fields,
+  //   harder to decode; iter 3 keeps csr_addr in imm[11:0] contiguous.
+  //
+  function automatic logic [11:0] pvm_priv_csr_addr(input logic [63:0] imm);
+    // Extracts the 12-bit csr_addr field from the immediate operand of a
+    // PVM privileged CSR opcode (231..236). Defined here so both the decoder
+    // and Verilator testbenches share one extraction point — preventing the
+    // polkatool-emission / decoder-decode contract from diverging silently.
+    return imm[11:0];
+  endfunction
 
   // ---------------------------------------------------------------------------
   // pvm_exit_reason_t — PVM execution termination codes
