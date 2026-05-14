@@ -17,7 +17,15 @@ package ariane_soc;
   localparam int unsigned NumSources = 30;
   localparam int unsigned MaxPriority = 7;
 
-  localparam NrSlaves = 2; // actually masters, but slaves on the crossbar
+  // Phase 5 sub-phase 1.2 (M9/PM-5): NrSlaves bumped from 2→3.
+  //   slave[0] = CVA6 NoC port (instruction + data via existing noc_req/resp)
+  //   slave[1] = Debug Module DMI master
+  //   slave[2] = pvm_frontend DRAM fetch master (new; activated in 1.2b)
+  // Bumping NrSlaves changes log2(NrSlaves) from 1 to 2, so xbar slave-side
+  // AXI ID width grows by 1 bit. Xilinx IPs that bind to specific ID widths
+  // may need regeneration — PM-5 mitigation is sub-phase 1.5 Vivado synth
+  // pre-flight which catches any IP width mismatch.
+  localparam NrSlaves = 3; // actually masters, but slaves on the crossbar
 
   typedef enum int unsigned {
     DRAM      = 0,

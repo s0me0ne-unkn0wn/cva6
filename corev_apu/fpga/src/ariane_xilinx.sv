@@ -229,7 +229,15 @@ localparam NumWords = (24 * 1024 * 1024) / 8;
   
 // WARNING: If NBSlave is modified, Xilinx's IPs under fpga/xilinx need to be updated with the new AXI id width and regenerated.
 // Otherwise reads and writes to DRAM may be returned to the wrong master and the crossbar will freeze. See issue #568.
-localparam NBSlave = 2; // debug, ariane
+//
+// Phase 5 sub-phase 1.2 (M9/PM-5): NBSlave bumped from 2→3 to add the
+// pvm_frontend DRAM fetch master at slave[2]. This changes AxiIdWidthSlaves
+// from 5 (4+log2(2)) to 6 (4+ceil(log2(3))). Per the warning above, the PM-5
+// risk is mitigated by sub-phase 1.5 Vivado synth pre-flight which catches
+// any Xilinx-IP-side ID width mismatch. Sub-phase 1.2a (this commit) wires
+// slave[2] to a tied-off no-traffic default; sub-phase 1.2b activates the
+// real AXI master from pvm_frontend via new cva6 ports.
+localparam NBSlave = 3; // debug, ariane, pvm_frontend_dram_fetch (sub-phase 1.2)
 localparam AxiAddrWidth = 64;
 localparam AxiDataWidth = 64;
 localparam AxiIdWidthMaster = 4;
@@ -249,6 +257,48 @@ AXI_BUS #(
     .AXI_ID_WIDTH   ( AxiIdWidthMaster ),
     .AXI_USER_WIDTH ( AxiUserWidth     )
 ) slave[NBSlave-1:0]();
+
+// ---------------------------------------------------------------------------
+// Phase 5 sub-phase 1.2a: slave[2] tie-off (no traffic).
+// ---------------------------------------------------------------------------
+// slave[2] is reserved for the pvm_frontend DRAM fetch master. In 1.2a it is
+// tied off to a no-traffic state — aw/w/ar_valid all 0, b/r_ready all 1
+// (drain any spurious responses). Sub-phase 1.2b will replace these
+// assignments with the real AXI master signals driven from new cva6 ports.
+// The xbar still sees a valid AXI slave port at index 2 with consistent ID
+// width (AxiIdWidthMaster=4), so synthesis and elaboration pass cleanly.
+assign slave[2].aw_id     = '0;
+assign slave[2].aw_addr   = '0;
+assign slave[2].aw_len    = '0;
+assign slave[2].aw_size   = '0;
+assign slave[2].aw_burst  = '0;
+assign slave[2].aw_lock   = 1'b0;
+assign slave[2].aw_cache  = '0;
+assign slave[2].aw_prot   = '0;
+assign slave[2].aw_qos    = '0;
+assign slave[2].aw_region = '0;
+assign slave[2].aw_atop   = '0;
+assign slave[2].aw_user   = '0;
+assign slave[2].aw_valid  = 1'b0;
+assign slave[2].w_data    = '0;
+assign slave[2].w_strb    = '0;
+assign slave[2].w_last    = 1'b0;
+assign slave[2].w_user    = '0;
+assign slave[2].w_valid   = 1'b0;
+assign slave[2].b_ready   = 1'b1;
+assign slave[2].ar_id     = '0;
+assign slave[2].ar_addr   = '0;
+assign slave[2].ar_len    = '0;
+assign slave[2].ar_size   = '0;
+assign slave[2].ar_burst  = '0;
+assign slave[2].ar_lock   = 1'b0;
+assign slave[2].ar_cache  = '0;
+assign slave[2].ar_prot   = '0;
+assign slave[2].ar_qos    = '0;
+assign slave[2].ar_region = '0;
+assign slave[2].ar_user   = '0;
+assign slave[2].ar_valid  = 1'b0;
+assign slave[2].r_ready   = 1'b1;
 
 AXI_BUS #(
     .AXI_ADDR_WIDTH ( AxiAddrWidth     ),

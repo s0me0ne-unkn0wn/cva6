@@ -109,6 +109,42 @@ module ariane_testharness #(
     .AXI_USER_WIDTH ( AXI_USER_WIDTH          )
   ) slave[ariane_soc::NrSlaves-1:0]();
 
+  // Phase 5 sub-phase 1.2a: slave[2] (pvm_frontend DRAM fetch master) tied
+  // off to no-traffic state. Same pattern as ariane_xilinx.sv. Sub-phase
+  // 1.2b will replace this with real AXI master signals from cva6.
+  assign slave[2].aw_id     = '0;
+  assign slave[2].aw_addr   = '0;
+  assign slave[2].aw_len    = '0;
+  assign slave[2].aw_size   = '0;
+  assign slave[2].aw_burst  = '0;
+  assign slave[2].aw_lock   = 1'b0;
+  assign slave[2].aw_cache  = '0;
+  assign slave[2].aw_prot   = '0;
+  assign slave[2].aw_qos    = '0;
+  assign slave[2].aw_region = '0;
+  assign slave[2].aw_atop   = '0;
+  assign slave[2].aw_user   = '0;
+  assign slave[2].aw_valid  = 1'b0;
+  assign slave[2].w_data    = '0;
+  assign slave[2].w_strb    = '0;
+  assign slave[2].w_last    = 1'b0;
+  assign slave[2].w_user    = '0;
+  assign slave[2].w_valid   = 1'b0;
+  assign slave[2].b_ready   = 1'b1;
+  assign slave[2].ar_id     = '0;
+  assign slave[2].ar_addr   = '0;
+  assign slave[2].ar_len    = '0;
+  assign slave[2].ar_size   = '0;
+  assign slave[2].ar_burst  = '0;
+  assign slave[2].ar_lock   = 1'b0;
+  assign slave[2].ar_cache  = '0;
+  assign slave[2].ar_prot   = '0;
+  assign slave[2].ar_qos    = '0;
+  assign slave[2].ar_region = '0;
+  assign slave[2].ar_user   = '0;
+  assign slave[2].ar_valid  = 1'b0;
+  assign slave[2].r_ready   = 1'b1;
+
   AXI_BUS #(
     .AXI_ADDR_WIDTH ( AXI_ADDRESS_WIDTH            ),
     .AXI_DATA_WIDTH ( AXI_DATA_WIDTH               ),
