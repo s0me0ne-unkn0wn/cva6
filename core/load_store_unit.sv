@@ -649,8 +649,16 @@ module load_store_unit
     // valid.  PVM_LOW_INACCESSIBLE_MOD previously set to 0x10000 was too
     // aggressive and blocked legitimate RO/RW data accesses.  Use limit=1
     // (only address 0 is the null-pointer trap) to allow the program to run.
+    //
+    // Phase 5 sub-phase 1.6 (ADR-11): gated on priv_lvl != M. M-mode
+    // bypasses this PVM panic check entirely so OpenSBI can access device
+    // MMIO at low physical addresses (UART_BASE region is at 0x1000_0000;
+    // null-pointer protection in M-mode is a non-goal — debug-only).
+    // U/S-mode keep the check active (PVM bare-metal user contract).
+    // Test vectors per Mn8: (a) M-mode at 0x10000 succeeds; (b) U-mode at
+    // 0x10000 panics; (c) S-mode at 0x10000 panics.
     if (cva6_config_pkg::CVA6ConfigUsePvmIsa && lsu_ctrl.valid &&
-        lsu_ctrl.vaddr[31:0] < 32'h1) begin
+        (priv_lvl_i != riscv::PRIV_LVL_M) && lsu_ctrl.vaddr[31:0] < 32'h1) begin
       cva6_misaligned_exception.valid = 1'b1;
       case (lsu_ctrl.fu)
         LOAD: begin

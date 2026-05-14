@@ -63,7 +63,19 @@ module ariane import ariane_pkg::*; #(
   output rvfi_probes_t rvfi_probes_o,
   // memory side
   output noc_req_t                     noc_req_o,
-  input  noc_resp_t                    noc_resp_i
+  input  noc_resp_t                    noc_resp_i,
+  // Phase 5 ADR-10 + sub-phase 1.1: DRAM section bounds from pvm_config_regs.
+  // M-mode set: programmed by bootrom via PVMConfig MMIO; consumed by
+  // pvm_frontend (mode-aware fetch source mux) and (Stage 2+) the LSU.
+  // S/U-mode set: Phase 6 use; stays 0 in Phase 5.
+  input  logic [31:0]                  pvm_code_base_m_i,
+  input  logic [31:0]                  pvm_code_len_m_i,
+  input  logic [31:0]                  pvm_code_base_s_i,
+  input  logic [31:0]                  pvm_code_len_s_i,
+  // Combinational selector for the wrapper's bootrom/DRAM-AXI mux
+  // (sub-phase 1.2 will consume this in ariane_xilinx.sv).
+  //   2'b00 BOOTROM, 2'b01 DRAM_M, 2'b10 DRAM_S
+  output logic [1:0]                   pvm_fetch_source_o
 );
 
   cvxif_req_t  cvxif_req;
@@ -105,7 +117,13 @@ module ariane import ariane_pkg::*; #(
     .cvxif_req_o          ( cvxif_req                 ),
     .cvxif_resp_i         ( cvxif_resp                ),
     .noc_req_o            ( noc_req_o                 ),
-    .noc_resp_i           ( noc_resp_i                )
+    .noc_resp_i           ( noc_resp_i                ),
+    // Phase 5 sub-phase 1.1: DRAM section bounds pass-through.
+    .pvm_code_base_m_i    ( pvm_code_base_m_i         ),
+    .pvm_code_len_m_i     ( pvm_code_len_m_i          ),
+    .pvm_code_base_s_i    ( pvm_code_base_s_i         ),
+    .pvm_code_len_s_i     ( pvm_code_len_s_i          ),
+    .pvm_fetch_source_o   ( pvm_fetch_source_o        )
   );
 
   // CVXIF coprocessor removed (CvxifEn=0)

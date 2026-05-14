@@ -189,4 +189,19 @@ package cva6_config_pkg;
   // grep: FETCH_WIDTH = 128 when CVA6ConfigUsePvmIsa = 1.
   localparam CVA6ConfigPvmFetchWidth = 128;
 
+  // Phase 5 ADR-8 (iter 2 + iter 3 M6): privileged-extension activation switch.
+  //   USE_PVM_PRIV = 1'b0  → Phase 4.5 behaviour preserved (no M-mode CSRs,
+  //                          no priv opcodes 231-240, no DRAM-fetch routing).
+  //                          This is the default; Stage 5.0b will flip it.
+  //   USE_PVM_PRIV = 1'b1  → Phase 5 priv extensions active.
+  //
+  // Elaboration matrix (Critic Major 1 / Iter 3 M6):
+  //   Only TWO combinations are valid:
+  //     (CVA6ConfigUsePvmIsa=1, USE_PVM_PRIV=0)  [Phase 4.5 baseline]
+  //     (CVA6ConfigUsePvmIsa=1, USE_PVM_PRIV=1)  [Phase 5 priv active]
+  //   The combination (CVA6ConfigUsePvmIsa=0, USE_PVM_PRIV=1) is ILLEGAL —
+  //   priv opcodes only emit when the PVM ISA path is the active frontend.
+  //   Downstream modules elaborate $error if this combination is forced.
+  localparam logic USE_PVM_PRIV = 1'b0;
+
 endpackage

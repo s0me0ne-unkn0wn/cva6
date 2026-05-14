@@ -66,6 +66,31 @@ module pvm_frontend #(
     input  logic [VirtualAddrSize-1:0]    branch_redirect_target_i,
 
     // -----------------------------------------------------------------------
+    // Phase 5 ADR-10 + sub-phase 1.1: privilege mode + DRAM section bounds.
+    // -----------------------------------------------------------------------
+    // Current privilege level (RISC-V encoding): 2'b11 = M, 2'b01 = S, 2'b00 = U.
+    // In Phase 4.5 mode (USE_PVM_PRIV=0) the wrapper ties this to 2'b11 — and
+    // since code_base_m/s default to 0 from pvm_config_regs reset, all bounds
+    // checks fail and fetch_source_o stays at BOOTROM (preserved behaviour).
+    input  logic [1:0]                    priv_lvl_i,
+    // M-mode DRAM section bounds (programmed by bootrom via PVMConfig MMIO).
+    input  logic [31:0]                   code_base_m_i,
+    input  logic [31:0]                   code_len_m_i,
+    // S/U-mode DRAM section bounds (Phase 6 — reset 0 in Phase 5).
+    input  logic [31:0]                   code_base_s_i,
+    input  logic [31:0]                   code_len_s_i,
+    // Fetch-source selector for the wrapper's bootrom/DRAM-AXI mux (sub-phase 1.2):
+    //   2'b00 FETCH_BOOTROM — pc falls outside both DRAM ranges (default)
+    //   2'b01 FETCH_DRAM_M  — M-mode, pc ∈ [code_base_m, code_base_m+code_len_m)
+    //   2'b10 FETCH_DRAM_S  — S/U-mode, pc ∈ [code_base_s, code_base_s+code_len_s)
+    // Combinational alongside code_addr_o; the wrapper muxes the data source
+    // in the same cycle so code_data_i (existing input) reflects the chosen
+    // source on the next read.
+    // Sub-phase 1.1 (this file) only computes the flag; sub-phase 1.2 wires
+    // the AXI master interface in cva6.sv / ariane_xilinx.sv that consumes it.
+    output logic [1:0]                    fetch_source_o,
+
+    // -----------------------------------------------------------------------
     // Output to id_stage / pvm_decoder — registered (ADR-1).
     // -----------------------------------------------------------------------
     output logic                          valid_o,
@@ -216,6 +241,38 @@ module pvm_frontend #(
   end
 
   // =========================================================================
+  // Phase 5 ADR-10 / sub-phase 1.1: mode-aware fetch source selection
+  // (B3 fix iter 3: absolute-PC bounds-check, NO `pc_q - reset_vector`).
+  // =========================================================================
+  // The fetch-source decision is combinational on pc_q (matches the cycle
+  // when code_addr_o is driven). The wrapper consumes fetch_source_o in the
+  // same cycle to route either bootrom-direct or DRAM-AXI data into
+  // code_data_i / code_data_next_i / bitmask_data_i.
+  localparam logic [1:0] FETCH_BOOTROM = 2'b00;
+  localparam logic [1:0] FETCH_DRAM_M  = 2'b01;
+  localparam logic [1:0] FETCH_DRAM_S  = 2'b10;
+
+  // Zero-extend 32-bit bases to VirtualAddrSize. DRAM at 0x80000000-0xBFFFFFFF
+  // on Genesys2 fits within 32 bits, so 32-bit MMIO base regs are sufficient.
+  logic in_m_range, in_s_range;
+  assign in_m_range = (code_len_m_i != 32'h0)
+                   && (pc_q >= VirtualAddrSize'({{(VirtualAddrSize-32){1'b0}}, code_base_m_i}))
+                   && (pc_q <  VirtualAddrSize'({{(VirtualAddrSize-32){1'b0}}, code_base_m_i + code_len_m_i}));
+  assign in_s_range = (code_len_s_i != 32'h0)
+                   && (pc_q >= VirtualAddrSize'({{(VirtualAddrSize-32){1'b0}}, code_base_s_i}))
+                   && (pc_q <  VirtualAddrSize'({{(VirtualAddrSize-32){1'b0}}, code_base_s_i + code_len_s_i}));
+
+  logic [1:0] fetch_source_comb;
+  always_comb begin : p_fetch_source_mux
+    unique case (priv_lvl_i)
+      2'b11:   fetch_source_comb = in_m_range ? FETCH_DRAM_M : FETCH_BOOTROM;
+      2'b00,
+      2'b01:   fetch_source_comb = in_s_range ? FETCH_DRAM_S : FETCH_BOOTROM;
+      default: fetch_source_comb = FETCH_BOOTROM;  // 2'b10 reserved
+    endcase
+  end
+
+  // =========================================================================
   // Output assignments
   // =========================================================================
   assign valid_o           = valid_q;
@@ -223,5 +280,6 @@ module pvm_frontend #(
   assign skip_o            = skip_q;
   assign is_valid_opcode_o = is_valid_op_q;
   assign pc_o              = pc_out_q;
+  assign fetch_source_o    = fetch_source_comb;
 
 endmodule

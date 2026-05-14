@@ -348,7 +348,18 @@ module cva6
     // noc request, can be AXI or OpenPiton - SUBSYSTEM
     output noc_req_t noc_req_o,
     // noc response, can be AXI or OpenPiton - SUBSYSTEM
-    input noc_resp_t noc_resp_i
+    input noc_resp_t noc_resp_i,
+    // Phase 5 ADR-10 + sub-phase 1.1: DRAM section bounds (from pvm_config_regs
+    // via top-level ariane wrapper). Consumed by pvm_frontend's mode-aware
+    // fetch source mux. M-mode set is programmed by bootrom over MMIO;
+    // S/U-mode set is Phase 6 territory and stays 0 in Phase 5.
+    input  logic [31:0] pvm_code_base_m_i,
+    input  logic [31:0] pvm_code_len_m_i,
+    input  logic [31:0] pvm_code_base_s_i,
+    input  logic [31:0] pvm_code_len_s_i,
+    // Combinational fetch-source selector for the wrapper's bootrom/DRAM-AXI
+    // mux (sub-phase 1.2 will consume in ariane_xilinx.sv).
+    output logic [1:0]  pvm_fetch_source_o
 );
 
   localparam type interrupts_t = struct packed {
@@ -840,6 +851,14 @@ module cva6
     .code_data_next_i         (pvm_fe_code_data_next_w),
     .bitmask_addr_o           (pvm_fe_bitmask_addr_w),
     .bitmask_data_i           (pvm_fe_bitmask_data_w),
+    // Phase 5 sub-phase 1.1: mode-aware fetch source selection.
+    // riscv::priv_lvl_t is typedef enum logic [1:0] — implicit conversion ok.
+    .priv_lvl_i               (priv_lvl),
+    .code_base_m_i            (pvm_code_base_m_i),
+    .code_len_m_i             (pvm_code_len_m_i),
+    .code_base_s_i            (pvm_code_base_s_i),
+    .code_len_s_i             (pvm_code_len_s_i),
+    .fetch_source_o           (pvm_fetch_source_o),
     // Exception / eret / ecalli redirect (sub-phase 6):
     .branch_redirect_valid_i  (pvm_fe_redirect_valid_w),
     .branch_redirect_target_i (pvm_fe_redirect_target_w),

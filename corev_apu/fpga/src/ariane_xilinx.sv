@@ -342,16 +342,17 @@ assign rst = ddr_sync_reset;
 axi_pkg::xbar_rule_64_t [ariane_soc::NB_PERIPHERALS-1:0] addr_map;
 
 assign addr_map = '{
-  '{ idx: ariane_soc::Debug,    start_addr: ariane_soc::DebugBase,    end_addr: ariane_soc::DebugBase + ariane_soc::DebugLength       },
-  '{ idx: ariane_soc::ROM,      start_addr: ariane_soc::ROMBase,      end_addr: ariane_soc::ROMBase + ariane_soc::ROMLength           },
-  '{ idx: ariane_soc::CLINT,    start_addr: ariane_soc::CLINTBase,    end_addr: ariane_soc::CLINTBase + ariane_soc::CLINTLength       },
-  '{ idx: ariane_soc::PLIC,     start_addr: ariane_soc::PLICBase,     end_addr: ariane_soc::PLICBase + ariane_soc::PLICLength         },
-  '{ idx: ariane_soc::UART,     start_addr: ariane_soc::UARTBase,     end_addr: ariane_soc::UARTBase + ariane_soc::UARTLength         },
-  '{ idx: ariane_soc::Timer,    start_addr: ariane_soc::TimerBase,    end_addr: ariane_soc::TimerBase + ariane_soc::TimerLength       },
-  '{ idx: ariane_soc::SPI,      start_addr: ariane_soc::SPIBase,      end_addr: ariane_soc::SPIBase + ariane_soc::SPILength           },
-  '{ idx: ariane_soc::Ethernet, start_addr: ariane_soc::EthernetBase, end_addr: ariane_soc::EthernetBase + ariane_soc::EthernetLength },
-  '{ idx: ariane_soc::GPIO,     start_addr: ariane_soc::GPIOBase,     end_addr: ariane_soc::GPIOBase + ariane_soc::GPIOLength         },
-  '{ idx: ariane_soc::DRAM,     start_addr: ariane_soc::DRAMBase,     end_addr: ariane_soc::DRAMBase + ariane_soc::DRAMLength         }
+  '{ idx: ariane_soc::Debug,     start_addr: ariane_soc::DebugBase,     end_addr: ariane_soc::DebugBase + ariane_soc::DebugLength         },
+  '{ idx: ariane_soc::ROM,       start_addr: ariane_soc::ROMBase,       end_addr: ariane_soc::ROMBase + ariane_soc::ROMLength             },
+  '{ idx: ariane_soc::CLINT,     start_addr: ariane_soc::CLINTBase,     end_addr: ariane_soc::CLINTBase + ariane_soc::CLINTLength         },
+  '{ idx: ariane_soc::PLIC,      start_addr: ariane_soc::PLICBase,      end_addr: ariane_soc::PLICBase + ariane_soc::PLICLength           },
+  '{ idx: ariane_soc::UART,      start_addr: ariane_soc::UARTBase,      end_addr: ariane_soc::UARTBase + ariane_soc::UARTLength           },
+  '{ idx: ariane_soc::Timer,     start_addr: ariane_soc::TimerBase,     end_addr: ariane_soc::TimerBase + ariane_soc::TimerLength         },
+  '{ idx: ariane_soc::PVMConfig, start_addr: ariane_soc::PVMConfigBase, end_addr: ariane_soc::PVMConfigBase + ariane_soc::PVMConfigLength },  // Phase 5 ADR-2
+  '{ idx: ariane_soc::SPI,       start_addr: ariane_soc::SPIBase,       end_addr: ariane_soc::SPIBase + ariane_soc::SPILength             },
+  '{ idx: ariane_soc::Ethernet,  start_addr: ariane_soc::EthernetBase,  end_addr: ariane_soc::EthernetBase + ariane_soc::EthernetLength   },
+  '{ idx: ariane_soc::GPIO,      start_addr: ariane_soc::GPIOBase,      end_addr: ariane_soc::GPIOBase + ariane_soc::GPIOLength           },
+  '{ idx: ariane_soc::DRAM,      start_addr: ariane_soc::DRAMBase,      end_addr: ariane_soc::DRAMBase + ariane_soc::DRAMLength           }
 };
 
 localparam axi_pkg::xbar_cfg_t AXI_XBAR_CFG = '{
@@ -771,6 +772,11 @@ end
 // ---------------
 ariane_axi::req_t    axi_ariane_req;
 ariane_axi::resp_t   axi_ariane_resp;
+
+// Phase 5 sub-phase 1.1: fetch-source flag from cva6 frontend. Sub-phase 1.2
+// will route this through the bootrom/DRAM-AXI mux. For now (1.1) it is
+// just exposed as a wire — bootrom path stays the only physical fetch source.
+logic [1:0] pvm_fetch_source;
 rvfi_probes_t rvfi_probes;
 
 rvfi_instr_t [CVA6Cfg.NrCommitPorts-1:0]  rvfi_instr;
@@ -793,7 +799,13 @@ ariane #(
     .rvfi_probes_o( rvfi_probes         ),
     .debug_req_i  ( debug_req_irq       ),
     .noc_req_o    ( axi_ariane_req      ),
-    .noc_resp_i   ( axi_ariane_resp     )
+    .noc_resp_i   ( axi_ariane_resp     ),
+    // Phase 5 sub-phase 1.1: DRAM section bounds from pvm_config_regs.
+    .pvm_code_base_m_i  ( pvm_code_base_m   ),
+    .pvm_code_len_m_i   ( pvm_code_len_m    ),
+    .pvm_code_base_s_i  ( pvm_code_base_s   ),
+    .pvm_code_len_s_i   ( pvm_code_len_s    ),
+    .pvm_fetch_source_o ( pvm_fetch_source  )  // consumed by sub-phase 1.2
 );
 
 `AXI_ASSIGN_FROM_REQ(slave[0], axi_ariane_req)
@@ -965,6 +977,56 @@ clint #(
 
 `AXI_ASSIGN_TO_REQ(axi_clint_req, master[ariane_soc::CLINT])
 `AXI_ASSIGN_FROM_RESP(master[ariane_soc::CLINT], axi_clint_resp)
+
+// ---------------
+// PVM config regs (Phase 5 ADR-2 / sub-phase 1.0)
+// ---------------
+// 20 × 32-bit AXI4 slave at 0x1800_2000 (4 KB region).
+// Bootrom (sub-phase 5.2) writes M-mode section bases/lengths after parsing
+// the SD-image header; pvm_frontend (sub-phase 1.1) and LSU (Stage 2)
+// consume them.  S-mode set stays 0 in Phase 5 (kicks Phase 5 milestone-C
+// trap on first mret per ADR-4 + ADR-10).
+logic [31:0] pvm_code_base_m,  pvm_code_len_m;
+logic [31:0] pvm_bm_base_m,    pvm_bm_len_m;
+logic [31:0] pvm_ro_base_m,    pvm_ro_len_m;
+logic [31:0] pvm_rw_base_m,    pvm_rw_len_m;
+logic [31:0] pvm_jt_base_m,    pvm_jt_len_m;
+logic [31:0] pvm_code_base_s,  pvm_code_len_s;
+logic [31:0] pvm_bm_base_s,    pvm_bm_len_s;
+logic [31:0] pvm_ro_base_s,    pvm_ro_len_s;
+logic [31:0] pvm_rw_base_s,    pvm_rw_len_s;
+logic [31:0] pvm_jt_base_s,    pvm_jt_len_s;
+
+pvm_config_regs #(
+    .AxiAddrWidth ( AxiAddrWidth      ),
+    .AxiDataWidth ( AxiDataWidth      ),
+    .AxiIdWidth   ( AxiIdWidthSlaves  ),
+    .AxiUserWidth ( AxiUserWidth      )
+) i_pvm_config_regs (
+    .clk_i            ( clk                              ),
+    .rst_ni           ( ndmreset_n                       ),
+    .axi              ( master[ariane_soc::PVMConfig]    ),
+    .code_base_m_o    ( pvm_code_base_m                  ),
+    .code_len_m_o     ( pvm_code_len_m                   ),
+    .bitmask_base_m_o ( pvm_bm_base_m                    ),
+    .bitmask_len_m_o  ( pvm_bm_len_m                     ),
+    .ro_base_m_o      ( pvm_ro_base_m                    ),
+    .ro_len_m_o       ( pvm_ro_len_m                     ),
+    .rw_base_m_o      ( pvm_rw_base_m                    ),
+    .rw_len_m_o       ( pvm_rw_len_m                     ),
+    .jt_base_m_o      ( pvm_jt_base_m                    ),
+    .jt_len_m_o       ( pvm_jt_len_m                     ),
+    .code_base_s_o    ( pvm_code_base_s                  ),
+    .code_len_s_o     ( pvm_code_len_s                   ),
+    .bitmask_base_s_o ( pvm_bm_base_s                    ),
+    .bitmask_len_s_o  ( pvm_bm_len_s                     ),
+    .ro_base_s_o      ( pvm_ro_base_s                    ),
+    .ro_len_s_o       ( pvm_ro_len_s                     ),
+    .rw_base_s_o      ( pvm_rw_base_s                    ),
+    .rw_len_s_o       ( pvm_rw_len_s                     ),
+    .jt_base_s_o      ( pvm_jt_base_s                    ),
+    .jt_len_s_o       ( pvm_jt_len_s                     )
+);
 
 // ---------------
 // ROM
