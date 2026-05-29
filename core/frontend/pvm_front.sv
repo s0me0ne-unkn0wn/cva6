@@ -38,6 +38,9 @@ module pvm_front
     input  logic [7:0]      img_wdata_i,
     // downstream issue handshake
     input  logic            issue_ack_i,     // consumer accepted current uop -> advance
+    // conditional-branch resolution feedback from the backend branch_unit
+    input  logic            br_resolved_i,   // a PVM branch resolved this cycle (pulse)
+    input  logic            br_taken_i,      // resolved branch outcome (1 = taken)
     // decoded micro-op (raw; scoreboard_entry_t assembled by cva6.sv)
     output logic            valid_o,
     output logic [VLEN-1:0] pc_o,
@@ -129,6 +132,9 @@ module pvm_front
       .code_len_i    (code_len_i),
       .next_ready_i  (issue_ack_i),
       .halt_i        (is_hostcall_o),     // ecalli: advance to next pc, then suspend for M-mode
+      .branch_i      (is_branch_o),       // conditional branch: suspend until backend resolves
+      .br_resolved_i (br_resolved_i),
+      .br_taken_i    (br_taken_i),
       .redirect_valid_i(is_jump_o),       // unconditional jump -> front redirect
       .redirect_pc_i   (branch_target_o),
       .code_window_i (code_window),

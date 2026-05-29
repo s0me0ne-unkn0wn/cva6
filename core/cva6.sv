@@ -449,6 +449,7 @@ module cva6
   logic                    pvm_is_trap, pvm_illegal, pvm_unsupported, pvm_halted, pvm_use_imm;
   logic [CVA6Cfg.VLEN-1:0] pvm_pc, pvm_btgt;
   logic                    pvm_resume;
+  logic                    pvm_br_resolved, pvm_br_taken;
   fu_t                     pvm_fu;
   fu_op                    pvm_op;
   logic [4:0]              pvm_rd, pvm_rs1, pvm_rs2;
@@ -478,6 +479,10 @@ module cva6
   // PVMCFG1[33] = resume: set by the M-mode host-call handler so the re-activation
   // continues at the post-ecalli pc held in pvm_fetch (instead of reloading entry_pc).
   assign pvm_resume    = CVA6Cfg.PvmPresent & pvm_cfg1_csr[33];
+  // Conditional-branch resolution feedback: while PVM owns issue, the only branch
+  // in flight is the suspended PVM branch, so resolved_branch.valid is its outcome.
+  assign pvm_br_resolved = CVA6Cfg.PvmPresent & pvm_active & resolved_branch.valid;
+  assign pvm_br_taken    = resolved_branch.is_taken;
   assign pvm_entry_pc  = {{(CVA6Cfg.VLEN-32){1'b0}}, pvm_cfg0_csr[31:0]};
   assign pvm_code_base = {{(CVA6Cfg.VLEN-32){1'b0}}, pvm_cfg0_csr[63:32]};
   assign pvm_code_len  = {{(CVA6Cfg.VLEN-32){1'b0}}, pvm_cfg1_csr[31:0]};
@@ -501,6 +506,8 @@ module cva6
         .img_addr_i     (pvm_img_addr),
         .img_wdata_i    (pvm_img_wdata),
         .issue_ack_i    (pvm_active & issue_instr_issue_id[0]),
+        .br_resolved_i  (pvm_br_resolved),
+        .br_taken_i     (pvm_br_taken),
         .valid_o        (pvm_valid),
         .pc_o           (pvm_pc),
         .fu_o           (pvm_fu),

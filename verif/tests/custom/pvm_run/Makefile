@@ -48,14 +48,35 @@ run-banner: loader.S link.ld gen_pvm_img.py
 # Stage 4 host-call model: the banner is printed via `ecalli #0` (putchar) host
 # calls instead of direct MMIO. Each char: load_imm r7,c ; ecalli #0. The PVM trap
 # vectors to M-mode (mcause=ENV_CALL_MMODE), the handler does putchar(PVM r7) and
-# resumes the guest at next_pc (carried in mepc), proving PVM-mode resume-after-trap.
+# resumes the guest (pvm_fetch suspended at the post-ecalli pc; re-entry sets the
+# resume bit PVM_CFG1[33]), proving PVM-mode resume-after-trap.
 run-ecalli: loader.S link.ld gen_pvm_img.py
 	@CL=$$(python3 gen_pvm_img.py '$(BANNER)' ecalli.hex ecalli | tee /dev/stderr | grep CODE_LEN | grep -oE '[0-9]+'); \
 	echo ">> building loader with CODE_LEN=$$CL"; \
 	$(CC) $(CFLAGS) -DCODE_LEN=$$CL -T link.ld -o loader_ecalli.elf loader.S; \
 	$(HARNESS) +PVM_IMG=$(abspath ecalli.hex) +tohost_addr=$(TOHOST) +time_out=400000 $(abspath loader_ecalli.elf)
 
-clean:
-	rm -f loader.elf loader_jump.elf loader_banner.elf loader_ecalli.elf loader_hi.elf baseline.elf banner.hex ecalli.hex hi_banner.hex
+# Stage 3.3b: conditional branches (backend-resolved, stall-on-branch). branch_eq
+# r1,r2,+9 with r1==r2 (taken -> prints 'T') or r1!=r2 (not taken -> prints 'F').
+run-branch: loader.S link.ld gen_pvm_img.py
+	@python3 gen_pvm_img.py '' br_taken.hex    br_taken    >/dev/null; \
+	 python3 gen_pvm_img.py '' br_nottaken.hex br_nottaken >/dev/null; \
+	 $(CC) $(CFLAGS) -DCODE_LEN=21 -T link.ld -o loader_br.elf loader.S; \
+	 echo ">> branch TAKEN (expect T):"; \
+	 $(HARNESS) +PVM_IMG=$(abspath br_taken.hex)    +tohost_addr=$(TOHOST) +time_out=200000 $(abspath loader_br.elf) | grep -aE 'SUCCESS|^T'; \
+	 echo ">> branch NOT-TAKEN (expect F):"; \
+	 $(HARNESS) +PVM_IMG=$(abspath br_nottaken.hex) +tohost_addr=$(TOHOST) +time_out=200000 $(abspath loader_br.elf) | grep -aE 'SUCCESS|^F'
 
-.PHONY: all run run-jump run-banner run-ecalli clean
+# Stage 3.3b: backward conditional branch (loop). Prints '#' N times (N=$(LOOP_N)).
+LOOP_N ?= 5
+run-loop: loader.S link.ld gen_pvm_img.py
+	@CL=$$(python3 gen_pvm_img.py '$(LOOP_N)' loop.hex loop | grep CODE_LEN | grep -oE '[0-9]+'); \
+	 $(CC) $(CFLAGS) -DCODE_LEN=$$CL -T link.ld -o loader_loop.elf loader.S; \
+	 echo ">> loop N=$(LOOP_N): printing '#' x$(LOOP_N)"; \
+	 OUT=$$($(HARNESS) +PVM_IMG=$(abspath loop.hex) +tohost_addr=$(TOHOST) +time_out=400000 $(abspath loader_loop.elf) 2>&1); \
+	 echo "$$OUT" | grep -aE 'SUCCESS'; echo "   '#' count = $$(echo "$$OUT" | grep -ao '#' | wc -l)"
+
+clean:
+	rm -f loader.elf loader_jump.elf loader_banner.elf loader_ecalli.elf loader_br.elf loader_loop.elf loader_hi.elf baseline.elf banner.hex ecalli.hex hi_banner.hex br_taken.hex br_nottaken.hex loop.hex
+
+.PHONY: all run run-jump run-banner run-ecalli run-branch run-loop clean

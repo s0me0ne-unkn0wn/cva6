@@ -105,6 +105,59 @@ def emit_ecalli_banner(text):
     return code, starts
 
 
+BRANCH_EQ = 0xAA   # 170: branch if rA==rB; arg = (rB<<4)|rA, then signed LE offset
+ADD_IMM_32 = 0x83  # 131: rd = rs + imm (arg = (rs<<4)|rd? see decoder); used by loop test
+
+
+def emit_branch_test(take):
+    """Forward conditional-branch test. branch_eq r1,r2,+9 -> TGT; the fall-through
+    path prints 'F', the taken path prints 'T' (via ecalli). With take=True r2==r1
+    so the branch is taken ('T'); with take=False r2!=r1 so it falls through ('F').
+    Proves stall-on-branch resolves both directions and redirects pvm_fetch.
+    Layout (1-byte offset, every instr fixed-length): branch@pc6, TGT@pc15, off=9."""
+    r2val = 7 if take else 9
+    code = (
+        [LOAD_IMM, 0x01, 7]            # load_imm r1, 7          @0  (r1->x2)
+        + [LOAD_IMM, 0x02, r2val]      # load_imm r2, 7|9        @3  (r2->x3)
+        + [BRANCH_EQ, 0x21, 9]         # branch_eq r1,r2,+9->@15 @6  (rA=r1,rB=r2)
+        + [LOAD_IMM, 0x07, ord('F')]   # load_imm r7, 'F'        @9
+        + [ECALLI, 0x00]               # ecalli  (putchar 'F')   @12
+        + [TRAP]                       # trap                    @14
+        + [LOAD_IMM, 0x07, ord('T')]   # load_imm r7, 'T'  (TGT) @15
+        + [ECALLI, 0x00]               # ecalli  (putchar 'T')   @18
+        + [TRAP]                       # trap                    @20
+    )
+    starts = [0, 3, 6, 9, 12, 14, 15, 18, 20]
+    return code, starts
+
+
+def emit_loop_test(n):
+    """Countdown loop: print '*' n times via a backward branch_ne. Proves the
+    taken (loop-back, negative offset) and not-taken (exit) paths plus add_imm.
+      load_imm r1,n ; load_imm r2,0 ; LOOP: load_imm r7,'*' ; ecalli ;
+      add_imm_32 r1,r1,-1 ; branch_ne r1,r2,LOOP ; trap"""
+    BRANCH_NE = 0xAB  # 171
+    instrs = []
+    instrs.append([LOAD_IMM, 0x01, n & 0xFF])    # r1 = n            (r1->x2)
+    instrs.append([LOAD_IMM, 0x02, 0])           # r2 = 0            (r2->x3)
+    # LOOP:
+    instrs.append([LOAD_IMM, 0x07, ord('#')])    # r7 = '#' (absent from all harness stdout)
+    instrs.append([ECALLI, 0x00])                # putchar('*')
+    instrs.append([ADD_IMM_32, 0x11, 0xFF])      # add_imm r1,r1,-1  (rd=r1,rs=r1; imm=-1 sext)
+    # branch_ne r1,r2,LOOP : filled after we know positions
+    instrs.append([BRANCH_NE, 0x21, 0])          # placeholder offset
+    instrs.append([TRAP])
+    # compute starts + the backward offset (target = LOOP pc, branch_pc = branch start)
+    code, starts = [], []
+    for ins in instrs:
+        starts.append(len(code)); code.extend(ins)
+    loop_pc   = starts[2]            # LOOP label
+    branch_pc = starts[5]            # branch instruction
+    off = (loop_pc - branch_pc) & 0xFF   # signed 1-byte LE
+    code[branch_pc + 2] = off
+    return code, starts
+
+
 def build_image(code, starts):
     """Pad code to align16 and append the LSB-first opcode bitmask."""
     code_len = len(code)
@@ -130,12 +183,18 @@ def write_hex(path, img):
 def main():
     text = sys.argv[1] if len(sys.argv) > 1 else "PolkaVM on CVA6!\n"
     out  = sys.argv[2] if len(sys.argv) > 2 else "banner.hex"
-    mode = sys.argv[3] if len(sys.argv) > 3 else "mmio"  # "mmio" | "ecalli"
+    mode = sys.argv[3] if len(sys.argv) > 3 else "mmio"  # mmio|ecalli|br_taken|br_nottaken|loop
     # allow \n etc. from the shell-literal default / argv
     text = text.encode().decode("unicode_escape")
 
     if mode == "ecalli":
         code, starts = emit_ecalli_banner(text)
+    elif mode == "br_taken":
+        code, starts = emit_branch_test(True)
+    elif mode == "br_nottaken":
+        code, starts = emit_branch_test(False)
+    elif mode == "loop":
+        code, starts = emit_loop_test(int(text) if text.strip().isdigit() else 3)
     else:
         code, starts = emit_banner(text)
     img, code_len, bm_off = build_image(code, starts)

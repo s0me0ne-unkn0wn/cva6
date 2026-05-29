@@ -45,6 +45,7 @@ module pvm_fetch_decode_tb;
   pvm_fetch #(.VLEN(VLEN)) i_fetch (
       .clk_i(clk), .rst_ni(rst_n), .start_i(start), .resume_i(1'b0), .entry_pc_i(entry_pc),
       .code_len_i(code_len), .next_ready_i(next_ready), .halt_i(1'b0),
+      .branch_i(1'b0), .br_resolved_i(1'b0), .br_taken_i(1'b0),
       .redirect_valid_i(1'b0), .redirect_pc_i('0),
       .code_window_i(code_window), .bm_window_i(bm_window),
       .valid_o(f_valid), .pc_o(f_pc), .code_addr_o(f_code_addr), .opcode_o(f_opcode),

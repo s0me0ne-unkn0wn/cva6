@@ -33,7 +33,7 @@ module pvm_front_tb;
       .pvm_active_i(pvm_active), .resume_i(resume), .entry_pc_i(entry_pc), .code_len_i(code_len),
       .code_base_i(code_base), .bitmask_base_i(bitmask_base),
       .img_we_i(img_we), .img_addr_i(img_addr), .img_wdata_i(img_wdata),
-      .issue_ack_i(issue_ack),
+      .issue_ack_i(issue_ack), .br_resolved_i(1'b0), .br_taken_i(1'b0),
       .valid_o(valid), .pc_o(pc), .fu_o(fu), .op_o(op),
       .rd_o(rd), .rs1_o(rs1), .rs2_o(rs2), .imm_o(imm), .use_imm_o(),
       .is_branch_o(is_branch), .is_jump_o(is_jump), .branch_target_o(btgt),
