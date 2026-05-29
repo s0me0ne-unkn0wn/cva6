@@ -54,6 +54,7 @@ ${CVA6_REPO_DIR}/core/include/instr_tracer_pkg.sv
 ${CVA6_REPO_DIR}/core/include/build_config_pkg.sv
 // aes_pkg.sv removed (ZKN=0)
 ${CVA6_REPO_DIR}/core/include/triggers_pkg.sv
+${CVA6_REPO_DIR}/core/include/polkavm_pkg.sv
 
 // CVXIF removed (CvxifEn=0)
 
@@ -92,6 +93,9 @@ ${CVA6_REPO_DIR}/core/csr_buffer.sv
 ${CVA6_REPO_DIR}/core/csr_regfile.sv
 ${CVA6_REPO_DIR}/core/trigger_module.sv
 ${CVA6_REPO_DIR}/core/decoder.sv
+${CVA6_REPO_DIR}/core/pvm_decoder.sv
+${CVA6_REPO_DIR}/core/frontend/pvm_fetch.sv
+${CVA6_REPO_DIR}/core/frontend/pvm_front.sv
 ${CVA6_REPO_DIR}/core/ex_stage.sv
 ${CVA6_REPO_DIR}/core/instr_realign.sv
 ${CVA6_REPO_DIR}/core/id_stage.sv

@@ -186,6 +186,8 @@ module csr_regfile
     output rvfi_probes_csr_t rvfi_csr_o,
     //jvt output
     output jvt_t jvt_o,
+    output logic [CVA6Cfg.XLEN-1:0] pvm_cfg0_o,
+    output logic [CVA6Cfg.XLEN-1:0] pvm_cfg1_o,
     // trigger module signals
     output logic debug_from_trigger_o,
     input logic [CVA6Cfg.VLEN-1:0] vaddr_from_lsu_i,
@@ -237,6 +239,8 @@ module csr_regfile
   logic [CVA6Cfg.XLEN-1:0] mie_q, mie_d;
   logic [CVA6Cfg.XLEN-1:0] mcounteren_q, mcounteren_d;
   logic [CVA6Cfg.XLEN-1:0] mscratch_q, mscratch_d;
+  logic [CVA6Cfg.XLEN-1:0] pvm_cfg0_q, pvm_cfg0_d;  // PolkaVM control CSR 0
+  logic [CVA6Cfg.XLEN-1:0] pvm_cfg1_q, pvm_cfg1_d;  // PolkaVM control CSR 1
   logic [CVA6Cfg.XLEN-1:0] mepc_q, mepc_d;
   logic [CVA6Cfg.XLEN-1:0] mcause_q, mcause_d;
   logic [CVA6Cfg.XLEN-1:0] mtval_q, mtval_d;
@@ -435,6 +439,8 @@ module csr_regfile
         if (CVA6Cfg.RVU) csr_rdata = mcounteren_q;
         else read_access_exception = 1'b1;
         riscv::CSR_MSCRATCH: csr_rdata = mscratch_q;
+        riscv::CSR_PVM_CFG0: csr_rdata = pvm_cfg0_q;
+        riscv::CSR_PVM_CFG1: csr_rdata = pvm_cfg1_q;
         riscv::CSR_MEPC: csr_rdata = mepc_q;
         riscv::CSR_MCAUSE: csr_rdata = mcause_q;
         riscv::CSR_MTVAL:
@@ -839,6 +845,8 @@ module csr_regfile
     mcause_d     = mcause_q;
     mcounteren_d = mcounteren_q;
     mscratch_d   = mscratch_q;
+    pvm_cfg0_d   = pvm_cfg0_q;
+    pvm_cfg1_d   = pvm_cfg1_q;
     if (CVA6Cfg.TvalEn) mtval_d = mtval_q;
 
     fiom_d     = fiom_q;
@@ -1154,6 +1162,8 @@ module csr_regfile
         end
 
         riscv::CSR_MSCRATCH: mscratch_d = csr_wdata;
+        riscv::CSR_PVM_CFG0: pvm_cfg0_d = csr_wdata;
+        riscv::CSR_PVM_CFG1: pvm_cfg1_d = csr_wdata;
         riscv::CSR_MEPC: mepc_d = {csr_wdata[CVA6Cfg.XLEN-1:1], 1'b0};
         riscv::CSR_MCAUSE: mcause_d = csr_wdata;
         riscv::CSR_MTVAL: begin
@@ -1964,6 +1974,8 @@ module csr_regfile
       mcause_q         <= {CVA6Cfg.XLEN{1'b0}};
       mcounteren_q     <= {CVA6Cfg.XLEN{1'b0}};
       mscratch_q       <= {CVA6Cfg.XLEN{1'b0}};
+      pvm_cfg0_q       <= {CVA6Cfg.XLEN{1'b0}};
+      pvm_cfg1_q       <= {CVA6Cfg.XLEN{1'b0}};
       if (CVA6Cfg.TvalEn) mtval_q <= {CVA6Cfg.XLEN{1'b0}};
       fiom_q          <= '0;
       dcache_q        <= {{CVA6Cfg.XLEN - 1{1'b0}}, 1'b1};
@@ -2024,6 +2036,8 @@ module csr_regfile
       mcause_q         <= mcause_d;
       mcounteren_q     <= mcounteren_d;
       mscratch_q       <= mscratch_d;
+      pvm_cfg0_q       <= pvm_cfg0_d;
+      pvm_cfg1_q       <= pvm_cfg1_d;
       if (CVA6Cfg.TvalEn) mtval_q <= mtval_d;
       fiom_q          <= fiom_d;
       dcache_q        <= dcache_d;
@@ -2184,6 +2198,8 @@ module csr_regfile
   assign rvfi_csr_o.mtvec_q = mtvec_q;
   assign rvfi_csr_o.mcounteren_q = mcounteren_q;
   assign rvfi_csr_o.mscratch_q = mscratch_q;
+  assign pvm_cfg0_o = pvm_cfg0_q;
+  assign pvm_cfg1_o = pvm_cfg1_q;
   assign rvfi_csr_o.mepc_q = mepc_q;
   assign rvfi_csr_o.mcause_q = mcause_q;
   assign rvfi_csr_o.mtval_q = CVA6Cfg.TvalEn ? mtval_q : '0;

@@ -101,6 +101,7 @@ package build_config_pkg;
     cfg.EnableAccelerator = bit'(EnableAccelerator);
     cfg.PerfCounterEn = CVA6Cfg.PerfCounterEn;
     cfg.MmuPresent = CVA6Cfg.MmuPresent;
+    cfg.PvmPresent = CVA6Cfg.PvmPresent;
     cfg.RVS = CVA6Cfg.RVS;
     cfg.RVU = CVA6Cfg.RVU;
     cfg.SoftwareInterruptEn = CVA6Cfg.SoftwareInterruptEn;

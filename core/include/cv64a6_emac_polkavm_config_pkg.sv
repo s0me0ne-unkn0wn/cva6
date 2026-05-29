@@ -75,6 +75,8 @@ package cva6_config_pkg;
 
   localparam CVA6ConfigMmuPresent = 1;
 
+  localparam CVA6ConfigPvmPresent = 1;
+
   localparam CVA6ConfigRvfiTrace = 1;
 
   localparam config_pkg::cva6_user_cfg_t cva6_cfg = '{
@@ -118,6 +120,7 @@ package cva6_config_pkg;
       NrScoreboardEntries: unsigned'(CVA6ConfigNrScoreboardEntries),
       PerfCounterEn: bit'(CVA6ConfigPerfCounterEn),
       MmuPresent: bit'(CVA6ConfigMmuPresent),
+      PvmPresent: bit'(CVA6ConfigPvmPresent),
       RVS: bit'(1),
       RVU: bit'(1),
       SoftwareInterruptEn: bit'(1),

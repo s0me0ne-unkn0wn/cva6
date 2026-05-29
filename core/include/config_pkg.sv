@@ -110,6 +110,8 @@ package config_pkg;
     bit                          PerfCounterEn;
     // MMU
     bit                          MmuPresent;
+    // PolkaVM hardware front-end present (JAM v1 fetch+decode)
+    bit                          PvmPresent;
     // Supervisor mode
     bit                          RVS;
     // User mode
@@ -340,6 +342,7 @@ package config_pkg;
     bit          EnableAccelerator;
     bit          PerfCounterEn;
     bit          MmuPresent;
+    bit          PvmPresent;           //PolkaVM hardware front-end
     bit          RVS;                  //Supervisor mode
     bit          RVU;                  //User mode
     bit          SoftwareInterruptEn;

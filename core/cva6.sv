@@ -429,6 +429,154 @@ module cva6
   logic [CVA6Cfg.NrIssuePorts-1:0] issue_instr_issue_id;
 
   // --------------
+  // PVM front-half (PolkaVM JAM v1) muxed into ISSUE  [Stage 3]
+  // --------------
+  // Signals actually driven to the issue stage (RISC-V id_stage vs PVM front).
+  scoreboard_entry_t [CVA6Cfg.NrIssuePorts-1:0] issue_entry_to_issue;
+  logic [CVA6Cfg.NrIssuePorts-1:0] issue_entry_valid_to_issue;
+  logic [CVA6Cfg.NrIssuePorts-1:0] is_ctrl_flow_to_issue;
+  logic [CVA6Cfg.NrIssuePorts-1:0] issue_instr_ack_to_id;
+  // PVM control. TODO Stage 3.2: drive from a control CSR set by the M-mode loader
+  // + route the loader's image stores to the img write port. Tied off for now so
+  // the RISC-V path is unchanged (pvm_active=0 -> mux selects id_stage).
+  logic                    pvm_active;
+  logic [CVA6Cfg.VLEN-1:0] pvm_entry_pc, pvm_code_len, pvm_code_base, pvm_bitmask_base;
+  logic                    pvm_img_we;
+  logic [CVA6Cfg.VLEN-1:0] pvm_img_addr;
+  logic [7:0]              pvm_img_wdata;
+  // PVM front raw decoded micro-op
+  logic                    pvm_valid, pvm_is_branch, pvm_is_jump, pvm_is_hostcall;
+  logic                    pvm_is_trap, pvm_illegal, pvm_unsupported, pvm_halted, pvm_use_imm;
+  logic [CVA6Cfg.VLEN-1:0] pvm_pc, pvm_btgt;
+  logic                    pvm_resume;
+  fu_t                     pvm_fu;
+  fu_op                    pvm_op;
+  logic [4:0]              pvm_rd, pvm_rs1, pvm_rs2;
+  logic [63:0]             pvm_imm, pvm_hcid;
+  scoreboard_entry_t       pvm_sbe;
+  logic [CVA6Cfg.XLEN-1:0] pvm_cfg0_csr, pvm_cfg1_csr;  // from control CSRs (csr_regfile)
+
+  // Control from M-mode CSRs: PVMCFG0[31:0]=entry_pc, [63:32]=code_base;
+  // PVMCFG1[31:0]=code_len, [32]=pvm_active. Bitmask follows code, 16-aligned.
+  // pvm_active enter/exit FSM: set on the CSR-request rising edge, cleared by HW
+  // on a PVM exception commit (trap/ecalli/illegal) so the M-mode trap handler
+  // runs as RISC-V (not as PVM uops). The combinational ~ex_commit.valid gate
+  // deselects PVM in the same cycle the exception commits.
+  logic pvm_active_q, pvm_req_q, pvm_req;
+  assign pvm_req = CVA6Cfg.PvmPresent & pvm_cfg1_csr[32];
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      pvm_active_q <= 1'b0;
+      pvm_req_q    <= 1'b0;
+    end else begin
+      pvm_req_q <= pvm_req;
+      if (pvm_req & ~pvm_req_q)                 pvm_active_q <= 1'b1;
+      else if (pvm_active_q & ex_commit.valid)  pvm_active_q <= 1'b0;
+    end
+  end
+  assign pvm_active    = pvm_active_q & ~ex_commit.valid;
+  // PVMCFG1[33] = resume: set by the M-mode host-call handler so the re-activation
+  // continues at the post-ecalli pc held in pvm_fetch (instead of reloading entry_pc).
+  assign pvm_resume    = CVA6Cfg.PvmPresent & pvm_cfg1_csr[33];
+  assign pvm_entry_pc  = {{(CVA6Cfg.VLEN-32){1'b0}}, pvm_cfg0_csr[31:0]};
+  assign pvm_code_base = {{(CVA6Cfg.VLEN-32){1'b0}}, pvm_cfg0_csr[63:32]};
+  assign pvm_code_len  = {{(CVA6Cfg.VLEN-32){1'b0}}, pvm_cfg1_csr[31:0]};
+  assign pvm_bitmask_base = pvm_code_base +
+      {{(CVA6Cfg.VLEN-32){1'b0}}, ((pvm_cfg1_csr[31:0] + 32'd15) & ~32'd15)};
+  assign pvm_img_we       = 1'b0;
+  assign pvm_img_addr     = '0;
+  assign pvm_img_wdata    = '0;
+
+  if (CVA6Cfg.PvmPresent) begin : gen_pvm_front
+    pvm_front #(.VLEN(CVA6Cfg.VLEN)) i_pvm_front (
+        .clk_i,
+        .rst_ni,
+        .pvm_active_i   (pvm_active),
+        .resume_i       (pvm_resume),
+        .entry_pc_i     (pvm_entry_pc),
+        .code_len_i     (pvm_code_len),
+        .code_base_i    (pvm_code_base),
+        .bitmask_base_i (pvm_bitmask_base),
+        .img_we_i       (pvm_img_we),
+        .img_addr_i     (pvm_img_addr),
+        .img_wdata_i    (pvm_img_wdata),
+        .issue_ack_i    (pvm_active & issue_instr_issue_id[0]),
+        .valid_o        (pvm_valid),
+        .pc_o           (pvm_pc),
+        .fu_o           (pvm_fu),
+        .op_o           (pvm_op),
+        .rd_o           (pvm_rd),
+        .rs1_o          (pvm_rs1),
+        .rs2_o          (pvm_rs2),
+        .imm_o          (pvm_imm),
+        .use_imm_o      (pvm_use_imm),
+        .is_branch_o    (pvm_is_branch),
+        .is_jump_o      (pvm_is_jump),
+        .branch_target_o(pvm_btgt),
+        .is_hostcall_o  (pvm_is_hostcall),
+        .hostcall_id_o  (pvm_hcid),
+        .is_trap_o      (pvm_is_trap),
+        .illegal_o      (pvm_illegal),
+        .unsupported_o  (pvm_unsupported),
+        .halted_o       (pvm_halted)
+    );
+  end else begin : gen_no_pvm_front
+    assign pvm_valid = 1'b0;
+    assign pvm_pc = '0;
+    assign pvm_fu = NONE;
+    assign pvm_op = ADD;
+    assign pvm_rd = '0;
+    assign pvm_rs1 = '0;
+    assign pvm_rs2 = '0;
+    assign pvm_imm = '0;
+    assign pvm_use_imm = 1'b0;
+    assign pvm_is_branch = 1'b0;
+    assign pvm_is_jump = 1'b0;
+    assign pvm_btgt = '0;
+    assign pvm_is_hostcall = 1'b0;
+    assign pvm_hcid = '0;
+    assign pvm_is_trap = 1'b0;
+    assign pvm_illegal = 1'b0;
+    assign pvm_unsupported = 1'b0;
+    assign pvm_halted = 1'b0;
+  end
+
+  // Adapter: PVM raw micro-op -> scoreboard_entry_t
+  always_comb begin
+    pvm_sbe          = '0;
+    pvm_sbe.pc       = pvm_pc;
+    pvm_sbe.fu       = pvm_fu;
+    pvm_sbe.op       = pvm_op;
+    pvm_sbe.rs1      = pvm_rs1[REG_ADDR_SIZE-1:0];
+    pvm_sbe.rs2      = pvm_rs2[REG_ADDR_SIZE-1:0];
+    pvm_sbe.rd       = pvm_rd[REG_ADDR_SIZE-1:0];
+    pvm_sbe.result   = pvm_imm[CVA6Cfg.XLEN-1:0];
+    pvm_sbe.use_imm  = pvm_use_imm;
+    // result is "valid"(done) at issue ONLY for exceptions (trap/ecalli/illegal);
+    // normal ALU/LOAD/STORE uops are marked done by their FU writeback (matches
+    // decoder: instruction_o.valid = ex.valid). Setting this 1 unconditionally made
+    // the scoreboard commit stores before the store_unit pushed -> spec-buffer underflow.
+    pvm_sbe.valid    = pvm_is_trap | pvm_illegal | pvm_unsupported | pvm_is_hostcall;
+    // trap/illegal/host-call -> exception to M-mode (TODO Stage 3.2: refine cause/tval)
+    pvm_sbe.ex.valid = pvm_is_trap | pvm_illegal | pvm_unsupported | pvm_is_hostcall;
+    pvm_sbe.ex.cause = pvm_is_hostcall ? riscv::ENV_CALL_MMODE : riscv::ILLEGAL_INSTR;
+  end
+
+  // Mux PVM vs RISC-V into the issue stage (port 0 carries PVM uops).
+  always_comb begin
+    issue_entry_to_issue       = issue_entry_id_issue;
+    issue_entry_valid_to_issue = issue_entry_valid_id_issue;
+    is_ctrl_flow_to_issue      = is_ctrl_fow_id_issue;
+    issue_instr_ack_to_id      = issue_instr_issue_id;
+    if (CVA6Cfg.PvmPresent && pvm_active) begin
+      issue_entry_to_issue[0]       = pvm_sbe;
+      issue_entry_valid_to_issue[0] = pvm_valid;
+      is_ctrl_flow_to_issue[0]      = pvm_is_branch;  // jumps are front-resolved NOPs
+      issue_instr_ack_to_id         = '0;  // id_stage stalls while PVM owns issue
+    end
+  end
+
+  // --------------
   // ISSUE <-> EX
   // --------------
   logic [CVA6Cfg.NrIssuePorts-1:0][CVA6Cfg.VLEN-1:0] rs1_forwarding_id_ex;  // unregistered version of fu_data_o.operanda
@@ -741,7 +889,7 @@ module cva6
       .orig_instr_o       (orig_instr_id_issue),
       .issue_entry_valid_o(issue_entry_valid_id_issue),
       .is_ctrl_flow_o     (is_ctrl_fow_id_issue),
-      .issue_instr_ack_i  (issue_instr_issue_id),
+      .issue_instr_ack_i  (issue_instr_ack_to_id),
 
       .rvfi_is_compressed_o(rvfi_is_compressed),
 
@@ -835,11 +983,11 @@ module cva6
       .flush_i                 (flush_ctrl_id),
       .stall_i                 (stall_acc_id),
       // ID Stage
-      .decoded_instr_i         (issue_entry_id_issue),
+      .decoded_instr_i         (issue_entry_to_issue),
       .decoded_instr_i_prev    (issue_entry_id_issue_prev),
       .orig_instr_i            (orig_instr_id_issue),
-      .decoded_instr_valid_i   (issue_entry_valid_id_issue),
-      .is_ctrl_flow_i          (is_ctrl_fow_id_issue),
+      .decoded_instr_valid_i   (issue_entry_valid_to_issue),
+      .is_ctrl_flow_i          (is_ctrl_flow_to_issue),
       .decoded_instr_ack_o     (issue_instr_issue_id),
       // Functional Units
       .rs1_forwarding_o        (rs1_forwarding_id_ex),
@@ -1208,6 +1356,8 @@ module cva6
       .scbcfe_o                (scbcfe),
       .hcbcfe_o                (hcbcfe),
       .jvt_o                   (jvt),
+      .pvm_cfg0_o              (pvm_cfg0_csr),
+      .pvm_cfg1_o              (pvm_cfg1_csr),
       //RVFI
       .rvfi_csr_o              (rvfi_csr),
       // Trigger Signals
