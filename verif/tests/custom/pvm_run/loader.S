@@ -13,8 +13,15 @@
 
 #define CSR_PVM_CFG0 0xbc0
 #define CSR_PVM_CFG1 0xbc1
+#define CSR_PVM_CFG2 0xbc2
 #ifndef CODE_LEN
 #define CODE_LEN 4
+#endif
+#ifndef JT_BASE
+#define JT_BASE 0          /* dynamic jump-table base (bytes); 0 = none */
+#endif
+#ifndef JT_Z
+#define JT_Z 1             /* jump-table entry size in bytes */
 #endif
 
     .section .text.init,"ax",@progbits
@@ -26,6 +33,17 @@ _start:
 
     # PVMCFG0 = (code_base<<32) | entry_pc = 0
     csrw CSR_PVM_CFG0, x0
+
+    # PVMCFG2 = (jumptable_z<<32) | jumptable_base  (for dynamic jumps via the jump
+    # table). Only written when a jump table is present (JT_BASE != 0): the extra
+    # startup CSR write perturbs pipeline timing enough to expose a race between the
+    # M-mode handler's in-flight control flow and PVM re-entry on back-to-back ecalli
+    # resumes (see logs/04-pvm-in-hw "djump CFG2 timing race"). Programs that do djump
+    # set JT_BASE; the ecalli/branch/loop tests don't need it.
+#if (JT_BASE)
+    li   t0, ((JT_Z) << 32) | (JT_BASE)
+    csrw CSR_PVM_CFG2, t0
+#endif
 
     # PVMCFG1 = (pvm_active<<32) | code_len ; active=bit32, code_len=4
     li   t0, (1 << 32) | CODE_LEN

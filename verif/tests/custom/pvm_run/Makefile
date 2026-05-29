@@ -76,7 +76,27 @@ run-loop: loader.S link.ld gen_pvm_img.py
 	 OUT=$$($(HARNESS) +PVM_IMG=$(abspath loop.hex) +tohost_addr=$(TOHOST) +time_out=400000 $(abspath loader_loop.elf) 2>&1); \
 	 echo "$$OUT" | grep -aE 'SUCCESS'; echo "   '#' count = $$(echo "$$OUT" | grep -ao '#' | wc -l)"
 
-clean:
-	rm -f loader.elf loader_jump.elf loader_banner.elf loader_ecalli.elf loader_br.elf loader_loop.elf loader_hi.elf baseline.elf banner.hex ecalli.hex hi_banner.hex br_taken.hex br_nottaken.hex loop.hex
+# Stage 3.3b: dynamic jump (jump_ind) -> djump. Halt variant: jump_ind to the r0
+# halt magic (0xFFFF0000) -> clean halt -> synthetic trap -> M-mode SUCCESS.
+run-djump-halt: loader.S link.ld gen_pvm_img.py
+	@CL=$$(python3 gen_pvm_img.py '' djhalt.hex djump_halt | grep CODE_LEN | grep -oE '[0-9]+'); \
+	 $(CC) $(CFLAGS) -DCODE_LEN=$$CL -T link.ld -o loader_djhalt.elf loader.S; \
+	 echo ">> jump_ind -> r0 halt magic:"; \
+	 $(HARNESS) +PVM_IMG=$(abspath djhalt.hex) +tohost_addr=$(TOHOST) +time_out=200000 $(abspath loader_djhalt.elf) 2>&1 | grep -aE 'SUCCESS'
 
-.PHONY: all run run-jump run-banner run-ecalli run-branch run-loop clean
+# Stage 3.3b: dynamic jump through the jump table. jump_ind r2 (a=2) -> j[0]=TARGET;
+# prints 'J' then traps. CFG2 (JT_BASE/JT_Z) comes from the generator's report.
+run-djump-table: loader.S link.ld gen_pvm_img.py
+	@G=$$(python3 gen_pvm_img.py '' djtab.hex djump_table); \
+	 CL=$$(echo "$$G" | grep CODE_LEN | grep -oE '[0-9]+'); \
+	 JB=$$(echo "$$G" | grep JT_BASE | grep -oE '[0-9]+'); \
+	 JZ=$$(echo "$$G" | grep JT_Z | grep -oE '[0-9]+'); \
+	 echo ">> CODE_LEN=$$CL JT_BASE=$$JB JT_Z=$$JZ"; \
+	 $(CC) $(CFLAGS) -DCODE_LEN=$$CL -DJT_BASE=$$JB -DJT_Z=$$JZ -T link.ld -o loader_djtab.elf loader.S; \
+	 echo ">> jump_ind through jump table (expect J):"; \
+	 $(HARNESS) +PVM_IMG=$(abspath djtab.hex) +tohost_addr=$(TOHOST) +time_out=200000 $(abspath loader_djtab.elf) | grep -aE 'SUCCESS|^J'
+
+clean:
+	rm -f loader.elf loader_jump.elf loader_banner.elf loader_ecalli.elf loader_br.elf loader_loop.elf loader_djhalt.elf loader_djtab.elf loader_hi.elf baseline.elf banner.hex ecalli.hex hi_banner.hex br_taken.hex br_nottaken.hex loop.hex djhalt.hex djtab.hex
+
+.PHONY: all run run-jump run-banner run-ecalli run-branch run-loop run-djump-halt run-djump-table clean

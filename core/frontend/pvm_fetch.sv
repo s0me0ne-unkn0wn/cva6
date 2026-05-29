@@ -42,6 +42,13 @@ module pvm_fetch
     input  logic            branch_i,     // current instr is a conditional branch
     input  logic            br_resolved_i,// backend resolved the pending branch (pulse)
     input  logic            br_taken_i,   // resolved outcome (1 = taken)
+    // dynamic indirect jump (jump_ind): suspend, resolve a = reg+imm in the backend,
+    // then djump (jump-table target / r0 halt magic).
+    input  logic            djump_i,      // current instr is a dynamic jump
+    input  logic [VLEN-1:0] br_target_i,  // backend-resolved address a (= reg_A + imm_X)
+    input  logic [VLEN-1:0] djump_target_i,// jump-table target for a (computed by pvm_front)
+    input  logic            djump_halt_i, // a is the r0 halt magic (2^32 - 2^16)
+    output logic            done_o,       // PVM run finished cleanly (djump-halt / off-the-end)
     // same-cycle front redirect for unconditional jumps (target known at decode)
     input  logic            redirect_valid_i,
     input  logic [VLEN-1:0] redirect_pc_i,
@@ -64,6 +71,8 @@ module pvm_fetch
   logic [VLEN-1:0] pc_q;
   logic            running_q;
   logic            branch_pending_q;  // suspended at a conditional branch, awaiting resolution
+  logic            djump_pending_q;   // suspended at a dynamic jump, awaiting resolution
+  logic            done_q;            // PVM run terminated cleanly (djump-halt / off-the-end)
 
   // ---- combinational skip encoder (LSB-first, append-1s past code_len) ------
   logic [4:0] skip_c;
@@ -93,12 +102,16 @@ module pvm_fetch
       pc_q             <= '0;
       running_q        <= 1'b0;
       branch_pending_q <= 1'b0;
+      djump_pending_q  <= 1'b0;
+      done_q           <= 1'b0;
     end else if (start_i) begin
       // Fresh start loads entry_pc; a host-call resume keeps the suspended pc_q
       // (which already points at the instruction after the ecalli).
       if (!resume_i) pc_q <= entry_pc_i;
       running_q        <= 1'b1;
       branch_pending_q <= 1'b0;
+      djump_pending_q  <= 1'b0;
+      done_q           <= 1'b0;
     end else if (branch_pending_q) begin
       // Suspended after a conditional branch: wait for the backend branch_unit to
       // resolve it, then redirect to the taken target (decode-time redirect_pc_i,
@@ -108,16 +121,30 @@ module pvm_fetch
         running_q        <= 1'b1;
         branch_pending_q <= 1'b0;
       end
+    end else if (djump_pending_q) begin
+      // Suspended at a dynamic jump: the backend gave a = reg_A + imm_X; pvm_front
+      // turned it into either the r0 halt magic (clean termination) or a jump-table
+      // target (continue there).
+      if (br_resolved_i) begin
+        djump_pending_q <= 1'b0;
+        if (djump_halt_i) done_q <= 1'b1;
+        else begin pc_q <= djump_target_i; running_q <= 1'b1; end
+      end
     end else if (running_q && next_ready_i) begin
       // Unconditional jump: redirect to the decode-time target (overrides the
       // terminator-halt, since `jump` is itself a basic-block terminator).
       if (redirect_valid_i) pc_q <= redirect_pc_i;
       // Conditional branch: suspend (no speculation) until the backend resolves it.
       else if (branch_i) begin running_q <= 1'b0; branch_pending_q <= 1'b1; end
+      // Dynamic jump (jump_ind): suspend until the backend resolves a = reg+imm.
+      else if (djump_i) begin running_q <= 1'b0; djump_pending_q <= 1'b1; end
       // Host-call (ecalli): advance to the next pc, then suspend so the M-mode
       // handler runs; on resume pvm_fetch continues from this saved next pc.
       else if (halt_i) begin pc_q <= next_pc_c; running_q <= 1'b0; end
-      else if (terminator_c || (next_pc_c >= code_len_i)) running_q <= 1'b0;
+      // trap (opcode 0) exits via its own exception uop; just stop fetching.
+      else if (terminator_c) running_q <= 1'b0;
+      // Off the end of the code with no explicit trap: clean halt -> synthetic trap.
+      else if (next_pc_c >= code_len_i) begin running_q <= 1'b0; done_q <= 1'b1; end
       else pc_q <= next_pc_c;
     end
   end
@@ -131,5 +158,6 @@ module pvm_fetch
   assign skip_o         = skip_c;
   assign next_pc_o      = next_pc_c;
   assign terminator_o   = terminator_c;
+  assign done_o         = done_q;
 
 endmodule

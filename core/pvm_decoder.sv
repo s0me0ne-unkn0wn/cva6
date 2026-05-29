@@ -42,7 +42,8 @@ module pvm_decoder
     output logic [63:0]     imm_o,           // immediate / store data / target imm
     output logic            use_imm_o,       // operand B is the immediate
     output logic            is_branch_o,     // conditional branch (cond in op_o)
-    output logic            is_jump_o,       // unconditional / indirect jump
+    output logic            is_jump_o,       // unconditional jump (target known at decode)
+    output logic            is_djump_o,      // dynamic indirect jump (jump_ind): djump(reg+imm)
     output logic [VLEN-1:0] branch_target_o, // PVM instruction-counter target
     output logic            is_hostcall_o,   // ecalli
     output logic [63:0]     hostcall_id_o,
@@ -89,6 +90,7 @@ module pvm_decoder
     use_imm_o       = 1'b0;
     is_branch_o     = 1'b0;
     is_jump_o       = 1'b0;
+    is_djump_o      = 1'b0;
     branch_target_o = '0;
     is_hostcall_o   = 1'b0;
     hostcall_id_o   = 64'd0;
@@ -140,8 +142,11 @@ module pvm_decoder
         endcase
       end
       PVM_OP_JUMP_IND: begin
+        // Dynamic jump: the backend branch_unit (JALR) computes a = reg_A + imm_X;
+        // pvm_fetch suspends (is_djump) and resolves it through djump (jump table
+        // or the r0 halt magic). NOT a decode-time (is_jump) target.
         fu_o = CTRL_FLOW; op_o = JALR; rs1_o = g_lo; imm_o = imm_ri;
-        use_imm_o = 1'b1; is_jump_o = 1'b1;
+        use_imm_o = 1'b1; is_djump_o = 1'b1;
       end
 
       // ---- 2reg + imm: indirect loads/stores + reg-imm arithmetic ----

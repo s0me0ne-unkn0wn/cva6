@@ -32,7 +32,7 @@ module pvm_fetch_decode_tb;
   fu_op            d_op;
   logic [4:0]      d_rd, d_rs1, d_rs2;
   logic [63:0]     d_imm;
-  logic            d_use_imm, d_is_branch, d_is_jump;
+  logic            d_use_imm, d_is_branch, d_is_jump, d_is_djump;
   logic [VLEN-1:0] d_btgt;
   logic            d_hostcall;
   logic [63:0]     d_hcid;
@@ -46,6 +46,7 @@ module pvm_fetch_decode_tb;
       .clk_i(clk), .rst_ni(rst_n), .start_i(start), .resume_i(1'b0), .entry_pc_i(entry_pc),
       .code_len_i(code_len), .next_ready_i(next_ready), .halt_i(1'b0),
       .branch_i(1'b0), .br_resolved_i(1'b0), .br_taken_i(1'b0),
+      .djump_i(1'b0), .br_target_i('0), .djump_target_i('0), .djump_halt_i(1'b0), .done_o(),
       .redirect_valid_i(1'b0), .redirect_pc_i('0),
       .code_window_i(code_window), .bm_window_i(bm_window),
       .valid_o(f_valid), .pc_o(f_pc), .code_addr_o(f_code_addr), .opcode_o(f_opcode),
@@ -55,7 +56,7 @@ module pvm_fetch_decode_tb;
   pvm_decoder #(.VLEN(VLEN)) i_dec (
       .opcode_i(f_opcode), .instr_window_i(f_window), .pc_i(f_pc), .skip_i(f_skip),
       .fu_o(d_fu), .op_o(d_op), .rd_o(d_rd), .rs1_o(d_rs1), .rs2_o(d_rs2),
-      .imm_o(d_imm), .use_imm_o(d_use_imm), .is_branch_o(d_is_branch), .is_jump_o(d_is_jump),
+      .imm_o(d_imm), .use_imm_o(d_use_imm), .is_branch_o(d_is_branch), .is_jump_o(d_is_jump), .is_djump_o(d_is_djump),
       .branch_target_o(d_btgt), .is_hostcall_o(d_hostcall), .hostcall_id_o(d_hcid),
       .is_trap_o(d_trap), .illegal_o(d_illegal), .unsupported_o(d_unsupported)
   );
@@ -87,14 +88,16 @@ module pvm_fetch_decode_tb;
   fu_op o_op  [0:N-1];
   logic o_host[0:N-1];
   logic o_jump[0:N-1];
+  logic o_djump[0:N-1];
 
   always @(posedge clk) begin
     if (sample_en && f_valid && n_obs < N) begin
-      o_fu[n_obs]   = d_fu;
-      o_op[n_obs]   = d_op;
-      o_host[n_obs] = d_hostcall;
-      o_jump[n_obs] = d_is_jump;
-      n_obs         = n_obs + 1;
+      o_fu[n_obs]    = d_fu;
+      o_op[n_obs]    = d_op;
+      o_host[n_obs]  = d_hostcall;
+      o_jump[n_obs]  = d_is_jump;
+      o_djump[n_obs] = d_is_djump;
+      n_obs          = n_obs + 1;
     end
   end
 
@@ -136,8 +139,9 @@ module pvm_fetch_decode_tb;
     end
     // ecalli at index 4
     if (n_obs > 4 && o_host[4] !== 1'b1) begin errors++; $display("FAIL instr4: ecalli hostcall not set"); end
-    // jump_ind at index 9
-    if (n_obs > 9 && o_jump[9] !== 1'b1) begin errors++; $display("FAIL instr9: jump_ind is_jump not set"); end
+    // jump_ind at index 9 is a dynamic jump (is_djump, NOT the decode-time is_jump)
+    if (n_obs > 9 && o_djump[9] !== 1'b1) begin errors++; $display("FAIL instr9: jump_ind is_djump not set"); end
+    if (n_obs > 9 && o_jump[9]  !== 1'b0) begin errors++; $display("FAIL instr9: jump_ind wrongly is_jump"); end
 
     if (errors != 0) begin
       $display("PVM_FETCH_DECODE_TB: %0d CHECK(S) FAILED", errors);

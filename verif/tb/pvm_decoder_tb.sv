@@ -30,7 +30,7 @@ module pvm_decoder_tb;
   fu_op            op_o;
   logic [4:0]      rd_o, rs1_o, rs2_o;
   logic [63:0]     imm_o;
-  logic            use_imm_o, is_branch_o, is_jump_o;
+  logic            use_imm_o, is_branch_o, is_jump_o, is_djump_o;
   logic [VLEN-1:0] branch_target_o;
   logic            is_hostcall_o;
   logic [63:0]     hostcall_id_o;
@@ -44,7 +44,7 @@ module pvm_decoder_tb;
       .pc_i           (pc),
       .skip_i         (skip),
       .fu_o, .op_o, .rd_o, .rs1_o, .rs2_o, .imm_o, .use_imm_o,
-      .is_branch_o, .is_jump_o, .branch_target_o,
+      .is_branch_o, .is_jump_o, .is_djump_o, .branch_target_o,
       .is_hostcall_o, .hostcall_id_o, .is_trap_o, .illegal_o, .unsupported_o
   );
 
@@ -120,9 +120,10 @@ module pvm_decoder_tb;
     check_instr("hw18 load_i32",18, 1, LOAD, LW, 6, 2, 0, 64'd0, 1'b1);
     // pc=20: add_imm_32 sp,sp,8  rd=2 rs1=2 imm=8
     check_instr("hw20 add_imm32",20, 2, ALU, ADDW, 2, 2, 0, 64'd8, 1'b1);
-    // pc=23: jump_ind ra  rs1=ra(1) imm=0 (checked + is_jump below)
+    // pc=23: jump_ind ra  rs1=ra(1) imm=0 (a dynamic jump -> is_djump, NOT is_jump)
     check_instr("hw23 jump_ind",23, 1, CTRL_FLOW, JALR, 0, 1, 0, 64'd0, 1'b1);
-    chk("hw23 is_jump", is_jump_o === 1'b1);
+    chk("hw23 is_djump", is_djump_o === 1'b1);
+    chk("hw23 not is_jump", is_jump_o === 1'b0);
 
     // ---- hand cases ----
     // trap

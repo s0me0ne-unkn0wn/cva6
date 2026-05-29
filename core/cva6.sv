@@ -449,13 +449,14 @@ module cva6
   logic                    pvm_is_trap, pvm_illegal, pvm_unsupported, pvm_halted, pvm_use_imm;
   logic [CVA6Cfg.VLEN-1:0] pvm_pc, pvm_btgt;
   logic                    pvm_resume;
-  logic                    pvm_br_resolved, pvm_br_taken;
+  logic                    pvm_br_resolved, pvm_br_taken, pvm_done;
+  logic [CVA6Cfg.VLEN-1:0] pvm_br_target;
   fu_t                     pvm_fu;
   fu_op                    pvm_op;
   logic [4:0]              pvm_rd, pvm_rs1, pvm_rs2;
   logic [63:0]             pvm_imm, pvm_hcid;
   scoreboard_entry_t       pvm_sbe;
-  logic [CVA6Cfg.XLEN-1:0] pvm_cfg0_csr, pvm_cfg1_csr;  // from control CSRs (csr_regfile)
+  logic [CVA6Cfg.XLEN-1:0] pvm_cfg0_csr, pvm_cfg1_csr, pvm_cfg2_csr;  // from control CSRs (csr_regfile)
 
   // Control from M-mode CSRs: PVMCFG0[31:0]=entry_pc, [63:32]=code_base;
   // PVMCFG1[31:0]=code_len, [32]=pvm_active. Bitmask follows code, 16-aligned.
@@ -483,6 +484,8 @@ module cva6
   // in flight is the suspended PVM branch, so resolved_branch.valid is its outcome.
   assign pvm_br_resolved = CVA6Cfg.PvmPresent & pvm_active & resolved_branch.valid;
   assign pvm_br_taken    = resolved_branch.is_taken;
+  // For a dynamic jump (JALR), the branch_unit's target_address = reg_A + imm_X = a.
+  assign pvm_br_target   = resolved_branch.target_address;
   assign pvm_entry_pc  = {{(CVA6Cfg.VLEN-32){1'b0}}, pvm_cfg0_csr[31:0]};
   assign pvm_code_base = {{(CVA6Cfg.VLEN-32){1'b0}}, pvm_cfg0_csr[63:32]};
   assign pvm_code_len  = {{(CVA6Cfg.VLEN-32){1'b0}}, pvm_cfg1_csr[31:0]};
@@ -508,6 +511,10 @@ module cva6
         .issue_ack_i    (pvm_active & issue_instr_issue_id[0]),
         .br_resolved_i  (pvm_br_resolved),
         .br_taken_i     (pvm_br_taken),
+        .br_target_i    (pvm_br_target),
+        .jumptable_base_i({{(CVA6Cfg.VLEN-32){1'b0}}, pvm_cfg2_csr[31:0]}),
+        .jumptable_z_i  (pvm_cfg2_csr[35:32]),
+        .done_o         (pvm_done),
         .valid_o        (pvm_valid),
         .pc_o           (pvm_pc),
         .fu_o           (pvm_fu),
@@ -546,26 +553,29 @@ module cva6
     assign pvm_illegal = 1'b0;
     assign pvm_unsupported = 1'b0;
     assign pvm_halted = 1'b0;
+    assign pvm_done = 1'b0;
   end
 
   // Adapter: PVM raw micro-op -> scoreboard_entry_t
   always_comb begin
     pvm_sbe          = '0;
     pvm_sbe.pc       = pvm_pc;
-    pvm_sbe.fu       = pvm_fu;
+    // pvm_done = clean termination (djump-halt / off-the-end): the guest emitted no
+    // `trap`, so synthesise one here (fu=NONE so the exception, not an FU, commits).
+    pvm_sbe.fu       = pvm_done ? NONE : pvm_fu;
     pvm_sbe.op       = pvm_op;
     pvm_sbe.rs1      = pvm_rs1[REG_ADDR_SIZE-1:0];
     pvm_sbe.rs2      = pvm_rs2[REG_ADDR_SIZE-1:0];
     pvm_sbe.rd       = pvm_rd[REG_ADDR_SIZE-1:0];
     pvm_sbe.result   = pvm_imm[CVA6Cfg.XLEN-1:0];
     pvm_sbe.use_imm  = pvm_use_imm;
-    // result is "valid"(done) at issue ONLY for exceptions (trap/ecalli/illegal);
+    // result is "valid"(done) at issue ONLY for exceptions (trap/ecalli/illegal/done);
     // normal ALU/LOAD/STORE uops are marked done by their FU writeback (matches
     // decoder: instruction_o.valid = ex.valid). Setting this 1 unconditionally made
     // the scoreboard commit stores before the store_unit pushed -> spec-buffer underflow.
-    pvm_sbe.valid    = pvm_is_trap | pvm_illegal | pvm_unsupported | pvm_is_hostcall;
-    // trap/illegal/host-call -> exception to M-mode (TODO Stage 3.2: refine cause/tval)
-    pvm_sbe.ex.valid = pvm_is_trap | pvm_illegal | pvm_unsupported | pvm_is_hostcall;
+    pvm_sbe.valid    = pvm_is_trap | pvm_illegal | pvm_unsupported | pvm_is_hostcall | pvm_done;
+    // trap/illegal/host-call/clean-halt -> exception to M-mode
+    pvm_sbe.ex.valid = pvm_is_trap | pvm_illegal | pvm_unsupported | pvm_is_hostcall | pvm_done;
     pvm_sbe.ex.cause = pvm_is_hostcall ? riscv::ENV_CALL_MMODE : riscv::ILLEGAL_INSTR;
   end
 
@@ -1365,6 +1375,7 @@ module cva6
       .jvt_o                   (jvt),
       .pvm_cfg0_o              (pvm_cfg0_csr),
       .pvm_cfg1_o              (pvm_cfg1_csr),
+      .pvm_cfg2_o              (pvm_cfg2_csr),
       //RVFI
       .rvfi_csr_o              (rvfi_csr),
       // Trigger Signals

@@ -158,8 +158,44 @@ def emit_loop_test(n):
     return code, starts
 
 
-def build_image(code, starts):
-    """Pad code to align16 and append the LSB-first opcode bitmask."""
+JUMP_IND = 0x32   # 50: djump((reg_A + imm_X) mod 2^32); arg = reg_A in low nibble, then imm_X
+DJUMP_HALT_ADDR = 0xFFFF0000  # r0 halt magic = 2^32 - 2^16
+
+
+def emit_djump_halt():
+    """jump_ind to the r0 halt magic: load_imm64 r2, 0xFFFF0000 ; jump_ind r2.
+    djump(0xFFFF0000) -> halt -> pvm_front emits a synthetic trap -> M-mode SUCCESS.
+    No jump table needed. Proves the dynamic-jump stall/resolve + clean-halt exit."""
+    code = (
+        [LOAD_IMM_64, 0x02] + le(DJUMP_HALT_ADDR, 8)   # r2 = 0xFFFF0000   @0  (10B)
+        + [JUMP_IND, 0x02]                             # jump_ind r2       @10 (2B)
+    )
+    starts = [0, 10]
+    return code, starts
+
+
+def emit_djump_table():
+    """jump_ind through the jump table: load_imm r2,2 ; jump_ind r2 -> j[0] = TARGET.
+    djump(2): index = 2/2-1 = 0 -> target = jumptable[0]. Prints 'J' then traps.
+    Returns (code, starts, jumptable_bytes, z). The image builder appends the table
+    after the bitmask; CFG2 = jumptable_base | (z<<32)."""
+    code = (
+        [LOAD_IMM, 0x02, 2]            # load_imm r2, 2 (djump addr -> index 0) @0 (3B)
+        + [JUMP_IND, 0x02]             # jump_ind r2                            @3 (2B)
+        + [TRAP]                       # (error catch: djump must skip this)    @5 (1B)
+        + [LOAD_IMM, 0x07, ord('J')]   # TARGET: load_imm r7, 'J'               @6 (3B)
+        + [ECALLI, 0x00]               # ecalli (putchar 'J')                   @9 (2B)
+        + [TRAP]                       # trap                                   @11(1B)
+    )
+    starts = [0, 3, 5, 6, 9, 11]
+    z = 1
+    jumptable = [6]                    # j[0] = TARGET pc (6)
+    return code, starts, jumptable, z
+
+
+def build_image(code, starts, jumptable=None, z=1):
+    """Pad code to align16, append the LSB-first opcode bitmask, then (optionally)
+    the dynamic jump table (z bytes/entry, LE). Returns (img, code_len, bm_off, jt_off)."""
     code_len = len(code)
     bm_off = (code_len + 15) & ~15            # align16(code_len)
     bm_len = (code_len + 7) // 8              # ceil(code_len/8)
@@ -170,7 +206,11 @@ def build_image(code, starts):
     img = list(code)
     img += [0] * (bm_off - code_len)          # pad gap between code and bitmask
     img += bitmask
-    return img, code_len, bm_off
+    jt_off = len(img)
+    if jumptable:
+        for entry in jumptable:
+            img += [(entry >> (8 * i)) & 0xFF for i in range(z)]   # z-byte LE entry
+    return img, code_len, bm_off, jt_off
 
 
 def write_hex(path, img):
@@ -187,6 +227,7 @@ def main():
     # allow \n etc. from the shell-literal default / argv
     text = text.encode().decode("unicode_escape")
 
+    jumptable, z = None, 1
     if mode == "ecalli":
         code, starts = emit_ecalli_banner(text)
     elif mode == "br_taken":
@@ -195,15 +236,22 @@ def main():
         code, starts = emit_branch_test(False)
     elif mode == "loop":
         code, starts = emit_loop_test(int(text) if text.strip().isdigit() else 3)
+    elif mode == "djump_halt":
+        code, starts = emit_djump_halt()
+    elif mode == "djump_table":
+        code, starts, jumptable, z = emit_djump_table()
     else:
         code, starts = emit_banner(text)
-    img, code_len, bm_off = build_image(code, starts)
+    img, code_len, bm_off, jt_off = build_image(code, starts, jumptable, z)
     write_hex(out, img)
 
     print(f"mode      : {mode}")
     print(f"banner    : {text!r}")
     print(f"CODE_LEN  : {code_len}")
     print(f"bitmask@  : 0x{bm_off:x} ({bm_off})")
+    if jumptable:
+        print(f"JT_BASE   : {jt_off}")
+        print(f"JT_Z      : {z}")
     print(f"img bytes : {len(img)}")
     print(f"starts    : {starts}")
     print(f"wrote     : {out}")

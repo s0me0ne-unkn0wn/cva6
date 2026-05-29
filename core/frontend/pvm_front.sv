@@ -32,15 +32,18 @@ module pvm_front
     input  logic [VLEN-1:0] code_len_i,      // |c| in bytes
     input  logic [VLEN-1:0] code_base_i,     // byte offset of code in image mem
     input  logic [VLEN-1:0] bitmask_base_i,  // byte offset of bitmask in image mem
+    input  logic [VLEN-1:0] jumptable_base_i,// byte offset of the dynamic jump table
+    input  logic [3:0]      jumptable_z_i,   // jump-table entry size in bytes (E1(z), 1..8)
     // image memory write port (loader)
     input  logic            img_we_i,
     input  logic [VLEN-1:0] img_addr_i,
     input  logic [7:0]      img_wdata_i,
     // downstream issue handshake
     input  logic            issue_ack_i,     // consumer accepted current uop -> advance
-    // conditional-branch resolution feedback from the backend branch_unit
-    input  logic            br_resolved_i,   // a PVM branch resolved this cycle (pulse)
-    input  logic            br_taken_i,      // resolved branch outcome (1 = taken)
+    // control-flow resolution feedback from the backend branch_unit
+    input  logic            br_resolved_i,   // a PVM branch/jump resolved this cycle (pulse)
+    input  logic            br_taken_i,      // resolved conditional-branch outcome (1 = taken)
+    input  logic [VLEN-1:0] br_target_i,     // resolved address (cond: unused; djump: a=reg+imm)
     // decoded micro-op (raw; scoreboard_entry_t assembled by cva6.sv)
     output logic            valid_o,
     output logic [VLEN-1:0] pc_o,
@@ -59,7 +62,8 @@ module pvm_front
     output logic            is_trap_o,
     output logic            illegal_o,
     output logic            unsupported_o,
-    output logic            halted_o         // PVM run finished (terminator/!valid)
+    output logic            halted_o,        // PVM run finished (terminator/!valid)
+    output logic            done_o           // PVM terminated cleanly (djump-halt / off-the-end)
 );
 
   // ---- image memory --------------------------------------------------------
@@ -118,11 +122,32 @@ module pvm_front
   end
 
   // ---- fetch ----------------------------------------------------------------
-  logic            f_valid, f_term;
+  logic            f_valid, f_term, f_done, f_is_djump;
   logic [VLEN-1:0] f_pc, f_next_pc;
   logic [7:0]      f_opcode;
   logic [127:0]    f_window;
   logic [4:0]      f_skip;
+
+  // ---- dynamic-jump (djump) decode: a = br_target_i (= reg_A + imm_X) ---------
+  // r0 halt magic = 2^32 - 2^16; otherwise target = j[a/Z - 1], Z = 2 (eq.
+  // jumptablealignment). Panic checks (a even, in range, target is a BB start) are
+  // omitted for the trusted-bootloader MVP, like gas metering (decision D3).
+  localparam logic [31:0] DJUMP_HALT = 32'hFFFF0000;
+  logic            djump_halt_c;
+  logic [VLEN-1:0] djump_index, djump_entry, djump_target_c;
+  always_comb begin : p_djump
+    logic [VLEN-1:0] ea;
+    djump_halt_c   = (br_target_i[31:0] == DJUMP_HALT);
+    djump_index    = (br_target_i >> 1) - VLEN'(1);                 // a/Z - 1
+    djump_entry    = jumptable_base_i + djump_index * VLEN'(jumptable_z_i);
+    djump_target_c = '0;
+    ea             = '0;
+    for (int e = 0; e < 8; e++) begin
+      ea = djump_entry + VLEN'(e);
+      if ((e < int'(jumptable_z_i)) && (ea < VLEN'(IMG_BYTES)))
+        djump_target_c[e*8+:8] = img_mem[ea[IMG_AW-1:0]];
+    end
+  end
 
   pvm_fetch #(.VLEN(VLEN)) i_fetch (
       .clk_i, .rst_ni,
@@ -135,6 +160,11 @@ module pvm_front
       .branch_i      (is_branch_o),       // conditional branch: suspend until backend resolves
       .br_resolved_i (br_resolved_i),
       .br_taken_i    (br_taken_i),
+      .djump_i       (f_is_djump),        // jump_ind: suspend, resolve a, then djump
+      .br_target_i   (br_target_i),
+      .djump_target_i(djump_target_c),
+      .djump_halt_i  (djump_halt_c),
+      .done_o        (f_done),
       .redirect_valid_i(is_jump_o),       // unconditional jump -> front redirect
       .redirect_pc_i   (branch_target_o),
       .code_window_i (code_window),
@@ -164,6 +194,7 @@ module pvm_front
       .use_imm_o      (use_imm_o),
       .is_branch_o    (is_branch_o),
       .is_jump_o      (is_jump_o),
+      .is_djump_o     (f_is_djump),
       .branch_target_o(branch_target_o),
       .is_hostcall_o  (is_hostcall_o),
       .hostcall_id_o  (hostcall_id_o),
@@ -173,7 +204,10 @@ module pvm_front
   );
 
   assign pc_o     = f_pc;
-  assign valid_o  = pvm_active_i & f_valid;
-  assign halted_o = pvm_active_i & ~f_valid;
+  // On a clean termination (f_done) present one synthetic uop; cva6 turns it into a
+  // trap exception so the M-mode loader regains control (the guest had no `trap`).
+  assign valid_o  = pvm_active_i & (f_valid | f_done);
+  assign done_o   = pvm_active_i & f_done;
+  assign halted_o = pvm_active_i & ~f_valid & ~f_done;
 
 endmodule
