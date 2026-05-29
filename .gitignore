@@ -1,5 +1,6 @@
 *.swp
 *.swo
+*.traces
 site/*
 *.ucdb
 covhtmlreport/*
@@ -54,6 +55,4 @@ Bender.lock
 !/vendor/riscv/riscv-isa-manual/build/*
 /config/gen_from_riscv_config/hwconfig/linker/link.ld
 /config/gen_from_riscv_config/hwconfig/spike/spike.yaml
-/verif/sim/encaps.traces
-/verif/sim/iti.traces
 /verif/sim/verilator.fst.hier
