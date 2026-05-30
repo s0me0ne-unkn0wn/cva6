@@ -46,7 +46,8 @@ module pvm_fetch_decode_tb;
       .clk_i(clk), .rst_ni(rst_n), .start_i(start), .resume_i(1'b0), .entry_pc_i(entry_pc),
       .code_len_i(code_len), .next_ready_i(next_ready), .halt_i(1'b0),
       .branch_i(1'b0), .br_resolved_i(1'b0), .br_taken_i(1'b0),
-      .djump_i(1'b0), .br_target_i('0), .djump_target_i('0), .djump_halt_i(1'b0), .done_o(),
+      .djump_i(1'b0), .br_target_i('0), .djump_target_i('0), .djump_halt_i(1'b0), .djump_pending_o(),
+      .two_uop_i(1'b0), .phase_o(), .done_o(),
       .redirect_valid_i(1'b0), .redirect_pc_i('0),
       .code_window_i(code_window), .bm_window_i(bm_window),
       .valid_o(f_valid), .pc_o(f_pc), .code_addr_o(f_code_addr), .opcode_o(f_opcode),
@@ -55,6 +56,7 @@ module pvm_fetch_decode_tb;
 
   pvm_decoder #(.VLEN(VLEN)) i_dec (
       .opcode_i(f_opcode), .instr_window_i(f_window), .pc_i(f_pc), .skip_i(f_skip),
+      .phase_i(1'b0), .two_uop_o(),
       .fu_o(d_fu), .op_o(d_op), .rd_o(d_rd), .rs1_o(d_rs1), .rs2_o(d_rs2),
       .imm_o(d_imm), .use_imm_o(d_use_imm), .is_branch_o(d_is_branch), .is_jump_o(d_is_jump), .is_djump_o(d_is_djump),
       .branch_target_o(d_btgt), .is_hostcall_o(d_hostcall), .hostcall_id_o(d_hcid),

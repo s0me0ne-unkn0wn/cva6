@@ -96,7 +96,28 @@ run-djump-table: loader.S link.ld gen_pvm_img.py
 	 echo ">> jump_ind through jump table (expect J):"; \
 	 $(HARNESS) +PVM_IMG=$(abspath djtab.hex) +tohost_addr=$(TOHOST) +time_out=200000 $(abspath loader_djtab.elf) | grep -aE 'SUCCESS|^J'
 
-clean:
-	rm -f loader.elf loader_jump.elf loader_banner.elf loader_ecalli.elf loader_br.elf loader_loop.elf loader_djhalt.elf loader_djtab.elf loader_hi.elf baseline.elf banner.hex ecalli.hex hi_banner.hex br_taken.hex br_nottaken.hex loop.hex djhalt.hex djtab.hex
+# Stage 3.3b: imm-branches (81-90), macro-expanded in the front (load scratch=imm ;
+# branch_reg). branch_eq_imm r1,X,+10: X==7 (taken -> 'T') or X!=7 (not taken -> 'F').
+run-ibranch: loader.S link.ld gen_pvm_img.py
+	@python3 gen_pvm_img.py '' ibr_t.hex  ibr_taken    >/dev/null; \
+	 python3 gen_pvm_img.py '' ibr_nt.hex ibr_nottaken >/dev/null; \
+	 $(CC) $(CFLAGS) -DCODE_LEN=19 -T link.ld -o loader_ibr.elf loader.S; \
+	 echo ">> imm-branch TAKEN (expect T):"; \
+	 $(HARNESS) +PVM_IMG=$(abspath ibr_t.hex)  +tohost_addr=$(TOHOST) +time_out=200000 $(abspath loader_ibr.elf) 2>&1 | grep -aE 'SUCCESS|^T'; \
+	 echo ">> imm-branch NOT-TAKEN (expect F):"; \
+	 $(HARNESS) +PVM_IMG=$(abspath ibr_nt.hex) +tohost_addr=$(TOHOST) +time_out=200000 $(abspath loader_ibr.elf) 2>&1 | grep -aE 'SUCCESS|^F'
 
-.PHONY: all run run-jump run-banner run-ecalli run-branch run-loop run-djump-halt run-djump-table clean
+# Stage 3.3b: load_imm_jump_ind (180) -- macro-expanded (load reg_A) + dynamic jump
+# (reg_B) through the jump table. Prints 'J' then traps.
+run-ldij: loader.S link.ld gen_pvm_img.py
+	@G=$$(python3 gen_pvm_img.py '' ldij.hex ldij); \
+	 CL=$$(echo "$$G"|grep CODE_LEN|grep -oE '[0-9]+'); JB=$$(echo "$$G"|grep JT_BASE|grep -oE '[0-9]+'); JZ=$$(echo "$$G"|grep JT_Z|grep -oE '[0-9]+'); \
+	 echo ">> CODE_LEN=$$CL JT_BASE=$$JB JT_Z=$$JZ"; \
+	 $(CC) $(CFLAGS) -DCODE_LEN=$$CL -DJT_BASE=$$JB -DJT_Z=$$JZ -T link.ld -o loader_ldij.elf loader.S; \
+	 echo ">> load_imm_jump_ind (expect J):"; \
+	 $(HARNESS) +PVM_IMG=$(abspath ldij.hex) +tohost_addr=$(TOHOST) +time_out=200000 $(abspath loader_ldij.elf) 2>&1 | grep -aE 'SUCCESS|^J'
+
+clean:
+	rm -f loader.elf loader_jump.elf loader_banner.elf loader_ecalli.elf loader_br.elf loader_loop.elf loader_djhalt.elf loader_djtab.elf loader_ibr.elf loader_ldij.elf loader_hi.elf baseline.elf banner.hex ecalli.hex hi_banner.hex br_taken.hex br_nottaken.hex loop.hex djhalt.hex djtab.hex ibr_t.hex ibr_nt.hex ldij.hex
+
+.PHONY: all run run-jump run-banner run-ecalli run-branch run-loop run-djump-halt run-djump-table run-ibranch run-ldij clean

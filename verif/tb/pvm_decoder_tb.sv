@@ -43,6 +43,8 @@ module pvm_decoder_tb;
       .instr_window_i (instr_window),
       .pc_i           (pc),
       .skip_i         (skip),
+      .phase_i        (1'b0),
+      .two_uop_o      (),
       .fu_o, .op_o, .rd_o, .rs1_o, .rs2_o, .imm_o, .use_imm_o,
       .is_branch_o, .is_jump_o, .is_djump_o, .branch_target_o,
       .is_hostcall_o, .hostcall_id_o, .is_trap_o, .illegal_o, .unsupported_o

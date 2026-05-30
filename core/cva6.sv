@@ -459,11 +459,15 @@ module cva6
   logic [CVA6Cfg.XLEN-1:0] pvm_cfg0_csr, pvm_cfg1_csr, pvm_cfg2_csr;  // from control CSRs (csr_regfile)
 
   // Control from M-mode CSRs: PVMCFG0[31:0]=entry_pc, [63:32]=code_base;
-  // PVMCFG1[31:0]=code_len, [32]=pvm_active. Bitmask follows code, 16-aligned.
+  // PVMCFG1[31:0]=code_len, [32]=pvm_active, [33]=resume. Bitmask follows code, 16-aligned.
   // pvm_active enter/exit FSM: set on the CSR-request rising edge, cleared by HW
   // on a PVM exception commit (trap/ecalli/illegal) so the M-mode trap handler
   // runs as RISC-V (not as PVM uops). The combinational ~ex_commit.valid gate
-  // deselects PVM in the same cycle the exception commits.
+  // deselects PVM in the same cycle the exception commits. NOTE: this rising-edge
+  // re-entry is fragile under pipeline-timing shifts (see log "djump CFG2 timing
+  // race"); the conditional-CFG2 loader dodge keeps all gates green. A robust
+  // write-pulse re-entry was tried but broke trap-immediately-after-a-PVM-branch
+  // (stuck ex_commit) -- a deeper enter/exit-vs-commit fix is TODO.
   logic pvm_active_q, pvm_req_q, pvm_req;
   assign pvm_req = CVA6Cfg.PvmPresent & pvm_cfg1_csr[32];
   always_ff @(posedge clk_i or negedge rst_ni) begin

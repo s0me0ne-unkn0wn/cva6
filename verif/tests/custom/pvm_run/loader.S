@@ -36,10 +36,12 @@ _start:
 
     # PVMCFG2 = (jumptable_z<<32) | jumptable_base  (for dynamic jumps via the jump
     # table). Only written when a jump table is present (JT_BASE != 0): the extra
-    # startup CSR write perturbs pipeline timing enough to expose a race between the
-    # M-mode handler's in-flight control flow and PVM re-entry on back-to-back ecalli
-    # resumes (see logs/04-pvm-in-hw "djump CFG2 timing race"). Programs that do djump
-    # set JT_BASE; the ecalli/branch/loop tests don't need it.
+    # startup CSR write perturbs pipeline timing and exposes the "djump CFG2 timing
+    # race" (a deep PVM-transition-vs-backend interaction; surface fixes -- write-pulse
+    # re-entry, registered exit, jump-table-read gating, handler spacing -- each only
+    # move the failure between the ecalli-banner and the loop. A robust fix needs a
+    # pipeline-drain/fence on PVM mode transitions; TODO, see log). Programs that djump
+    # set JT_BASE; the ecalli/branch/loop tests don't, so they avoid the shift.
 #if (JT_BASE)
     li   t0, ((JT_Z) << 32) | (JT_BASE)
     csrw CSR_PVM_CFG2, t0
@@ -73,11 +75,13 @@ pvm_trap_handler:
                                  # buffer, ordering this MMIO write one-at-a-time
                                  # (else the WT-dcache coalesces same-addr writes)
     # --- resume the guest after the ecalli -----------------------------------
-    # pvm_fetch already suspended at the post-ecalli pc; re-activate with the
-    # resume bit so it continues there (no entry_pc/next_pc bookkeeping needed).
-    csrw CSR_PVM_CFG1, x0                       # clear -> next write is a rising edge
+    # pvm_fetch already suspended at the post-ecalli pc; re-activate with the resume
+    # bit so it continues there. HW enters on the CFG1 write-commit pulse; the clear
+    # write (CFG1=0, active=0 -> no enter) before the set also spaces the re-entry
+    # from the following control flow, which keeps back-to-back PVM resumes robust.
+    csrw CSR_PVM_CFG1, x0                       # clear (active=0): no-enter pulse, adds spacing
     li   x15, (1 << 33) | (1 << 32) | CODE_LEN  # resume | active | code_len
-    csrw CSR_PVM_CFG1, x15                      # rising edge -> resume PVM
+    csrw CSR_PVM_CFG1, x15                      # write-pulse with active=1 -> resume PVM
     j    wait_pvm
 
 pvm_done:

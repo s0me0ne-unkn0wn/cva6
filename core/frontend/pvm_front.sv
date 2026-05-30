@@ -122,7 +122,7 @@ module pvm_front
   end
 
   // ---- fetch ----------------------------------------------------------------
-  logic            f_valid, f_term, f_done, f_is_djump;
+  logic            f_valid, f_term, f_done, f_is_djump, f_djump_pending, f_phase, f_two_uop;
   logic [VLEN-1:0] f_pc, f_next_pc;
   logic [7:0]      f_opcode;
   logic [127:0]    f_window;
@@ -142,11 +142,15 @@ module pvm_front
     djump_entry    = jumptable_base_i + djump_index * VLEN'(jumptable_z_i);
     djump_target_c = '0;
     ea             = '0;
-    for (int e = 0; e < 8; e++) begin
-      ea = djump_entry + VLEN'(e);
-      if ((e < int'(jumptable_z_i)) && (ea < VLEN'(IMG_BYTES)))
-        djump_target_c[e*8+:8] = img_mem[ea[IMG_AW-1:0]];
-    end
+    // Only read the jump table while actually resolving a dynamic jump. Otherwise a
+    // conditional branch (also drives br_target_i, with a small in-range target)
+    // would trigger a spurious img_mem read that races the code fetch in sim.
+    if (f_djump_pending)
+      for (int e = 0; e < 8; e++) begin
+        ea = djump_entry + VLEN'(e);
+        if ((e < int'(jumptable_z_i)) && (ea < VLEN'(IMG_BYTES)))
+          djump_target_c[e*8+:8] = img_mem[ea[IMG_AW-1:0]];
+      end
   end
 
   pvm_fetch #(.VLEN(VLEN)) i_fetch (
@@ -164,6 +168,9 @@ module pvm_front
       .br_target_i   (br_target_i),
       .djump_target_i(djump_target_c),
       .djump_halt_i  (djump_halt_c),
+      .djump_pending_o(f_djump_pending),
+      .two_uop_i     (f_two_uop),
+      .phase_o       (f_phase),
       .done_o        (f_done),
       .redirect_valid_i(is_jump_o),       // unconditional jump -> front redirect
       .redirect_pc_i   (branch_target_o),
@@ -185,6 +192,8 @@ module pvm_front
       .instr_window_i (f_window),
       .pc_i           (f_pc),
       .skip_i         (f_skip),
+      .phase_i        (f_phase),
+      .two_uop_o      (f_two_uop),
       .fu_o           (fu_o),
       .op_o           (op_o),
       .rd_o           (rd_o),

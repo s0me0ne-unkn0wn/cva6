@@ -48,6 +48,11 @@ module pvm_fetch
     input  logic [VLEN-1:0] br_target_i,  // backend-resolved address a (= reg_A + imm_X)
     input  logic [VLEN-1:0] djump_target_i,// jump-table target for a (computed by pvm_front)
     input  logic            djump_halt_i, // a is the r0 halt magic (2^32 - 2^16)
+    output logic            djump_pending_o,// suspended at a dynamic jump (gates the jump-table read)
+    // macro-expansion of imm-branches: a 2-uop instruction is held at the same pc
+    // across phase 0 (decoder emits uop0) and phase 1 (uop1) before advancing.
+    input  logic            two_uop_i,    // current instr expands to 2 uops (decoder)
+    output logic            phase_o,      // current micro-op phase (0 or 1) for the decoder
     output logic            done_o,       // PVM run finished cleanly (djump-halt / off-the-end)
     // same-cycle front redirect for unconditional jumps (target known at decode)
     input  logic            redirect_valid_i,
@@ -73,6 +78,7 @@ module pvm_fetch
   logic            branch_pending_q;  // suspended at a conditional branch, awaiting resolution
   logic            djump_pending_q;   // suspended at a dynamic jump, awaiting resolution
   logic            done_q;            // PVM run terminated cleanly (djump-halt / off-the-end)
+  logic            phase_q;           // micro-op phase for 2-uop (imm-branch) macro-expansion
 
   // ---- combinational skip encoder (LSB-first, append-1s past code_len) ------
   logic [4:0] skip_c;
@@ -104,6 +110,7 @@ module pvm_fetch
       branch_pending_q <= 1'b0;
       djump_pending_q  <= 1'b0;
       done_q           <= 1'b0;
+      phase_q          <= 1'b0;
     end else if (start_i) begin
       // Fresh start loads entry_pc; a host-call resume keeps the suspended pc_q
       // (which already points at the instruction after the ecalli).
@@ -112,14 +119,17 @@ module pvm_fetch
       branch_pending_q <= 1'b0;
       djump_pending_q  <= 1'b0;
       done_q           <= 1'b0;
+      phase_q          <= 1'b0;
     end else if (branch_pending_q) begin
       // Suspended after a conditional branch: wait for the backend branch_unit to
       // resolve it, then redirect to the taken target (decode-time redirect_pc_i,
-      // = pc+offset) or fall through to the sequential next pc.
+      // = pc+offset) or fall through to the sequential next pc. Reset the macro phase
+      // (an imm-branch's phase-1 branch resolving here ends its 2-uop sequence).
       if (br_resolved_i) begin
         pc_q             <= br_taken_i ? redirect_pc_i : next_pc_c;
         running_q        <= 1'b1;
         branch_pending_q <= 1'b0;
+        phase_q          <= 1'b0;
       end
     end else if (djump_pending_q) begin
       // Suspended at a dynamic jump: the backend gave a = reg_A + imm_X; pvm_front
@@ -127,13 +137,17 @@ module pvm_fetch
       // target (continue there).
       if (br_resolved_i) begin
         djump_pending_q <= 1'b0;
+        phase_q         <= 1'b0;  // end any 2-uop (load_imm_jump_ind) sequence
         if (djump_halt_i) done_q <= 1'b1;
         else begin pc_q <= djump_target_i; running_q <= 1'b1; end
       end
     end else if (running_q && next_ready_i) begin
+      // Macro-expansion phase 0 (imm-branch): the load-scratch uop just issued; stay
+      // at this pc and present phase 1 (the branch) next cycle.
+      if (two_uop_i && !phase_q) phase_q <= 1'b1;
       // Unconditional jump: redirect to the decode-time target (overrides the
       // terminator-halt, since `jump` is itself a basic-block terminator).
-      if (redirect_valid_i) pc_q <= redirect_pc_i;
+      else if (redirect_valid_i) pc_q <= redirect_pc_i;
       // Conditional branch: suspend (no speculation) until the backend resolves it.
       else if (branch_i) begin running_q <= 1'b0; branch_pending_q <= 1'b1; end
       // Dynamic jump (jump_ind): suspend until the backend resolves a = reg+imm.
@@ -159,5 +173,7 @@ module pvm_fetch
   assign next_pc_o      = next_pc_c;
   assign terminator_o   = terminator_c;
   assign done_o         = done_q;
+  assign djump_pending_o = djump_pending_q;
+  assign phase_o        = phase_q;
 
 endmodule

@@ -33,6 +33,8 @@ module pvm_decoder
     input  logic [127:0]    instr_window_i,  // c[i..i+15], byte 0 = opcode
     input  logic [VLEN-1:0] pc_i,            // instruction-counter i
     input  logic [4:0]      skip_i,          // skip(i) = instruction length - 1
+    input  logic            phase_i,         // micro-op phase for macro-expanded ops (imm-branch)
+    output logic            two_uop_o,       // this op expands to 2 uops (phase 0 then phase 1)
     // decoded micro-op (toward scoreboard_entry_t)
     output fu_t             fu_o,
     output fu_op            op_o,
@@ -68,6 +70,10 @@ module pvm_decoder
   // lX = min(4, skip) at offset 1. load_imm_64 uses 8 bytes at offset 2.
   int unsigned len_ri, len_ec;
   logic [63:0] imm_ri, imm_ec, imm64;
+  // reg + 2 immediates (imm-branch 81-90): lX = min(4, b1[6:4]), imm_X @offset 2;
+  // lY = min(4, max(0, skip - lX - 1)), imm_Y(offset) @offset 2+lX, target = pc + imm_Y.
+  int unsigned len_x, len_y, len_x2, len_y2;
+  logic [63:0] imm_x, imm_y, imm_x2, imm_y2;
   always_comb begin
     int unsigned skip_int;
     skip_int = int'(skip_i);
@@ -76,7 +82,23 @@ module pvm_decoder
     imm_ri = pvm_sext(pvm_le_bytes(instr_window_i, 2, len_ri), len_ri);
     imm_ec = pvm_sext(pvm_le_bytes(instr_window_i, 1, len_ec), len_ec);
     imm64  = pvm_le_bytes(instr_window_i, 2, 8);
+    len_x  = int'({1'b0, b1[6:4]});                  // (b1/16) mod 8
+    if (len_x > 4) len_x = 4;
+    len_y  = (skip_int > (len_x + 1)) ? (skip_int - len_x - 1) : 0;
+    if (len_y > 4) len_y = 4;
+    imm_x  = pvm_sext(pvm_le_bytes(instr_window_i, 2, len_x), len_x);
+    imm_y  = pvm_sext(pvm_le_bytes(instr_window_i, 2 + len_x, len_y), len_y);
+    // 2reg + 2imm family (load_imm_jump_ind 180): lX2 = min(4, c[i+2] mod 8),
+    // imm_X @offset 3; lY2 = min(4, max(0, skip - lX2 - 2)), imm_Y @offset 3+lX2.
+    len_x2 = int'({1'b0, b2[2:0]});
+    if (len_x2 > 4) len_x2 = 4;
+    len_y2 = (skip_int > (len_x2 + 2)) ? (skip_int - len_x2 - 2) : 0;
+    if (len_y2 > 4) len_y2 = 4;
+    imm_x2 = pvm_sext(pvm_le_bytes(instr_window_i, 3, len_x2), len_x2);
+    imm_y2 = pvm_sext(pvm_le_bytes(instr_window_i, 3 + len_x2, len_y2), len_y2);
   end
+
+  localparam logic [4:0] PVM_SCRATCH = 5'd14;  // x14: outside PVM r0..r12 (==x1..x13)
 
   // ---- decode ---------------------------------------------------------------
   always_comb begin
@@ -97,6 +119,7 @@ module pvm_decoder
     is_trap_o       = 1'b0;
     illegal_o       = 1'b0;
     unsupported_o   = 1'b0;
+    two_uop_o       = 1'b0;
 
     unique case (opcode_i)
       // ---- no-arg ----
@@ -147,6 +170,18 @@ module pvm_decoder
         // or the r0 halt magic). NOT a decode-time (is_jump) target.
         fu_o = CTRL_FLOW; op_o = JALR; rs1_o = g_lo; imm_o = imm_ri;
         use_imm_o = 1'b1; is_djump_o = 1'b1;
+      end
+
+      // ---- 2reg + 2imm: load_imm_jump_ind = (reg_A = imm_X ; djump(reg_B + imm_Y)) ----
+      // Macro-expanded: phase 0 loads reg_A, phase 1 is the dynamic jump on reg_B.
+      PVM_OP_LOAD_IMM_JUMP_IND: begin
+        two_uop_o = 1'b1;
+        if (!phase_i) begin
+          fu_o = ALU; op_o = ADD; rd_o = g_lo; rs1_o = 5'd0; imm_o = imm_x2; use_imm_o = 1'b1;
+        end else begin
+          fu_o = CTRL_FLOW; op_o = JALR; rs1_o = g_hi; imm_o = imm_y2;
+          use_imm_o = 1'b1; is_djump_o = 1'b1;
+        end
       end
 
       // ---- 2reg + imm: indirect loads/stores + reg-imm arithmetic ----
@@ -232,6 +267,42 @@ module pvm_decoder
           PVM_OP_BRANCH_GE_U: op_o = GEU;
           default:            op_o = GES;  // BRANCH_GE_S
         endcase
+      end
+
+      // ---- reg + 2imm: branch reg-vs-immediate (macro-expanded into 2 uops) ----
+      // CVA6's branch_unit compares two registers, so we synthesise:
+      //   phase 0: load PVM_SCRATCH = imm_X   (ALU ADD scratch = x0 + imm_X)
+      //   phase 1: branch <cmp> (rA, scratch), target = pc + imm_Y
+      // LE/GT have no direct RISC-V branch op, so we swap operands (a<=b == b>=a,
+      // a>b == b<a) using GE/LT instead.
+      PVM_OP_BRANCH_EQ_IMM, PVM_OP_BRANCH_NE_IMM,
+      PVM_OP_BRANCH_LT_U_IMM, PVM_OP_BRANCH_LE_U_IMM,
+      PVM_OP_BRANCH_GE_U_IMM, PVM_OP_BRANCH_GT_U_IMM,
+      PVM_OP_BRANCH_LT_S_IMM, PVM_OP_BRANCH_LE_S_IMM,
+      PVM_OP_BRANCH_GE_S_IMM, PVM_OP_BRANCH_GT_S_IMM: begin
+        two_uop_o = 1'b1;
+        if (!phase_i) begin
+          // phase 0: scratch = imm_X
+          fu_o = ALU; op_o = ADD; rd_o = PVM_SCRATCH; rs1_o = 5'd0;
+          imm_o = imm_x; use_imm_o = 1'b1;
+        end else begin
+          // phase 1: conditional branch rA vs scratch
+          fu_o = CTRL_FLOW; is_branch_o = 1'b1;
+          branch_target_o = pc_i + imm_y[VLEN-1:0];
+          imm_o = imm_y;
+          unique case (opcode_i)
+            PVM_OP_BRANCH_EQ_IMM:   begin op_o = EQ;  rs1_o = g_lo;        rs2_o = PVM_SCRATCH; end
+            PVM_OP_BRANCH_NE_IMM:   begin op_o = NE;  rs1_o = g_lo;        rs2_o = PVM_SCRATCH; end
+            PVM_OP_BRANCH_LT_U_IMM: begin op_o = LTU; rs1_o = g_lo;        rs2_o = PVM_SCRATCH; end
+            PVM_OP_BRANCH_GE_U_IMM: begin op_o = GEU; rs1_o = g_lo;        rs2_o = PVM_SCRATCH; end
+            PVM_OP_BRANCH_LT_S_IMM: begin op_o = LTS; rs1_o = g_lo;        rs2_o = PVM_SCRATCH; end
+            PVM_OP_BRANCH_GE_S_IMM: begin op_o = GES; rs1_o = g_lo;        rs2_o = PVM_SCRATCH; end
+            PVM_OP_BRANCH_LE_U_IMM: begin op_o = GEU; rs1_o = PVM_SCRATCH; rs2_o = g_lo; end // rA<=X == X>=rA
+            PVM_OP_BRANCH_GT_U_IMM: begin op_o = LTU; rs1_o = PVM_SCRATCH; rs2_o = g_lo; end // rA>X  == X<rA
+            PVM_OP_BRANCH_LE_S_IMM: begin op_o = GES; rs1_o = PVM_SCRATCH; rs2_o = g_lo; end
+            default:                begin op_o = LTS; rs1_o = PVM_SCRATCH; rs2_o = g_lo; end // GT_S
+          endcase
+        end
       end
 
       // ---- 3reg ALU / MUL ----

@@ -160,6 +160,30 @@ def emit_loop_test(n):
 
 JUMP_IND = 0x32   # 50: djump((reg_A + imm_X) mod 2^32); arg = reg_A in low nibble, then imm_X
 DJUMP_HALT_ADDR = 0xFFFF0000  # r0 halt magic = 2^32 - 2^16
+BRANCH_EQ_IMM = 0x51  # 81: branch(imm_Y, reg_A == imm_X); byte1=(lX<<4)|rA, then imm_X, imm_Y(offset)
+
+
+def emit_imm_branch(opcode, rval, x):
+    """Generic imm-branch (macro-expanded) test: load r1=rval ; <opcode> r1, X, +10.
+    Fall-through prints 'F', taken prints 'T'. Exercises the 2-uop front macro-expansion
+    (load scratch=X ; branch_cmp r1,scratch) -- including the LE/GT operand swaps."""
+    code = (
+        [LOAD_IMM, 0x01, rval & 0xFF]     # load_imm r1, rval           @0  (r1->x2)
+        + [opcode, 0x11, x & 0xFF, 10]    # <imm-branch> r1,X,off=10->@13  @3 (lX=1,rA=1)
+        + [LOAD_IMM, 0x07, ord('F')]      # load_imm r7,'F'             @7
+        + [ECALLI, 0x00]                  # ecalli                      @10
+        + [TRAP]                          # trap                        @12
+        + [LOAD_IMM, 0x07, ord('T')]      # TGT: load_imm r7,'T'        @13
+        + [ECALLI, 0x00]                  # ecalli                      @16
+        + [TRAP]                          # trap                        @18
+    )
+    starts = [0, 3, 7, 10, 12, 13, 16, 18]
+    return code, starts
+
+
+def emit_imm_branch_test(take):
+    """branch_eq_imm r1, X: r1=7; take -> X=7 (taken,'T'), else X=9 ('F')."""
+    return emit_imm_branch(BRANCH_EQ_IMM, 7, 7 if take else 9)
 
 
 def emit_djump_halt():
@@ -191,6 +215,25 @@ def emit_djump_table():
     z = 1
     jumptable = [6]                    # j[0] = TARGET pc (6)
     return code, starts, jumptable, z
+
+
+LOAD_IMM_JUMP_IND = 0xB4  # 180: reg_A = imm_X ; djump(reg_B + imm_Y); byte1=(rB<<4)|rA, byte2=lX
+
+
+def emit_ldij_test():
+    """load_imm_jump_ind: load r2=0 ; load_imm_jump_ind r3,r2,imm_X=99,imm_Y=2 ->
+    djump(r2+2)=djump(2)=j[0]=TARGET. Prints 'J' then traps. Combines the 2-uop
+    macro-expansion (load reg_A) with the dynamic-jump (reg_B) path + the jump table."""
+    code = (
+        [LOAD_IMM, 0x02, 0]                       # load_imm r2, 0 (djump base) @0 (3B)
+        + [LOAD_IMM_JUMP_IND, 0x23, 0x01, 99, 2]  # r3=99 ; djump(r2+2)->@9      @3 (5B) rB=2,rA=3,lX=1
+        + [TRAP]                                   # error catch (djump skips it) @8 (1B)
+        + [LOAD_IMM, 0x07, ord('J')]               # TARGET: load_imm r7,'J'      @9 (3B)
+        + [ECALLI, 0x00]                           # ecalli (putchar 'J')         @12 (2B)
+        + [TRAP]                                    # trap                         @14 (1B)
+    )
+    starts = [0, 3, 8, 9, 12, 14]
+    return code, starts, [9], 1   # jumptable[0] = TARGET(9), z=1
 
 
 def build_image(code, starts, jumptable=None, z=1):
@@ -240,6 +283,15 @@ def main():
         code, starts = emit_djump_halt()
     elif mode == "djump_table":
         code, starts, jumptable, z = emit_djump_table()
+    elif mode == "ibr_taken":
+        code, starts = emit_imm_branch_test(True)
+    elif mode == "ibr_nottaken":
+        code, starts = emit_imm_branch_test(False)
+    elif mode == "ibrx":
+        op, rv, xv = (int(t, 0) for t in text.split(","))   # "opcode,rval,X"
+        code, starts = emit_imm_branch(op, rv, xv)
+    elif mode == "ldij":
+        code, starts, jumptable, z = emit_ldij_test()
     else:
         code, starts = emit_banner(text)
     img, code_len, bm_off, jt_off = build_image(code, starts, jumptable, z)
