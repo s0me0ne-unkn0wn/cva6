@@ -1167,7 +1167,19 @@ module csr_regfile
 
         riscv::CSR_MSCRATCH: mscratch_d = csr_wdata;
         riscv::CSR_PVM_CFG0: pvm_cfg0_d = csr_wdata;
-        riscv::CSR_PVM_CFG1: pvm_cfg1_d = csr_wdata;
+        riscv::CSR_PVM_CFG1: begin
+          pvm_cfg1_d = csr_wdata;
+          // PVMCFG1 flips the entire front-end mode (RISC-V <-> PVM). Treat it like
+          // the other mode-changing CSRs (mstatus/satp above, which set flush_o) and
+          // flush the pipeline: the mode switch then lands on a drained pipe, so no
+          // in-flight RISC-V handler control flow (the `j wait_pvm` busy loop, the
+          // host-call handler's branches) races the PVM enter/re-entry. This fences
+          // the transition that the "djump CFG2 timing race" exposed -- adding the
+          // startup `csrw CFG2` shifted pipeline timing enough to make the rising-edge
+          // re-entry miss on rapid back-to-back ecalli resumes (M1). See the phase log
+          // (robust-fix-proposal.md, B1: flush-only).
+          flush_o = 1'b1;
+        end
         riscv::CSR_PVM_CFG2: pvm_cfg2_d = csr_wdata;
         riscv::CSR_MEPC: mepc_d = {csr_wdata[CVA6Cfg.XLEN-1:1], 1'b0};
         riscv::CSR_MCAUSE: mcause_d = csr_wdata;

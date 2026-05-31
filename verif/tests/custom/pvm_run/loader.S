@@ -34,18 +34,15 @@ _start:
     # PVMCFG0 = (code_base<<32) | entry_pc = 0
     csrw CSR_PVM_CFG0, x0
 
-    # PVMCFG2 = (jumptable_z<<32) | jumptable_base  (for dynamic jumps via the jump
-    # table). Only written when a jump table is present (JT_BASE != 0): the extra
-    # startup CSR write perturbs pipeline timing and exposes the "djump CFG2 timing
-    # race" (a deep PVM-transition-vs-backend interaction; surface fixes -- write-pulse
-    # re-entry, registered exit, jump-table-read gating, handler spacing -- each only
-    # move the failure between the ecalli-banner and the loop. A robust fix needs a
-    # pipeline-drain/fence on PVM mode transitions; TODO, see log). Programs that djump
-    # set JT_BASE; the ecalli/branch/loop tests don't, so they avoid the shift.
-#if (JT_BASE)
+    # PVMCFG2 = (jumptable_z<<32) | jumptable_base, for dynamic jumps via the jump
+    # table. Written UNCONDITIONALLY. This used to be #if (JT_BASE)-gated to dodge the
+    # "djump CFG2 timing race": the extra startup CSR write shifted pipeline timing and
+    # made the rising-edge PVM re-entry miss on back-to-back ecalli resumes (banner hung
+    # at ~char 6). That race is now fixed at the source -- a PVMCFG1 write flushes the
+    # pipeline (csr_regfile.sv, the same idiom as mstatus/satp), fencing every PVM mode
+    # transition -- so the dodge is removed and every program exercises CFG2.
     li   t0, ((JT_Z) << 32) | (JT_BASE)
     csrw CSR_PVM_CFG2, t0
-#endif
 
     # PVMCFG1 = (pvm_active<<32) | code_len ; active=bit32, code_len=4
     li   t0, (1 << 32) | CODE_LEN
