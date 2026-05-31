@@ -189,6 +189,8 @@ module csr_regfile
     output logic [CVA6Cfg.XLEN-1:0] pvm_cfg0_o,
     output logic [CVA6Cfg.XLEN-1:0] pvm_cfg1_o,
     output logic [CVA6Cfg.XLEN-1:0] pvm_cfg2_o,
+    output logic                    pvm_img_we_o,   // pulse: write img_mem (M1 load port)
+    output logic [CVA6Cfg.XLEN-1:0] pvm_img_w_o,    // {addr, data} payload for the img write
     // trigger module signals
     output logic debug_from_trigger_o,
     input logic [CVA6Cfg.VLEN-1:0] vaddr_from_lsu_i,
@@ -444,6 +446,7 @@ module csr_regfile
         riscv::CSR_PVM_CFG0: csr_rdata = pvm_cfg0_q;
         riscv::CSR_PVM_CFG1: csr_rdata = pvm_cfg1_q;
         riscv::CSR_PVM_CFG2: csr_rdata = pvm_cfg2_q;
+        riscv::CSR_PVM_IMG:  csr_rdata = '0;  // write-only image load port
         riscv::CSR_MEPC: csr_rdata = mepc_q;
         riscv::CSR_MCAUSE: csr_rdata = mcause_q;
         riscv::CSR_MTVAL:
@@ -807,6 +810,7 @@ module csr_regfile
 
     eret_o                          = 1'b0;
     flush_o                         = 1'b0;
+    pvm_img_we_o                    = 1'b0;
     update_access_exception         = 1'b0;
 
     set_debug_pc_o                  = 1'b0;
@@ -1181,6 +1185,7 @@ module csr_regfile
           flush_o = 1'b1;
         end
         riscv::CSR_PVM_CFG2: pvm_cfg2_d = csr_wdata;
+        riscv::CSR_PVM_IMG:  pvm_img_we_o = 1'b1;  // 1-cycle img_mem write pulse (data in pvm_img_w_o)
         riscv::CSR_MEPC: mepc_d = {csr_wdata[CVA6Cfg.XLEN-1:1], 1'b0};
         riscv::CSR_MCAUSE: mcause_d = csr_wdata;
         riscv::CSR_MTVAL: begin
@@ -2217,6 +2222,7 @@ module csr_regfile
   assign rvfi_csr_o.mtvec_q = mtvec_q;
   assign rvfi_csr_o.mcounteren_q = mcounteren_q;
   assign rvfi_csr_o.mscratch_q = mscratch_q;
+  assign pvm_img_w_o = csr_wdata;  // {addr, data}; latched into img_mem by pvm_front on pvm_img_we_o
   assign pvm_cfg0_o = pvm_cfg0_q;
   assign pvm_cfg1_o = pvm_cfg1_q;
   assign pvm_cfg2_o = pvm_cfg2_q;

@@ -142,7 +142,43 @@ run-hostcall: loader.S link.ld gen_pvm_img.py
 	 echo "$$OUT" | grep -aE 'SUCCESS'; \
 	 echo "$$OUT" | grep -qa '#' && echo "   host-call ABI OK ('#' returned)" || { echo "   *** host-call ABI FAILED (no '#') ***"; exit 1; }
 
-clean:
-	rm -f loader.elf loader_jump.elf loader_banner.elf loader_ecalli.elf loader_br.elf loader_loop.elf loader_djhalt.elf loader_djtab.elf loader_ibr.elf loader_ldij.elf loader_csr.elf loader_hostcall.elf loader_hi.elf baseline.elf banner.hex ecalli.hex hi_banner.hex br_taken.hex br_nottaken.hex loop.hex djhalt.hex djtab.hex ibr_t.hex ibr_nt.hex ldij.hex csr.hex hostcall.hex
+# M1: a PolkaVM image is loaded into img_mem at RUNTIME via the CSR_PVM_IMG load port
+# (the bootrom load path; here the bytes are resident in DRAM as the loader's .text.init
+# and streamed in by csrw) -- NO baked ROM, NO +PVM_IMG/$readmemh. Proves JAM code runs
+# from a runtime-loaded memory: the DRAM-fetch precursor. Image: load_imm r7,'#';ecalli;trap.
+run-dram: loader_dramload.S link.ld
+	@$(CC) $(CFLAGS) -T link.ld -o loader_dramload.elf loader_dramload.S; \
+	 echo ">> image CSR-loaded into img_mem from DRAM (no +PVM_IMG), expect '#':"; \
+	 OUT=$$($(HARNESS) +tohost_addr=$(TOHOST) +time_out=200000 $(abspath loader_dramload.elf) 2>&1); \
+	 echo "$$OUT" | grep -aE 'SUCCESS'; \
+	 echo "$$OUT" | grep -qa '#' && echo "   M1 OK: '#' from a runtime-loaded img_mem" || { echo "   *** M1 FAILED (no '#') ***"; exit 1; }
 
-.PHONY: all run run-jump run-banner run-ecalli run-branch run-loop run-djump-halt run-djump-table run-ibranch run-ldij run-csr run-hostcall clean
+# Run the whole PVM gate suite and tally PASS/FAIL (prereq: the testharness is built,
+# `make verilate target=cv64a6_emac_polkavm RISCV=/usr` from the repo root). Each gate
+# returns non-zero on failure (the SUCCESS grep / the hardened '#' asserts), so the exit
+# code is the per-gate verdict.
+PVM_GATES = run run-ecalli run-banner run-branch run-loop run-djump-halt run-djump-table \
+            run-ibranch run-ldij run-csr run-hostcall run-dram run-dram-banner
+run-all:
+	@pass=0; fail=0; failed=""; \
+	 for t in $(PVM_GATES); do \
+	   if $(MAKE) -s $$t >/dev/null 2>&1; then echo "  OK   $$t"; pass=$$((pass+1)); \
+	   else echo "  FAIL $$t"; fail=$$((fail+1)); failed="$$failed $$t"; fi; \
+	 done; \
+	 echo "=== PVM gates: PASS=$$pass FAIL=$$fail$${failed:+ (failed:$$failed)} ==="; \
+	 test $$fail -eq 0
+
+# CSR-load the FULL banner (108B, 7 BRAM words) via CSR_PVM_IMG, no +PVM_IMG -- the sim
+# mirror of the FPGA bootrom's DRAM-load path (run-dram only loads 17B). Stresses the
+# byte-enable BRAM write + read-FSM at the banner's scale. Expect 'PolkaVM on CVA6!'.
+run-dram-banner: loader_drambanner.S banner_blob.S link.ld
+	@$(CC) $(CFLAGS) -T link.ld -o loader_drambanner.elf loader_drambanner.S; \
+	 echo ">> CSR-loaded full banner (108B):"; \
+	 OUT=$$($(HARNESS) +tohost_addr=$(TOHOST) +time_out=400000 $(abspath loader_drambanner.elf) 2>&1); \
+	 echo "$$OUT" | grep -aoE 'PolkaVM on CVA6!' | head -1; \
+	 echo "$$OUT" | grep -qa 'PolkaVM on CVA6!' && echo "   CSR-load-at-scale OK" || { echo "   *** FAILED ***"; exit 1; }
+
+clean:
+	rm -f loader.elf loader_jump.elf loader_banner.elf loader_ecalli.elf loader_br.elf loader_loop.elf loader_djhalt.elf loader_djtab.elf loader_ibr.elf loader_ldij.elf loader_csr.elf loader_hostcall.elf loader_dramload.elf loader_drambanner.elf loader_hi.elf baseline.elf banner.hex ecalli.hex hi_banner.hex br_taken.hex br_nottaken.hex loop.hex djhalt.hex djtab.hex ibr_t.hex ibr_nt.hex ldij.hex csr.hex hostcall.hex
+
+.PHONY: all run run-jump run-banner run-ecalli run-branch run-loop run-djump-halt run-djump-table run-ibranch run-ldij run-csr run-hostcall run-dram run-dram-banner run-all clean

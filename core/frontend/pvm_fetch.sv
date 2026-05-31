@@ -48,6 +48,7 @@ module pvm_fetch
     input  logic [VLEN-1:0] br_target_i,  // backend-resolved address a (= reg_A + imm_X)
     input  logic [VLEN-1:0] djump_target_i,// jump-table target for a (computed by pvm_front)
     input  logic            djump_halt_i, // a is the r0 halt magic (2^32 - 2^16)
+    input  logic            jt_valid_i,   // jump-table read complete (djump_target_i ready)
     output logic            djump_pending_o,// suspended at a dynamic jump (gates the jump-table read)
     // macro-expansion of imm-branches: a 2-uop instruction is held at the same pc
     // across phase 0 (decoder emits uop0) and phase 1 (uop1) before advancing.
@@ -62,6 +63,7 @@ module pvm_fetch
     //   bm_window_i   : 32 bitmask bits starting at pc_o+1 (LSB = position pc_o+1)
     input  logic [127:0]    code_window_i,
     input  logic [31:0]     bm_window_i,
+    input  logic            window_valid_i,// code/bitmask window for pc_o is loaded (BRAM read-FSM)
     // outputs
     output logic            valid_o,       // a valid instruction is presented
     output logic [VLEN-1:0] pc_o,          // current instruction-counter i
@@ -134,14 +136,16 @@ module pvm_fetch
     end else if (djump_pending_q) begin
       // Suspended at a dynamic jump: the backend gave a = reg_A + imm_X; pvm_front
       // turned it into either the r0 halt magic (clean termination) or a jump-table
-      // target (continue there).
-      if (br_resolved_i) begin
+      // target (continue there). Wait for the BRAM jump-table read (jt_valid_i): with
+      // a real BRAM, djump_target_i is produced a few cycles after the backend resolves
+      // a, not combinationally -- so resolve on jt_valid_i, not br_resolved_i.
+      if (jt_valid_i) begin
         djump_pending_q <= 1'b0;
         phase_q         <= 1'b0;  // end any 2-uop (load_imm_jump_ind) sequence
         if (djump_halt_i) done_q <= 1'b1;
         else begin pc_q <= djump_target_i; running_q <= 1'b1; end
       end
-    end else if (running_q && next_ready_i) begin
+    end else if (running_q && next_ready_i && window_valid_i) begin
       // Macro-expansion phase 0 (imm-branch): the load-scratch uop just issued; stay
       // at this pc and present phase 1 (the branch) next cycle.
       if (two_uop_i && !phase_q) phase_q <= 1'b1;
@@ -164,7 +168,7 @@ module pvm_fetch
   end
 
   // ---- outputs --------------------------------------------------------------
-  assign valid_o        = running_q;
+  assign valid_o        = running_q & window_valid_i;
   assign pc_o           = pc_q;
   assign code_addr_o    = pc_q;
   assign opcode_o       = opcode_c;

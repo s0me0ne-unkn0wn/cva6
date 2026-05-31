@@ -457,6 +457,8 @@ module cva6
   logic [63:0]             pvm_imm, pvm_hcid;
   scoreboard_entry_t       pvm_sbe;
   logic [CVA6Cfg.XLEN-1:0] pvm_cfg0_csr, pvm_cfg1_csr, pvm_cfg2_csr;  // from control CSRs (csr_regfile)
+  logic                    pvm_img_we_csr;   // CSR_PVM_IMG write pulse (M1 load port)
+  logic [CVA6Cfg.XLEN-1:0] pvm_img_w_csr;    // {addr, data} payload
 
   // Control from M-mode CSRs: PVMCFG0[31:0]=entry_pc, [63:32]=code_base;
   // PVMCFG1[31:0]=code_len, [32]=pvm_active, [33]=resume. Bitmask follows code, 16-aligned.
@@ -506,12 +508,15 @@ module cva6
   assign pvm_code_len  = {{(CVA6Cfg.VLEN-32){1'b0}}, pvm_cfg1_csr[31:0]};
   assign pvm_bitmask_base = pvm_code_base +
       {{(CVA6Cfg.VLEN-32){1'b0}}, ((pvm_cfg1_csr[31:0] + 32'd15) & ~32'd15)};
-  assign pvm_img_we       = 1'b0;
-  assign pvm_img_addr     = '0;
-  assign pvm_img_wdata    = '0;
+  // M1 image load: the M-mode bootrom writes img_mem via CSR_PVM_IMG (csr_regfile
+  // pulses pvm_img_we_csr with {addr,data} in pvm_img_w_csr), so JAM code can be
+  // copied in from DRAM before entering PVM. (No baked ROM anymore.)
+  assign pvm_img_we       = CVA6Cfg.PvmPresent & pvm_img_we_csr;
+  assign pvm_img_addr     = pvm_img_w_csr >> 8;
+  assign pvm_img_wdata    = pvm_img_w_csr[7:0];
 
   if (CVA6Cfg.PvmPresent) begin : gen_pvm_front
-    pvm_front #(.VLEN(CVA6Cfg.VLEN), .IMG_BYTES(256)) i_pvm_front (
+    pvm_front #(.VLEN(CVA6Cfg.VLEN), .IMG_BYTES(4096)) i_pvm_front (
         .clk_i,
         .rst_ni,
         .pvm_active_i   (pvm_active),
@@ -1397,6 +1402,8 @@ module cva6
       .pvm_cfg0_o              (pvm_cfg0_csr),
       .pvm_cfg1_o              (pvm_cfg1_csr),
       .pvm_cfg2_o              (pvm_cfg2_csr),
+      .pvm_img_we_o            (pvm_img_we_csr),
+      .pvm_img_w_o             (pvm_img_w_csr),
       //RVFI
       .rvfi_csr_o              (rvfi_csr),
       // Trigger Signals
