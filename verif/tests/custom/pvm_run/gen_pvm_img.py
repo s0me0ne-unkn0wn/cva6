@@ -281,6 +281,25 @@ def emit_csr_test():
     return code, starts
 
 
+def emit_hostcall_test():
+    """Host-call ABI (B3): dispatch on the host-call number + multi-arg + return value.
+      load_imm r7,0x22 (a0) ; load_imm r8,0x01 (a1) ;
+      ecalli #1 (sum: handler sets a0 = a0 + a1 = 0x23) ; ecalli #0 (putchar a0) ; trap.
+    Prints exactly one '#' (0x23) iff the handler dispatched on the host-call number
+    (delivered in mtval), read both args (a0=r7, a1=r8), wrote the return into a0 and
+    resumed. A broken dispatch (always putchar) would print a0=0x22 ('"') at BOTH ecallis
+    and never '#'. ABI: a0..a5 = PVM r7..r12 (== x8..x13), a0 = arg0 + return."""
+    code = (
+        [LOAD_IMM, 0x07, 0x22]      # a0 (r7) = 0x22              @0  (3B)
+        + [LOAD_IMM, 0x08, 0x01]    # a1 (r8) = 0x01              @3  (3B)
+        + [ECALLI, 0x01]            # ecalli #1 (sum -> a0=0x23)  @6  (2B)
+        + [ECALLI, 0x00]            # ecalli #0 (putchar a0='#')  @8  (2B)
+        + [TRAP]                    # trap                        @10 (1B)
+    )
+    starts = [0, 3, 6, 8, 10]
+    return code, starts
+
+
 def build_image(code, starts, jumptable=None, z=1):
     """Pad code to align16, append the LSB-first opcode bitmask, then (optionally)
     the dynamic jump table (z bytes/entry, LE). Returns (img, code_len, bm_off, jt_off)."""
@@ -339,6 +358,8 @@ def main():
         code, starts, jumptable, z = emit_ldij_test()
     elif mode == "csr":
         code, starts = emit_csr_test()
+    elif mode == "hostcall":
+        code, starts = emit_hostcall_test()
     else:
         code, starts = emit_banner(text)
     img, code_len, bm_off, jt_off = build_image(code, starts, jumptable, z)

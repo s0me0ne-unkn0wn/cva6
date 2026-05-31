@@ -125,9 +125,24 @@ run-csr: loader.S link.ld gen_pvm_img.py
 	@CL=$$(python3 gen_pvm_img.py '' csr.hex csr | grep CODE_LEN | grep -oE '[0-9]+'); \
 	 $(CC) $(CFLAGS) -DCODE_LEN=$$CL -T link.ld -o loader_csr.elf loader.S; \
 	 echo ">> CSR rw/rs/rc round-trip (expect '#'):"; \
-	 $(HARNESS) +PVM_IMG=$(abspath csr.hex) +tohost_addr=$(TOHOST) +time_out=200000 $(abspath loader_csr.elf) 2>&1 | grep -aE 'SUCCESS|#'
+	 OUT=$$($(HARNESS) +PVM_IMG=$(abspath csr.hex) +tohost_addr=$(TOHOST) +time_out=200000 $(abspath loader_csr.elf) 2>&1); \
+	 echo "$$OUT" | grep -aE 'SUCCESS'; \
+	 echo "$$OUT" | grep -qa '#' && echo "   CSR rw/rs/rc OK ('#' returned)" || { echo "   *** CSR FAILED (no '#') ***"; exit 1; }
+
+# Stage B3: host-call ABI. The host-call number (ecalli imm) is delivered in mtval; the
+# handler dispatches -- #0 = putchar(a0), #1 = sum (a0 = a0 + a1). ABI a0..a5 = PVM
+# r7..r12. Program: a0=0x22, a1=0x01, ecalli #1 (a0->0x23), ecalli #0 -> putchar '#'.
+# Exactly one '#' iff dispatch + 2-arg + return + resume all work (a broken dispatch
+# would putchar a0 at #1 too -> '"' x2, no '#').
+run-hostcall: loader.S link.ld gen_pvm_img.py
+	@CL=$$(python3 gen_pvm_img.py '' hostcall.hex hostcall | grep CODE_LEN | grep -oE '[0-9]+'); \
+	 $(CC) $(CFLAGS) -DCODE_LEN=$$CL -T link.ld -o loader_hostcall.elf loader.S; \
+	 echo ">> host-call ABI dispatch (sum #1 then putchar #0, expect '#'):"; \
+	 OUT=$$($(HARNESS) +PVM_IMG=$(abspath hostcall.hex) +tohost_addr=$(TOHOST) +time_out=200000 $(abspath loader_hostcall.elf) 2>&1); \
+	 echo "$$OUT" | grep -aE 'SUCCESS'; \
+	 echo "$$OUT" | grep -qa '#' && echo "   host-call ABI OK ('#' returned)" || { echo "   *** host-call ABI FAILED (no '#') ***"; exit 1; }
 
 clean:
-	rm -f loader.elf loader_jump.elf loader_banner.elf loader_ecalli.elf loader_br.elf loader_loop.elf loader_djhalt.elf loader_djtab.elf loader_ibr.elf loader_ldij.elf loader_csr.elf loader_hi.elf baseline.elf banner.hex ecalli.hex hi_banner.hex br_taken.hex br_nottaken.hex loop.hex djhalt.hex djtab.hex ibr_t.hex ibr_nt.hex ldij.hex csr.hex
+	rm -f loader.elf loader_jump.elf loader_banner.elf loader_ecalli.elf loader_br.elf loader_loop.elf loader_djhalt.elf loader_djtab.elf loader_ibr.elf loader_ldij.elf loader_csr.elf loader_hostcall.elf loader_hi.elf baseline.elf banner.hex ecalli.hex hi_banner.hex br_taken.hex br_nottaken.hex loop.hex djhalt.hex djtab.hex ibr_t.hex ibr_nt.hex ldij.hex csr.hex hostcall.hex
 
-.PHONY: all run run-jump run-banner run-ecalli run-branch run-loop run-djump-halt run-djump-table run-ibranch run-ldij run-csr clean
+.PHONY: all run run-jump run-banner run-ecalli run-branch run-loop run-djump-halt run-djump-table run-ibranch run-ldij run-csr run-hostcall clean

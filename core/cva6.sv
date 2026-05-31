@@ -592,6 +592,12 @@ module cva6
     // trap/illegal/host-call/clean-halt -> exception to M-mode
     pvm_sbe.ex.valid = pvm_is_trap | pvm_illegal | pvm_unsupported | pvm_is_hostcall | pvm_done;
     pvm_sbe.ex.cause = pvm_is_hostcall ? riscv::ENV_CALL_MMODE : riscv::ILLEGAL_INSTR;
+    // Host-call ABI (B3): deliver the host-call number (the ecalli immediate) to the
+    // M-mode handler via mtval, so it can dispatch (the handler does `csrr x, mtval`).
+    // CVA6 only zeroes mtval for ENV_CALL_* under SPIKE_TANDEM (ZERO_TVAL=1); the
+    // sim and FPGA builds keep ZERO_TVAL=0, so mtval = this tval. Non-host-call
+    // exceptions (trap/illegal) carry tval=0.
+    pvm_sbe.ex.tval  = pvm_is_hostcall ? pvm_hcid[CVA6Cfg.XLEN-1:0] : '0;
   end
 
   // Mux PVM vs RISC-V into the issue stage (port 0 carries PVM uops).

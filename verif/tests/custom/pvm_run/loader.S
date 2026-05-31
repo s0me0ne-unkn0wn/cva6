@@ -54,31 +54,34 @@ wait_pvm:
 
     .align 2
 pvm_trap_handler:
-    # Two PVM exit causes vector here:
-    #   ecalli (host-call, opcode 10) -> mcause = ENV_CALL_MMODE (11): service it
-    #     and RESUME the guest. The HW put the resume point (next_pc) in mepc.
-    #   trap   (opcode 0)             -> mcause = ILLEGAL_INSTR (2): program done.
-    # Only x14/x15 are touched on the ecalli path: PVM uses r0..r12 == x1..x13,
-    # so x14/x15 are the only GPRs free to scratch without corrupting guest state.
+    # PVM exit causes: mcause = ENV_CALL_MMODE (11) = an ecalli host-call -> service it
+    # and RESUME the guest; anything else = the program's final `trap` (ILLEGAL_INSTR).
+    # Host-call ABI (B3): the host-call number (the ecalli immediate) arrives in mtval
+    # (HW, cva6.sv adapter). Args/return follow the PolkaVM ABI: a0..a5 = PVM r7..r12 =
+    # x8..x13, with a0 (x8) the first arg AND the return value. The handler scratches
+    # only x14/x15; it reads/writes a0/a1 (x8/x9) solely as the host-call ABI.
     csrr x14, mcause
-    li   x15, 11                 # ENV_CALL_MMODE
-    bne  x14, x15, pvm_done      # not a host-call -> final trap -> SUCCESS
-
-    # --- host-call #0 = putchar(PVM r7) --------------------------------------
-    # PVM r7 maps to x8; the guest left the character there before `ecalli #0`.
-    li   x15, 0x10000000         # UART base (THR)
-    sb   x8, 0(x15)              # THR <- char
-    lbu  x14, 0x14(x15)          # read LSR: an uncached load drains the store
-                                 # buffer, ordering this MMIO write one-at-a-time
-                                 # (else the WT-dcache coalesces same-addr writes)
-    # --- resume the guest after the ecalli -----------------------------------
-    # pvm_fetch already suspended at the post-ecalli pc; re-activate with the resume
-    # bit so it continues there. HW enters on the CFG1 write-commit pulse; the clear
-    # write (CFG1=0, active=0 -> no enter) before the set also spaces the re-entry
-    # from the following control flow, which keeps back-to-back PVM resumes robust.
-    csrw CSR_PVM_CFG1, x0                       # clear (active=0): no-enter pulse, adds spacing
-    li   x15, (1 << 33) | (1 << 32) | CODE_LEN  # resume | active | code_len
-    csrw CSR_PVM_CFG1, x15                      # write-pulse with active=1 -> resume PVM
+    li   x15, 11
+    bne  x14, x15, pvm_done       # not a host-call -> final trap -> SUCCESS
+    csrr x14, mtval               # x14 = host-call number
+    beqz x14, hc_putchar          # #0 = putchar(a0)
+    li   x15, 1
+    beq  x14, x15, hc_sum         # #1 = sum: a0 = a0 + a1
+    j    hc_resume                # unknown host-call -> no-op, resume
+hc_sum:
+    add  x8, x8, x9               # a0 = a0 + a1   (return value in a0)
+    j    hc_resume
+hc_putchar:
+    li   x15, 0x10000000          # UART THR
+    sb   x8, 0(x15)               # THR <- a0 (low byte)
+    lbu  x14, 0x14(x15)           # uncached LSR read drains the store buffer (1-at-a-time)
+hc_resume:
+    # pvm_fetch is suspended at the post-ecalli pc; re-activate with the resume bit so
+    # it continues there. The clear write (CFG1=0) before the set spaces the re-entry;
+    # the CFG1-write pipeline flush (B1) fences every PVM mode transition.
+    csrw CSR_PVM_CFG1, x0                        # clear pulse (spacing)
+    li   x15, (1 << 33) | (1 << 32) | CODE_LEN   # resume | active | code_len
+    csrw CSR_PVM_CFG1, x15                       # resume PVM
     j    wait_pvm
 
 pvm_done:
