@@ -236,6 +236,51 @@ def emit_ldij_test():
     return code, starts, [9], 1   # jumptable[0] = TARGET(9), z=1
 
 
+# Privileged CSR opcodes (231-236): reg_reg_imm. byte1 = (rd<<4)|rs1 nibbles (PVM
+# rN -> RISC-V x(N+1)), then the csr-number immediate (LE). csr_rw: rd=old csr,
+# csr=rs1. csr_rs: rd=old csr, csr|=rs1. csr_rc: rd=old csr, csr&=~rs1.
+CSR_RW   = 0xE7   # 231
+CSR_RS   = 0xE8   # 232
+CSR_RC   = 0xE9   # 233
+MSCRATCH = 0x340  # an M-mode CSR unused by the loader -> safe to clobber from PVM
+
+
+def emit_csr_test():
+    """Privileged CSR data ops (csr_rw / csr_rs / csr_rc) exercised through mscratch,
+    verifying each actually transforms the CSR value (not just round-trips a byte):
+      load_imm r7,0x20 ; csr_rw r1,r7,mscratch   ->  mscratch = 0x20
+      load_imm r2,0x07 ; csr_rs r1,r2,mscratch   ->  mscratch |= 0x07 = 0x27
+      load_imm r3,0x04 ; csr_rc r1,r3,mscratch   ->  mscratch &= ~0x04 = 0x23 ('#')
+      load_imm r7,0 (CLOBBER) ; load_imm r4,0 ; csr_rs r7,r4,mscratch -> r7 = 0x23
+      ecalli #0 (putchar r7) ; trap.
+    Prints '#' iff write + set + clear + read ALL work: 0x23 is reached only as
+    0x20 -> set 0x07 -> clear 0x04, so a wrong/no-op at any step yields a different
+    char (write-fail->0x03, set-fail->0x20 ' ', clear-fail->0x27 '\''). '#' is also
+    absent from the harness's own stdout, so it is unambiguous. The r7 clobber before
+    the read defeats a false pass. PVM runs at M-mode and mscratch is an M-mode CSR the
+    loader never touches, so the accesses are legal and observable. (mret/sret/wfi/
+    sfence_vma are control/privilege ops -- their meaningful test needs the guest-
+    privilege scenario from B4, so they are exercised there, not here.)"""
+    csr = le(MSCRATCH, 2)                    # [0x40, 0x03]
+    def b1(rd, rs1):                          # nibbles: hi = rd PVM idx, lo = rs1 PVM idx
+        return ((rd & 0xF) << 4) | (rs1 & 0xF)
+    code = (
+        [LOAD_IMM, 0x07, 0x20]               # r7 = 0x20                @0  (3B)
+        + [CSR_RW, b1(1, 7)] + csr           # mscratch = r7 = 0x20     @3  (4B)
+        + [LOAD_IMM, 0x02, 0x07]             # r2 = 0x07                @7  (3B)
+        + [CSR_RS, b1(1, 2)] + csr           # mscratch |= 0x07 -> 0x27 @10 (4B)
+        + [LOAD_IMM, 0x03, 0x04]             # r3 = 0x04                @14 (3B)
+        + [CSR_RC, b1(1, 3)] + csr           # mscratch &= ~0x04 ->0x23 @17 (4B)
+        + [LOAD_IMM, 0x07, 0x00]             # r7 = 0  (clobber)        @21 (3B)
+        + [LOAD_IMM, 0x04, 0x00]             # r4 = 0  (read mask)      @24 (3B)
+        + [CSR_RS, b1(7, 4)] + csr           # r7 = mscratch = 0x61     @27 (4B)
+        + [ECALLI, 0x00]                     # putchar(r7) = 'a'        @31 (2B)
+        + [TRAP]                             # trap                     @33 (1B)
+    )
+    starts = [0, 3, 7, 10, 14, 17, 21, 24, 27, 31, 33]
+    return code, starts
+
+
 def build_image(code, starts, jumptable=None, z=1):
     """Pad code to align16, append the LSB-first opcode bitmask, then (optionally)
     the dynamic jump table (z bytes/entry, LE). Returns (img, code_len, bm_off, jt_off)."""
@@ -292,6 +337,8 @@ def main():
         code, starts = emit_imm_branch(op, rv, xv)
     elif mode == "ldij":
         code, starts, jumptable, z = emit_ldij_test()
+    elif mode == "csr":
+        code, starts = emit_csr_test()
     else:
         code, starts = emit_banner(text)
     img, code_len, bm_off, jt_off = build_image(code, starts, jumptable, z)

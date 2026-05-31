@@ -117,7 +117,17 @@ run-ldij: loader.S link.ld gen_pvm_img.py
 	 echo ">> load_imm_jump_ind (expect J):"; \
 	 $(HARNESS) +PVM_IMG=$(abspath ldij.hex) +tohost_addr=$(TOHOST) +time_out=200000 $(abspath loader_ldij.elf) 2>&1 | grep -aE 'SUCCESS|^J'
 
-clean:
-	rm -f loader.elf loader_jump.elf loader_banner.elf loader_ecalli.elf loader_br.elf loader_loop.elf loader_djhalt.elf loader_djtab.elf loader_ibr.elf loader_ldij.elf loader_hi.elf baseline.elf banner.hex ecalli.hex hi_banner.hex br_taken.hex br_nottaken.hex loop.hex djhalt.hex djtab.hex ibr_t.hex ibr_nt.hex ldij.hex
+# Stage B2: privileged CSR data ops (csr_rw/csr_rs/csr_rc) through mscratch. Writes
+# 0x20, sets 0x07 (->0x27), clears 0x04 (->0x23), reads back, putchars '#'. The char
+# is '#' iff all three CSR ops transformed the real CSR correctly. PVM runs at M-mode
+# (mscratch is M-mode + loader-unused). mret/sret/wfi/sfence_vma -> B4 (need privilege).
+run-csr: loader.S link.ld gen_pvm_img.py
+	@CL=$$(python3 gen_pvm_img.py '' csr.hex csr | grep CODE_LEN | grep -oE '[0-9]+'); \
+	 $(CC) $(CFLAGS) -DCODE_LEN=$$CL -T link.ld -o loader_csr.elf loader.S; \
+	 echo ">> CSR rw/rs/rc round-trip (expect '#'):"; \
+	 $(HARNESS) +PVM_IMG=$(abspath csr.hex) +tohost_addr=$(TOHOST) +time_out=200000 $(abspath loader_csr.elf) 2>&1 | grep -aE 'SUCCESS|#'
 
-.PHONY: all run run-jump run-banner run-ecalli run-branch run-loop run-djump-halt run-djump-table run-ibranch run-ldij clean
+clean:
+	rm -f loader.elf loader_jump.elf loader_banner.elf loader_ecalli.elf loader_br.elf loader_loop.elf loader_djhalt.elf loader_djtab.elf loader_ibr.elf loader_ldij.elf loader_csr.elf loader_hi.elf baseline.elf banner.hex ecalli.hex hi_banner.hex br_taken.hex br_nottaken.hex loop.hex djhalt.hex djtab.hex ibr_t.hex ibr_nt.hex ldij.hex csr.hex
+
+.PHONY: all run run-jump run-banner run-ecalli run-branch run-loop run-djump-halt run-djump-table run-ibranch run-ldij run-csr clean
