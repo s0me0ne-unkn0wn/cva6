@@ -480,7 +480,18 @@ module cva6
       else if (pvm_active_q & ex_commit.valid)  pvm_active_q <= 1'b0;
     end
   end
-  assign pvm_active    = pvm_active_q & ~ex_commit.valid;
+  // pvm_active is purely REGISTERED -- no combinational `& ~ex_commit.valid` gate
+  // (which made pvm_active a combinational function of the commit-stage exception, a
+  // feedback path pvm_active -> issue mux -> ... -> commit -> ex_commit -> pvm_active).
+  // The registered exit is sufficient: on a host-call/trap, pvm_fetch has already
+  // dropped valid_o (halt_i suspended it the cycle the uop was accepted), so no
+  // spurious PVM uop is issued in the exception-commit cycle; pvm_active_q clears the
+  // next cycle (line above) so the M-mode handler then runs as RISC-V. Both this and
+  // the original comb gate pass all sim gates; this registered variant (no feedback)
+  // is what the verified FPGA banner was built with. (NB: the FPGA bring-up hang was
+  // NOT this gate -- it was a bootrom `la`->GOT bug setting mtvec=0; see log cont.14.)
+  assign pvm_active    = pvm_active_q;
+
   // PVMCFG1[33] = resume: set by the M-mode host-call handler so the re-activation
   // continues at the post-ecalli pc held in pvm_fetch (instead of reloading entry_pc).
   assign pvm_resume    = CVA6Cfg.PvmPresent & pvm_cfg1_csr[33];
@@ -500,7 +511,7 @@ module cva6
   assign pvm_img_wdata    = '0;
 
   if (CVA6Cfg.PvmPresent) begin : gen_pvm_front
-    pvm_front #(.VLEN(CVA6Cfg.VLEN)) i_pvm_front (
+    pvm_front #(.VLEN(CVA6Cfg.VLEN), .IMG_BYTES(256)) i_pvm_front (
         .clk_i,
         .rst_ni,
         .pvm_active_i   (pvm_active),

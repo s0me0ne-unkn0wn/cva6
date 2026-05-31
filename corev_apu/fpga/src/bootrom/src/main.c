@@ -53,6 +53,12 @@ int main()
     #endif 
     print_uart("Hello World!\r\n");
 
+    // PolkaVM bring-up (Stage 5): enter PVM mode and run the banner baked into
+    // pvm_front.img_mem. pvm_boot() services ecalli host-calls and never returns.
+    print_uart("Entering PolkaVM...\r\n");
+    extern void pvm_boot(void);
+    pvm_boot();
+
     // See if we should enter update mode
     print_uart("Hit any key to enter update mode ");
     for(i = 0; i < WAIT_SECONDS && !ret; i++) {

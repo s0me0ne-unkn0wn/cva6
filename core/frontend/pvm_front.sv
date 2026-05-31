@@ -15,6 +15,15 @@
 // loader via the img_we/img_addr/img_wdata port; read combinationally by fetch.
 // (FPGA synthesis will replace this with a real dual-port BRAM — a later step.)
 
+// img_mem initialisation source: FPGA synthesis (Vivado defines `SYNTHESIS`)
+// and the `+define+PVM_BAKE` sim-validation build compile in a fixed PolkaVM
+// banner image; plain simulation loads it at runtime via `+PVM_IMG`.
+`ifdef SYNTHESIS
+  `define PVM_USE_BAKED_IMG
+`elsif PVM_BAKE
+  `define PVM_USE_BAKED_IMG
+`endif
+
 module pvm_front
   import ariane_pkg::*;
   import polkavm_pkg::*;
@@ -69,13 +78,37 @@ module pvm_front
   // ---- image memory --------------------------------------------------------
   localparam int unsigned IMG_AW = $clog2(IMG_BYTES);
   logic [7:0] img_mem [0:IMG_BYTES-1];
+`ifdef PVM_USE_BAKED_IMG
+  // Baked PolkaVM image (FPGA / PVM_BAKE): a compiled-in `ecalli` banner driven as
+  // a PURE COMBINATIONAL CONSTANT ROM -- no write port, no `initial`. The JAM
+  // fetch windows read img_mem through many combinational ports, so Vivado cannot
+  // map it to a BRAM; with a writable array it dissolved into 32768 registers
+  // ("Potential Runtime issue") whose power-on INIT is unreliable. Driving the
+  // array from constants instead folds every read into a small guaranteed-init
+  // LUT ROM. Bytes are identical to verif/tests/custom/pvm_run/banner_fpga.hex,
+  // which the run-ecalli Verilator gate validates (banner 'PolkaVM on CVA6!\r\n',
+  // CODE_LEN=91). The M-mode bootrom (pvm_boot.S) enters PVM with CODE_LEN=91.
+  // Baked PolkaVM image (FPGA / PVM_BAKE): a compiled-in `ecalli` banner driven as
+  // a PURE COMBINATIONAL CONSTANT ROM -- no write port, no `initial`. The JAM
+  // fetch windows read img_mem through many combinational ports, so Vivado cannot
+  // map it to a BRAM; with a writable array it dissolved into 32768 registers
+  // ("Potential Runtime issue") whose power-on INIT is unreliable. Driving the
+  // array from constants instead folds every read into a small guaranteed-init
+  // LUT ROM. Bytes are identical to verif/tests/custom/pvm_run/banner_fpga.hex,
+  // which the run-ecalli Verilator gate validates (banner 'PolkaVM on CVA6!\r\n',
+  // CODE_LEN=91). The M-mode bootrom (pvm_boot.S) enters PVM with CODE_LEN=91.
+  localparam int PVM_BAKED_N = 108;
+  localparam logic [7:0] PVM_BAKED_DATA [0:PVM_BAKED_N-1] = '{8'h33, 8'h07, 8'h50, 8'h0a, 8'h00, 8'h33, 8'h07, 8'h6f, 8'h0a, 8'h00, 8'h33, 8'h07, 8'h6c, 8'h0a, 8'h00, 8'h33, 8'h07, 8'h6b, 8'h0a, 8'h00, 8'h33, 8'h07, 8'h61, 8'h0a, 8'h00, 8'h33, 8'h07, 8'h56, 8'h0a, 8'h00, 8'h33, 8'h07, 8'h4d, 8'h0a, 8'h00, 8'h33, 8'h07, 8'h20, 8'h0a, 8'h00, 8'h33, 8'h07, 8'h6f, 8'h0a, 8'h00, 8'h33, 8'h07, 8'h6e, 8'h0a, 8'h00, 8'h33, 8'h07, 8'h20, 8'h0a, 8'h00, 8'h33, 8'h07, 8'h43, 8'h0a, 8'h00, 8'h33, 8'h07, 8'h56, 8'h0a, 8'h00, 8'h33, 8'h07, 8'h41, 8'h0a, 8'h00, 8'h33, 8'h07, 8'h36, 8'h0a, 8'h00, 8'h33, 8'h07, 8'h21, 8'h0a, 8'h00, 8'h33, 8'h07, 8'h0d, 8'h0a, 8'h00, 8'h33, 8'h07, 8'h0a, 8'h0a, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00, 8'h29, 8'ha5, 8'h94, 8'h52, 8'h4a, 8'h29, 8'ha5, 8'h94, 8'h52, 8'h4a, 8'h29, 8'h05};
+  always_comb begin : p_img_rom
+    for (int k = 0; k < IMG_BYTES; k++)
+      img_mem[k] = (k < PVM_BAKED_N) ? PVM_BAKED_DATA[k] : 8'h00;
+  end
+`else
+  // Simulation: a writable image loaded at runtime via `+PVM_IMG=<hexfile>` (the
+  // loader/img-write path). One hex byte per line.
   always_ff @(posedge clk_i) begin
     if (img_we_i && img_addr_i < VLEN'(IMG_BYTES)) img_mem[img_addr_i[IMG_AW-1:0]] <= img_wdata_i;
   end
-`ifndef SYNTHESIS
-  // Simulation-only image preload: `+PVM_IMG=<hexfile>` loads the emit-image
-  // bytes (one hex byte per line) into img_mem. FPGA uses the img write port /
-  // a real loader path instead (guarded out of synthesis).
   initial begin : p_img_preload
     string pvm_img_file;
     if ($value$plusargs("PVM_IMG=%s", pvm_img_file)) begin
