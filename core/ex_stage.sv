@@ -42,6 +42,8 @@ module ex_stage
     input logic flush_i,
     // Debug mode is enabled - CSR_REGFILE
     input logic debug_mode_i,
+    // PVM guest mode active: mask LSU data addresses to the 32-bit guest space - CVA6
+    input logic pvm_active_i,
     // rs1 forwarding - ISSUE_STAGE
     input logic [CVA6Cfg.NrIssuePorts-1:0][CVA6Cfg.VLEN-1:0] rs1_forwarding_i,
     // rs2 forwarding - ISSUE_STAGE
@@ -474,6 +476,7 @@ module ex_stage
       .lsu_ready_o,
       .lsu_valid_i           (|lsu_valid_i),
       .speculative_load_i    (speculative_load),
+      .pvm_active_i          (pvm_active_i),
       .load_trans_id_o,
       .load_result_o,
       .load_valid_o,

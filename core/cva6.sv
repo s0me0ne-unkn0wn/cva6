@@ -1133,6 +1133,7 @@ module cva6
       .clk_i(clk_i),
       .rst_ni(rst_ni),
       .debug_mode_i(debug_mode),
+      .pvm_active_i(pvm_active),
       .flush_i(flush_ctrl_ex),
       .rs1_forwarding_i(rs1_forwarding_id_ex),
       .rs2_forwarding_i(rs2_forwarding_id_ex),

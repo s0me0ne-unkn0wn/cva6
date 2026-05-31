@@ -158,7 +158,7 @@ run-dram: loader_dramload.S link.ld
 # returns non-zero on failure (the SUCCESS grep / the hardened '#' asserts), so the exit
 # code is the per-gate verdict.
 PVM_GATES = run run-ecalli run-banner run-branch run-loop run-djump-halt run-djump-table \
-            run-ibranch run-ldij run-csr run-hostcall run-dram run-dram-banner
+            run-ibranch run-ldij run-csr run-hostcall run-dram run-dram-banner run-user
 run-all:
 	@pass=0; fail=0; failed=""; \
 	 for t in $(PVM_GATES); do \
@@ -178,7 +178,25 @@ run-dram-banner: loader_drambanner.S banner_blob.S link.ld
 	 echo "$$OUT" | grep -aoE 'PolkaVM on CVA6!' | head -1; \
 	 echo "$$OUT" | grep -qa 'PolkaVM on CVA6!' && echo "   CSR-load-at-scale OK" || { echo "   *** FAILED ***"; exit 1; }
 
+# A6: run a REAL compiled PolkaVM program from DRAM (not a hand-emitted banner). Take a
+# .polkavm blob, emit-image it, convert to our img_mem layout (polkavm_to_img.py), size
+# the loader to its code_len, run. The example export 'add_numbers' uses the GUEST STACK
+# (spills ra/s0 to [sp]/[sp+4] with sp in DRAM), arithmetic, a host-call, and ret-halt;
+# it computes a0 = a0+a1+third = 10+20+12 = 42 = '*'. Exactly one '*' + SUCCESS proves
+# the whole path -- the LSU 32-bit guest-address mask makes the stack land in DRAM.
+POLKATOOL ?= /home/claude/pvm/polkavm/target/release/polkatool
+USER_BLOB  ?= /home/claude/pvm/polkavm/guest-programs/output/example-hello-world.polkavm
+run-user: loader_user.S link.ld polkavm_to_img.py
+	@$(POLKATOOL) emit-image $(USER_BLOB) -o hello.img >/dev/null 2>&1; \
+	 CL=$$(python3 polkavm_to_img.py hello.img hello | grep CODE_LEN | grep -oE '[0-9]+'); \
+	 echo ">> real PolkaVM program from DRAM, CODE_LEN=$$CL (expect one '*'=42):"; \
+	 $(CC) $(CFLAGS) -DCODE_LEN=$$CL -T link.ld -o loader_user.elf loader_user.S; \
+	 OUT=$$($(HARNESS) +PVM_IMG=$(abspath hello.hex) +tohost_addr=$(TOHOST) +time_out=300000 $(abspath loader_user.elf) 2>&1); \
+	 echo "$$OUT" | grep -aE 'SUCCESS'; \
+	 R=$$(echo "$$OUT" | grep -aoE '\[.\]' | head -1); echo "   guest result = $$R (expect [*])"; \
+	 { [ "$$R" = "[*]" ] && echo "$$OUT" | grep -qa 'SUCCESS'; } && echo "   A6 OK: real program ran from DRAM" || { echo "   *** A6 FAILED (got '$$R') ***"; exit 1; }
+
 clean:
 	rm -f loader.elf loader_jump.elf loader_banner.elf loader_ecalli.elf loader_br.elf loader_loop.elf loader_djhalt.elf loader_djtab.elf loader_ibr.elf loader_ldij.elf loader_csr.elf loader_hostcall.elf loader_dramload.elf loader_drambanner.elf loader_hi.elf baseline.elf banner.hex ecalli.hex hi_banner.hex br_taken.hex br_nottaken.hex loop.hex djhalt.hex djtab.hex ibr_t.hex ibr_nt.hex ldij.hex csr.hex hostcall.hex
 
-.PHONY: all run run-jump run-banner run-ecalli run-branch run-loop run-djump-halt run-djump-table run-ibranch run-ldij run-csr run-hostcall run-dram run-dram-banner run-all clean
+.PHONY: all run run-jump run-banner run-ecalli run-branch run-loop run-djump-halt run-djump-table run-ibranch run-ldij run-csr run-hostcall run-dram run-dram-banner run-user run-all clean

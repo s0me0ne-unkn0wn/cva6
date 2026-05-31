@@ -53,6 +53,8 @@ module load_store_unit
     input logic lsu_valid_i,
     // Signals speculative loads for non-idempotent load handling - EX_STAGE
     input logic speculative_load_i,
+    // PVM guest mode active: mask data addresses to the 32-bit guest space - EX_STAGE
+    input logic pvm_active_i,
 
     // Load transaction ID - ISSUE_STAGE
     output logic [CVA6Cfg.TRANS_ID_BITS-1:0] load_trans_id_o,
@@ -192,7 +194,16 @@ module load_store_unit
   logic                        overflow;
   logic [(CVA6Cfg.XLEN/8)-1:0] be_i;
 
-  assign vaddr_xlen = $unsigned($signed(fu_data_i.imm) + $signed(fu_data_i.operand_a));
+  // PVM's guest address space is 32-bit: the guest computes addresses with 32-bit
+  // arithmetic (add_imm_32 sign-extends bit 31), so a DRAM pointer like 0x8010_0000
+  // becomes 0xFFFFFFFF_8010_0000 once written back to the 64-bit GPR. Mask to the low
+  // 32 bits (zero-extend) so it maps back to physical DRAM. RISC-V mode (pvm_active_i=0)
+  // and non-PVM builds (PvmPresent=0) keep the full 64-bit address unchanged.
+  logic [CVA6Cfg.XLEN-1:0] vaddr_xlen_raw;
+  assign vaddr_xlen_raw = $unsigned($signed(fu_data_i.imm) + $signed(fu_data_i.operand_a));
+  assign vaddr_xlen = (CVA6Cfg.PvmPresent && pvm_active_i)
+                    ? CVA6Cfg.XLEN'(vaddr_xlen_raw[31:0])  // 32-bit guest addr -> zero-extend
+                    : vaddr_xlen_raw;
   assign vaddr_i = vaddr_xlen[CVA6Cfg.VLEN-1:0];
   // we work with SV39 or SV32, so if VM is enabled, check that all bits [XLEN-1:38] or [XLEN-1:31] are equal
   assign overflow = (CVA6Cfg.IS_XLEN64 && (!((&vaddr_xlen[CVA6Cfg.XLEN-1:CVA6Cfg.SV-1]) == 1'b1 || (|vaddr_xlen[CVA6Cfg.XLEN-1:CVA6Cfg.SV-1]) == 1'b0)));
