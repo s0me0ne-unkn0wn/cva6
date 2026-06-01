@@ -459,6 +459,7 @@ module cva6
   logic [63:0]             pvm_imm, pvm_hcid;
   scoreboard_entry_t       pvm_sbe;
   logic [CVA6Cfg.XLEN-1:0] pvm_cfg0_csr, pvm_cfg1_csr, pvm_cfg2_csr;  // from control CSRs (csr_regfile)
+  logic [CVA6Cfg.XLEN-1:0] pvm_ram_csr;  // B7: guest-RAM->DRAM aperture (csr_regfile -> ex_stage -> LSU)
   // M3 demand-fetch: PVM fetches code/bitmask/jt from DRAM via dcache port 0 (PTW, idle
   // in M-mode). fetch_from_dram = CFG1[34]; pvm_dreq is muxed onto port 0 when active.
   logic pvm_fetch_from_dram;
@@ -1225,6 +1226,7 @@ module cva6
       .rst_ni(rst_ni),
       .debug_mode_i(debug_mode),
       .pvm_active_i(pvm_active),
+      .pvm_ram_i(pvm_ram_csr),
       .flush_i(flush_ctrl_ex),
       .rs1_forwarding_i(rs1_forwarding_id_ex),
       .rs2_forwarding_i(rs2_forwarding_id_ex),
@@ -1497,6 +1499,7 @@ module cva6
       .pvm_cfg2_o              (pvm_cfg2_csr),
       .pvm_img_we_o            (pvm_img_we_csr),
       .pvm_img_w_o             (pvm_img_w_csr),
+      .pvm_ram_o               (pvm_ram_csr),
       //RVFI
       .rvfi_csr_o              (rvfi_csr),
       // Trigger Signals

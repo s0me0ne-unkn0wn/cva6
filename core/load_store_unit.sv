@@ -55,6 +55,8 @@ module load_store_unit
     input logic speculative_load_i,
     // PVM guest mode active: mask data addresses to the 32-bit guest space - EX_STAGE
     input logic pvm_active_i,
+    // PVM guest-RAM->DRAM aperture (CSR_PVM_RAM): base + page bounds - EX_STAGE
+    input logic [CVA6Cfg.XLEN-1:0] pvm_ram_i,
 
     // Load transaction ID - ISSUE_STAGE
     output logic [CVA6Cfg.TRANS_ID_BITS-1:0] load_trans_id_o,
@@ -196,13 +198,31 @@ module load_store_unit
 
   // PVM's guest address space is 32-bit: the guest computes addresses with 32-bit
   // arithmetic (add_imm_32 sign-extends bit 31), so a DRAM pointer like 0x8010_0000
-  // becomes 0xFFFFFFFF_8010_0000 once written back to the 64-bit GPR. Mask to the low
-  // 32 bits (zero-extend) so it maps back to physical DRAM. RISC-V mode (pvm_active_i=0)
-  // and non-PVM builds (PvmPresent=0) keep the full 64-bit address unchanged.
+  // becomes 0xFFFFFFFF_8010_0000 once written back to the 64-bit GPR. We always start by
+  // taking the low 32 bits (zero-extend). B7: a range-selective aperture (CSR_PVM_RAM)
+  // then relocates guest-RAM addresses into DRAM while leaving MMIO (UART/CLINT, outside
+  // the aperture) to pass through unchanged. CSR_PVM_RAM encoding (XLEN=64):
+  //   [31:0]=ram_base, [47:32]=ram_lo_page, [63:48]=ram_hi_page; addr = page << 16.
+  // The aperture is [ram_lo_page<<16, ram_hi_page<<16); in-aperture addrs get +ram_base.
+  // DEFAULT (CSR_PVM_RAM==0): lo=hi=0 -> in_ram is never true (a32 < 0 impossible) ->
+  // vaddr = zext32(a32), i.e. byte-identical to the original base=0 zero-extend.
+  // RISC-V mode (pvm_active_i=0) and non-PVM builds (PvmPresent=0) keep the full 64-bit
+  // address unchanged.
   logic [CVA6Cfg.XLEN-1:0] vaddr_xlen_raw;
+  logic [           31:0]  pvm_a32;
+  logic [           31:0]  pvm_ram_base;
+  logic [           31:0]  pvm_ram_lo;
+  logic [           31:0]  pvm_ram_hi;
+  logic                    pvm_in_ram;
   assign vaddr_xlen_raw = $unsigned($signed(fu_data_i.imm) + $signed(fu_data_i.operand_a));
+  assign pvm_a32      = vaddr_xlen_raw[31:0];
+  assign pvm_ram_base = pvm_ram_i[31:0];
+  assign pvm_ram_lo   = {pvm_ram_i[47:32], 16'b0};
+  assign pvm_ram_hi   = {pvm_ram_i[63:48], 16'b0};
+  assign pvm_in_ram   = (pvm_a32 >= pvm_ram_lo) && (pvm_a32 < pvm_ram_hi);
   assign vaddr_xlen = (CVA6Cfg.PvmPresent && pvm_active_i)
-                    ? CVA6Cfg.XLEN'(vaddr_xlen_raw[31:0])  // 32-bit guest addr -> zero-extend
+                    ? (pvm_in_ram ? (CVA6Cfg.XLEN'(pvm_a32) + CVA6Cfg.XLEN'(pvm_ram_base))  // guest RAM -> DRAM
+                                  : CVA6Cfg.XLEN'(pvm_a32))                                  // MMIO / other -> zero-extend pass-through
                     : vaddr_xlen_raw;
   assign vaddr_i = vaddr_xlen[CVA6Cfg.VLEN-1:0];
   // we work with SV39 or SV32, so if VM is enabled, check that all bits [XLEN-1:38] or [XLEN-1:31] are equal
