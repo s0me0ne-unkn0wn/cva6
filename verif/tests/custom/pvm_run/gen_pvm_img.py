@@ -243,6 +243,7 @@ CSR_RW   = 0xE7   # 231
 CSR_RS   = 0xE8   # 232
 CSR_RC   = 0xE9   # 233
 MSCRATCH = 0x340  # an M-mode CSR unused by the loader -> safe to clobber from PVM
+MTVEC    = 0x305  # M-mode trap vector: the guest clobbers it to prove the B4 PVM-exit decouple
 
 
 def emit_csr_test():
@@ -297,6 +298,29 @@ def emit_hostcall_test():
         + [TRAP]                    # trap                        @10 (1B)
     )
     starts = [0, 3, 6, 8, 10]
+    return code, starts
+
+
+def emit_mtvec_test():
+    """B4 mtvec-decouple proof: the guest CLOBBERS mtvec (simulating OpenSBI installing its
+    own trap vector), then ecalli #0 (putchar). The ecalli MUST still reach the host handler
+    -- because a PVM host-boundary exit is delivered to CSR_PVM_VEC, not mtvec. The loader
+    sets CSR_PVM_VEC = the real handler; mtvec is clobbered to a bogus 0x40. If the decouple
+    works, '#' prints; if the exit wrongly used the (clobbered) mtvec, control jumps to 0x40
+    -> no '#'. Prints '#' iff B4 routes the host-boundary exit independently of mtvec.
+      load_imm r2,0x40 ; csr_rw r1,r2,mtvec  -> mtvec = 0x40 (CLOBBER)
+      load_imm r7,0x23 ; ecalli #0 (putchar '#') ; trap."""
+    def b1(rd, rs1):
+        return ((rd & 0xF) << 4) | (rs1 & 0xF)
+    mtv = le(MTVEC, 2)                        # [0x05, 0x03]
+    code = (
+        [LOAD_IMM, 0x02, 0x40]               # r2 = 0x40 (bogus handler)   @0  (3B)
+        + [CSR_RW, b1(1, 2)] + mtv           # mtvec = r2 = 0x40 (clobber) @3  (4B)
+        + [LOAD_IMM, 0x07, 0x23]             # r7 = 0x23 = '#'             @7  (3B)
+        + [ECALLI, 0x00]                     # putchar(r7) via CSR_PVM_VEC @10 (2B)
+        + [TRAP]                             # trap                        @12 (1B)
+    )
+    starts = [0, 3, 7, 10, 12]
     return code, starts
 
 
@@ -358,6 +382,8 @@ def main():
         code, starts, jumptable, z = emit_ldij_test()
     elif mode == "csr":
         code, starts = emit_csr_test()
+    elif mode == "mtvec":
+        code, starts = emit_mtvec_test()
     elif mode == "hostcall":
         code, starts = emit_hostcall_test()
     else:

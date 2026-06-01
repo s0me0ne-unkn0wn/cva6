@@ -581,6 +581,7 @@ package riscv;
     CSR_PVM_CFG1         = 12'hBC1,  // [31:0]=code_len, [32]=pvm_active, [33]=resume
     CSR_PVM_CFG2         = 12'hBC2,  // [31:0]=jumptable_base, [35:32]=jumptable entry size z
     CSR_PVM_IMG          = 12'hBC3,  // write {addr[..:8], data[7:0]} -> img_mem[addr] (M1 DRAM load port)
+    CSR_PVM_VEC          = 12'hBC4,  // B4: PVM host-boundary exit vector (ecalli/panic bypass mtvec, OpenSBI-safe)
     CSR_MCONFIGPTR       = 12'hF15,
     CSR_MCYCLE           = 12'hB00,
     CSR_MCYCLEH          = 12'hB80,

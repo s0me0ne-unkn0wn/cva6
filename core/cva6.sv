@@ -457,6 +457,15 @@ module cva6
   logic [63:0]             pvm_imm, pvm_hcid;
   scoreboard_entry_t       pvm_sbe;
   logic [CVA6Cfg.XLEN-1:0] pvm_cfg0_csr, pvm_cfg1_csr, pvm_cfg2_csr;  // from control CSRs (csr_regfile)
+  // M3 demand-fetch: PVM fetches code/bitmask/jt from DRAM via dcache port 0 (PTW, idle
+  // in M-mode). fetch_from_dram = CFG1[34]; pvm_dreq is muxed onto port 0 when active.
+  logic pvm_fetch_from_dram;
+  logic pvm_use_vec;                 // B4: this PVM exit is a host-boundary one -> CSR_PVM_VEC
+  dcache_req_i_t pvm_dreq;
+  logic pvm_d_req, pvm_d_tag_valid, pvm_d_kill, pvm_d_gnt, pvm_d_rvalid;
+  logic [CVA6Cfg.DCACHE_INDEX_WIDTH-1:0] pvm_d_addr_index;
+  logic [CVA6Cfg.DCACHE_TAG_WIDTH-1:0]   pvm_d_addr_tag;
+  logic [CVA6Cfg.XLEN-1:0]               pvm_d_rdata;
   logic                    pvm_img_we_csr;   // CSR_PVM_IMG write pulse (M1 load port)
   logic [CVA6Cfg.XLEN-1:0] pvm_img_w_csr;    // {addr, data} payload
 
@@ -508,6 +517,14 @@ module cva6
   assign pvm_code_len  = {{(CVA6Cfg.VLEN-32){1'b0}}, pvm_cfg1_csr[31:0]};
   assign pvm_bitmask_base = pvm_code_base +
       {{(CVA6Cfg.VLEN-32){1'b0}}, ((pvm_cfg1_csr[31:0] + 32'd15) & ~32'd15)};
+  // M3: CFG1[34] selects DRAM demand-fetch (image stays in DRAM; CFG0/2 carry DRAM addrs).
+  assign pvm_fetch_from_dram = CVA6Cfg.PvmPresent & pvm_cfg1_csr[34];
+  // B4: a PVM host-boundary exit (ecalli/panic/illegal/clean-halt, all adapter-synthesized
+  // below) routes to CSR_PVM_VEC instead of mtvec. Same combinational set that drives
+  // pvm_sbe.ex, so it reaches csr_regfile.ex_i coherently (pvm_front holds the uop to commit).
+  // Guest-internal RISC-V faults arrive via the FU writeback (not flagged here) -> keep mtvec.
+  assign pvm_use_vec = CVA6Cfg.PvmPresent & pvm_active &
+                       (pvm_is_hostcall | pvm_is_trap | pvm_illegal | pvm_unsupported | pvm_done);
   // M1 image load: the M-mode bootrom writes img_mem via CSR_PVM_IMG (csr_regfile
   // pulses pvm_img_we_csr with {addr,data} in pvm_img_w_csr), so JAM code can be
   // copied in from DRAM before entering PVM. (No baked ROM anymore.)
@@ -516,7 +533,9 @@ module cva6
   assign pvm_img_wdata    = pvm_img_w_csr[7:0];
 
   if (CVA6Cfg.PvmPresent) begin : gen_pvm_front
-    pvm_front #(.VLEN(CVA6Cfg.VLEN), .IMG_BYTES(4096)) i_pvm_front (
+    pvm_front #(.VLEN(CVA6Cfg.VLEN), .IMG_BYTES(4096),
+        .DC_IDX(CVA6Cfg.DCACHE_INDEX_WIDTH), .DC_TAG(CVA6Cfg.DCACHE_TAG_WIDTH),
+        .DC_PLEN(CVA6Cfg.PLEN)) i_pvm_front (
         .clk_i,
         .rst_ni,
         .pvm_active_i   (pvm_active),
@@ -525,6 +544,15 @@ module cva6
         .code_len_i     (pvm_code_len),
         .code_base_i    (pvm_code_base),
         .bitmask_base_i (pvm_bitmask_base),
+        .fetch_from_dram_i(pvm_fetch_from_dram),
+        .d_req_o        (pvm_d_req),
+        .d_addr_index_o (pvm_d_addr_index),
+        .d_addr_tag_o   (pvm_d_addr_tag),
+        .d_tag_valid_o  (pvm_d_tag_valid),
+        .d_kill_o       (pvm_d_kill),
+        .d_gnt_i        (pvm_d_gnt),
+        .d_rvalid_i     (pvm_d_rvalid),
+        .d_rdata_i      (pvm_d_rdata),
         .img_we_i       (pvm_img_we),
         .img_addr_i     (pvm_img_addr),
         .img_wdata_i    (pvm_img_wdata),
@@ -574,6 +602,11 @@ module cva6
     assign pvm_unsupported = 1'b0;
     assign pvm_halted = 1'b0;
     assign pvm_done = 1'b0;
+    assign pvm_d_req = 1'b0;
+    assign pvm_d_addr_index = '0;
+    assign pvm_d_addr_tag = '0;
+    assign pvm_d_tag_valid = 1'b0;
+    assign pvm_d_kill = 1'b0;
   end
 
   // Adapter: PVM raw micro-op -> scoreboard_entry_t
@@ -1400,6 +1433,7 @@ module cva6
       .scbcfe_o                (scbcfe),
       .hcbcfe_o                (hcbcfe),
       .jvt_o                   (jvt),
+      .pvm_use_vec_i           (pvm_use_vec),
       .pvm_cfg0_o              (pvm_cfg0_csr),
       .pvm_cfg1_o              (pvm_cfg1_csr),
       .pvm_cfg2_o              (pvm_cfg2_csr),
@@ -1517,7 +1551,25 @@ module cva6
 
   // D$ request
   // RVZCMT disabled - use standard cache port 0 routing
-  assign dcache_req_to_cache[0] = dcache_req_ports_ex_cache[0];
+  // M3: assemble the PVM demand-fetch dcache request and mux it onto port 0 (the PTW
+  // port, idle in M-mode Bare) when PVM runs in DRAM-fetch mode. The PTW response wire
+  // (dcache_req_ports_cache_ex[0]) is left as-is (PTW is idle); pvm_d_* taps the same.
+  always_comb begin
+    pvm_dreq               = '0;
+    pvm_dreq.address_index = pvm_d_addr_index;
+    pvm_dreq.address_tag   = pvm_d_addr_tag;
+    pvm_dreq.data_we       = 1'b0;
+    pvm_dreq.data_size     = 2'b11;                 // 64-bit beat
+    pvm_dreq.data_req      = pvm_d_req;
+    pvm_dreq.tag_valid     = pvm_d_tag_valid;
+    pvm_dreq.kill_req      = pvm_d_kill;
+    pvm_dreq.cbo_op        = ariane_pkg::CBO_NONE;
+  end
+  assign pvm_d_gnt    = dcache_req_from_cache[0].data_gnt;
+  assign pvm_d_rvalid = dcache_req_from_cache[0].data_rvalid;
+  assign pvm_d_rdata  = dcache_req_from_cache[0].data_rdata;
+  assign dcache_req_to_cache[0] = (pvm_fetch_from_dram & pvm_active) ? pvm_dreq
+                                                                     : dcache_req_ports_ex_cache[0];
   assign dcache_req_to_cache[1] = dcache_req_ports_ex_cache[1];
   assign dcache_req_to_cache[2] = dcache_req_ports_acc_cache[0];
   assign dcache_req_to_cache[3] = dcache_req_ports_ex_cache[2].data_req ? dcache_req_ports_ex_cache [2] :

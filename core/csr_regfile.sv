@@ -186,6 +186,8 @@ module csr_regfile
     output rvfi_probes_csr_t rvfi_csr_o,
     //jvt output
     output jvt_t jvt_o,
+    // B4: route a PVM host-boundary exit (ecalli/panic) to CSR_PVM_VEC instead of mtvec
+    input  logic                    pvm_use_vec_i,
     output logic [CVA6Cfg.XLEN-1:0] pvm_cfg0_o,
     output logic [CVA6Cfg.XLEN-1:0] pvm_cfg1_o,
     output logic [CVA6Cfg.XLEN-1:0] pvm_cfg2_o,
@@ -245,6 +247,7 @@ module csr_regfile
   logic [CVA6Cfg.XLEN-1:0] pvm_cfg0_q, pvm_cfg0_d;  // PolkaVM control CSR 0
   logic [CVA6Cfg.XLEN-1:0] pvm_cfg1_q, pvm_cfg1_d;  // PolkaVM control CSR 1
   logic [CVA6Cfg.XLEN-1:0] pvm_cfg2_q, pvm_cfg2_d;  // PolkaVM control CSR 2 (jump table)
+  logic [CVA6Cfg.XLEN-1:0] pvm_vec_q, pvm_vec_d;    // B4: PVM host-boundary exit vector
   logic [CVA6Cfg.XLEN-1:0] mepc_q, mepc_d;
   logic [CVA6Cfg.XLEN-1:0] mcause_q, mcause_d;
   logic [CVA6Cfg.XLEN-1:0] mtval_q, mtval_d;
@@ -446,6 +449,7 @@ module csr_regfile
         riscv::CSR_PVM_CFG0: csr_rdata = pvm_cfg0_q;
         riscv::CSR_PVM_CFG1: csr_rdata = pvm_cfg1_q;
         riscv::CSR_PVM_CFG2: csr_rdata = pvm_cfg2_q;
+        riscv::CSR_PVM_VEC:  csr_rdata = pvm_vec_q;
         riscv::CSR_PVM_IMG:  csr_rdata = '0;  // write-only image load port
         riscv::CSR_MEPC: csr_rdata = mepc_q;
         riscv::CSR_MCAUSE: csr_rdata = mcause_q;
@@ -855,6 +859,7 @@ module csr_regfile
     pvm_cfg0_d   = pvm_cfg0_q;
     pvm_cfg1_d   = pvm_cfg1_q;
     pvm_cfg2_d   = pvm_cfg2_q;
+    pvm_vec_d    = pvm_vec_q;
     if (CVA6Cfg.TvalEn) mtval_d = mtval_q;
 
     fiom_d     = fiom_q;
@@ -1185,6 +1190,7 @@ module csr_regfile
           flush_o = 1'b1;
         end
         riscv::CSR_PVM_CFG2: pvm_cfg2_d = csr_wdata;
+        riscv::CSR_PVM_VEC:  pvm_vec_d = csr_wdata;
         riscv::CSR_PVM_IMG:  pvm_img_we_o = 1'b1;  // 1-cycle img_mem write pulse (data in pvm_img_w_o)
         riscv::CSR_MEPC: mepc_d = {csr_wdata[CVA6Cfg.XLEN-1:1], 1'b0};
         riscv::CSR_MCAUSE: mcause_d = csr_wdata;
@@ -1872,6 +1878,17 @@ module csr_regfile
       trap_vector_base_o[7:2] = ex_i.cause[5:0];
     end
 
+    // B4: a PVM host-boundary exit (ecalli / panic / illegal / clean-halt, flagged by the
+    // cva6 adapter) is delivered to CSR_PVM_VEC instead of mtvec -- so a guest (e.g. OpenSBI)
+    // doing `csrw mtvec` cannot steal the host hypervisor's hook. Authoritative (overrides
+    // mtvec/stvec/vectored). Guest-internal RISC-V faults (FU writeback) are NOT flagged and
+    // keep using mtvec/stvec. PvmPresent-gated + pvm_use_vec_i=0 for every non-PVM exception,
+    // so the standard RISC-V trap path is byte-identical when this is off.
+    // CSR_PVM_VEC==0 means "unset" -> fall back to mtvec (backward-compatible: gates/hosts
+    // that never set CSR_PVM_VEC keep the original ecalli/trap->mtvec delivery).
+    if (CVA6Cfg.PvmPresent && pvm_use_vec_i && (|pvm_vec_q))
+      trap_vector_base_o = {pvm_vec_q[CVA6Cfg.VLEN-1:2], 2'b0};
+
     epc_o = mepc_q[CVA6Cfg.VLEN-1:0];
     // we are returning from supervisor mode, so take the sepc register
     if (CVA6Cfg.RVS) begin
@@ -1999,6 +2016,7 @@ module csr_regfile
       pvm_cfg0_q       <= {CVA6Cfg.XLEN{1'b0}};
       pvm_cfg1_q       <= {CVA6Cfg.XLEN{1'b0}};
       pvm_cfg2_q       <= {CVA6Cfg.XLEN{1'b0}};
+      pvm_vec_q        <= {CVA6Cfg.XLEN{1'b0}};
       if (CVA6Cfg.TvalEn) mtval_q <= {CVA6Cfg.XLEN{1'b0}};
       fiom_q          <= '0;
       dcache_q        <= {{CVA6Cfg.XLEN - 1{1'b0}}, 1'b1};
@@ -2062,6 +2080,7 @@ module csr_regfile
       pvm_cfg0_q       <= pvm_cfg0_d;
       pvm_cfg1_q       <= pvm_cfg1_d;
       pvm_cfg2_q       <= pvm_cfg2_d;
+      pvm_vec_q        <= pvm_vec_d;
       if (CVA6Cfg.TvalEn) mtval_q <= mtval_d;
       fiom_q          <= fiom_d;
       dcache_q        <= dcache_d;
