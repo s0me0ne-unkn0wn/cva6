@@ -403,6 +403,52 @@ def emit_priv_test():
     return code, starts
 
 
+def emit_priv_dyn_test():
+    """B5 flush-safe guest CSR write: identical to emit_priv_test() EXCEPT the GUEST sets
+    mstatus.MPP=S ITSELF (instead of the host loader), via a flush-class CSR write that B5's
+    csr-fence makes safe. A write to mstatus raises flush_o in csr_regfile; without B5 that
+    flush discards the YOUNGER in-flight PVM uop (here the mret issued right after) -> the eret
+    never commits and pvm_fetch hangs (no output). With B5, pvm_fetch fences at the mstatus
+    write, lets it commit ALONE, then resumes -- so the round-trip prints '#'.
+      @M  load_imm r2,0x800 ; csr_rs r1,r2,mstatus  -> mstatus.MPP=S (FLUSH-CLASS, fenced)
+          csr_rw mtvec,Lh ; csr_rw mepc,Ls ; mret    -> redirect to Ls, priv->S
+      @23 trap                                         (DECOY: mret-redirect-fail exit)
+      @Lh(M) ... (host '#') ... ; @Ls(S) ecalli@S -> guest-trap to Lh
+    Prints '#' iff B5 fences the guest mstatus write (no hang) AND the priv round-trip works.
+    A hang (no output / timeout) means the flush discarded the mret -> B5 is broken."""
+    def b1(rd, rs1):
+        return ((rd & 0xF) << 4) | (rs1 & 0xF)
+    mstatus = le(MSTATUS, 2)                      # [0x00, 0x03]
+    mtvec   = le(MTVEC, 2)                         # [0x05, 0x03]
+    mepc    = le(MEPC, 2)                          # [0x41, 0x03]
+    # Layout shifts +8 vs emit_priv_test() for the guest MPP-set prefix (load_imm 4B + csr_rs
+    # 4B). ALIGNMENT (RISC-V WARL on the PVM-pc targets): mtvec is 4-byte aligned (direct mode,
+    # bits[1:0]=0) so Lh MUST be 4-aligned; mepc clears bit 0 so Ls MUST be 2-aligned. With the
+    # +8 prefix and the same body, Lh=24 (4-aligned, right after the decoy) and Ls=30 (2-aligned).
+    Lh = 24                                       # M-mode guest trap handler PVM-pc (4-aligned)
+    Ls = 30                                       # S-mode entry PVM-pc (2-aligned)
+    code = (
+        [LOAD_IMM, 0x02, 0x00, 0x08]              # r2 = 0x800 (MPP=S bit, 2-byte imm) @0  (4B)
+        + [CSR_RS, b1(1, 2)] + mstatus            # mstatus |= r2 -> MPP=S (FENCED)     @4  (4B)
+        + [LOAD_IMM, 0x01, Lh]                     # r1 = Lh                             @8  (3B)
+        + [CSR_RW, b1(2, 1)] + mtvec              # mtvec = Lh (guest M tvec)           @11 (4B)
+        + [LOAD_IMM, 0x01, Ls]                     # r1 = Ls                             @15 (3B)
+        + [CSR_RW, b1(2, 1)] + mepc               # mepc = Ls                           @18 (4B)
+        + [MRET]                                   # mret -> Ls, priv->S                 @22 (1B)
+        + [TRAP]                                   # DECOY (redirect fail -> exit)       @23 (1B)
+        + [LOAD_IMM, 0x07, ord('#')]              # Lh: r7 = '#' (4-aligned=24)         @24 (3B)
+        + [ECALLI, 0x00]                          # ecalli@M -> host putchar '#'        @27 (2B)
+        + [TRAP]                                   # trap -> exit SUCCESS                @29 (1B)
+        + [LOAD_IMM, 0x07, ord('S')]              # Ls: r7 = 'S' (priv-fail char)       @30 (3B)
+        + [ECALLI, 0x00]                          # ecalli@S -> guest-trap to Lh        @33 (2B)
+        + [TRAP]                                   # safety exit                         @35 (1B)
+    )
+    starts = [0, 4, 8, 11, 15, 18, 22, 23, 24, 27, 29, 30, 33, 35]
+    assert Lh == 24 and Ls == 30 and len(code) == 36
+    assert Lh % 4 == 0 and Ls % 2 == 0            # RISC-V WARL: mtvec 4-aligned, mepc 2-aligned
+    return code, starts
+
+
 def build_image(code, starts, jumptable=None, z=1):
     """Pad code to align16, append the LSB-first opcode bitmask, then (optionally)
     the dynamic jump table (z bytes/entry, LE). Returns (img, code_len, bm_off, jt_off)."""
@@ -467,6 +513,8 @@ def main():
         code, starts = emit_mret_test()
     elif mode == "priv":
         code, starts = emit_priv_test()
+    elif mode == "priv_dyn":
+        code, starts = emit_priv_dyn_test()
     elif mode == "hostcall":
         code, starts = emit_hostcall_test()
     else:

@@ -51,6 +51,7 @@ module pvm_decoder
     output logic [63:0]     hostcall_id_o,
     output logic            is_trap_o,       // trap opcode (panic)
     output logic            is_eret_o,       // mret/sret: return-from-handler (PVM-pc redirect to mepc/sepc)
+    output logic            is_csr_fence_o,  // B5: a CSR write to a flush-class CSR (mstatus/sstatus/satp/mstatush)
     output logic            illegal_o,       // opcode not in valid set U
     output logic            unsupported_o    // valid but not handled in this increment
 );
@@ -119,6 +120,7 @@ module pvm_decoder
     hostcall_id_o   = 64'd0;
     is_trap_o       = 1'b0;
     is_eret_o       = 1'b0;
+    is_csr_fence_o  = 1'b0;
     illegal_o       = 1'b0;
     unsupported_o   = 1'b0;
     two_uop_o       = 1'b0;
@@ -371,6 +373,18 @@ module pvm_decoder
           PVM_OP_CSR_RW, PVM_OP_CSR_RWI: op_o = CSR_WRITE;
           PVM_OP_CSR_RS, PVM_OP_CSR_RSI: op_o = CSR_SET;
           default:                       op_o = CSR_CLEAR;  // RC / RCI
+        endcase
+        // B5: a write to a flush-class CSR (mstatus/sstatus/satp/mstatush) raises flush_o in
+        // csr_regfile (side-effects on translation/MPP etc.). In PVM mode that flush would
+        // discard the YOUNGER in-flight uop (e.g. a following mret) -> the eret never commits
+        // and pvm_fetch hangs. Flag it so pvm_fetch fences: it advances pc, suspends, and
+        // resumes on the commit flush (the CSR write commits ALONE, like the eret). The CSR
+        // address is the decoded immediate imm_ri; only its low 12 bits select the CSR.
+        // (CSR_SET/CLEAR with rs1=x0 don't write/flush; conservatively fencing them too is
+        // harmless -- they are rare and the fence just costs one extra commit round-trip.)
+        unique case (imm_ri[11:0])
+          12'h300, 12'h100, 12'h180, 12'h310: is_csr_fence_o = 1'b1;  // mstatus/sstatus/satp/mstatush
+          default: ;
         endcase
       end
       PVM_OP_SFENCE_VMA: begin fu_o = CSR; op_o = SFENCE_VMA; rs1_o = g_hi; rs2_o = g_lo; end

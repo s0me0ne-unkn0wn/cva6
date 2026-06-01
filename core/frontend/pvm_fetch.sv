@@ -69,6 +69,13 @@ module pvm_fetch
     // commit pulse it redirects to the guest trap vector (no host involvement).
     input  logic            trap_redirect_i,  // backend committed a stay-in-PVM trap (1-cycle pulse)
     input  logic [VLEN-1:0] trap_pc_i,        // committed guest mtvec/stvec as a PVM instruction-counter
+    // CSR fence (B5): a guest write to a flush-class CSR (mstatus/sstatus/satp/mstatush) raises
+    // flush_o in csr_regfile, which would discard the YOUNGER in-flight PVM uop (e.g. a following
+    // mret). The CSR write DOES execute, so -- like halt_i -- we advance pc to next_pc and suspend;
+    // unlike halt_i we resume on the commit flush (csr_fence_resolved_i), not a host resume. The CSR
+    // write then commits ALONE and its flush is harmless (identical safety argument to the eret).
+    input  logic            csr_fence_i,          // current instr is a flush-class CSR write
+    input  logic            csr_fence_resolved_i, // the CSR write committed/flushed (1-cycle pulse)
     // BRAM windows (combinational, addressed by pc_o):
     //   code_window_i : 16 code bytes starting at pc_o (byte 0 = opcode at pc_o)
     //   bm_window_i   : 32 bitmask bits starting at pc_o+1 (LSB = position pc_o+1)
@@ -91,6 +98,7 @@ module pvm_fetch
   logic            branch_pending_q;  // suspended at a conditional branch, awaiting resolution
   logic            djump_pending_q;   // suspended at a dynamic jump, awaiting resolution
   logic            eret_pending_q;    // suspended at an mret/sret, awaiting the backend commit
+  logic            csr_fence_pending_q;// B5: suspended at a flush-class CSR write, awaiting the commit flush
   logic            done_q;            // PVM run terminated cleanly (djump-halt / off-the-end)
   logic            phase_q;           // micro-op phase for 2-uop (imm-branch) macro-expansion
 
@@ -124,6 +132,7 @@ module pvm_fetch
       branch_pending_q <= 1'b0;
       djump_pending_q  <= 1'b0;
       eret_pending_q   <= 1'b0;
+      csr_fence_pending_q <= 1'b0;
       done_q           <= 1'b0;
       phase_q          <= 1'b0;
     end else if (start_i) begin
@@ -134,6 +143,7 @@ module pvm_fetch
       branch_pending_q <= 1'b0;
       djump_pending_q  <= 1'b0;
       eret_pending_q   <= 1'b0;
+      csr_fence_pending_q <= 1'b0;
       done_q           <= 1'b0;
       phase_q          <= 1'b0;
     end else if (branch_pending_q) begin
@@ -170,6 +180,17 @@ module pvm_fetch
         eret_pending_q <= 1'b0;
         phase_q        <= 1'b0;
       end
+    end else if (csr_fence_pending_q) begin
+      // B5: suspended at a flush-class CSR write (pc_q already advanced to next_pc when we
+      // suspended -- the CSR op executes). Wait for it to commit; its flush fires on commit
+      // (csr_fence_resolved_i = pvm_active & csr_regfile flush, gated in cva6.sv). The write
+      // commits ALONE (nothing younger was issued -- we suspended issue), so the flush is
+      // harmless. Just un-suspend; pc_q is already at the next instruction.
+      if (csr_fence_resolved_i) begin
+        running_q           <= 1'b1;
+        csr_fence_pending_q <= 1'b0;
+        phase_q             <= 1'b0;
+      end
     end else if (trap_redirect_i) begin
       // Guest-internal trap (ecalli@priv<M): pvm_fetch was halt-suspended at the ecalli
       // (running_q=0, post-ecalli pc held). The backend delivered the trap to the guest
@@ -196,6 +217,12 @@ module pvm_fetch
       // redirect to mepc/sepc. Not a terminator, so without this it would fall through
       // to the sequential next pc -- wrong (must resume at the handler return target).
       else if (eret_i) begin running_q <= 1'b0; eret_pending_q <= 1'b1; end
+      // CSR fence (B5): a flush-class CSR write (mstatus/sstatus/satp/mstatush). The write
+      // EXECUTES (so advance to next_pc like halt_i), then suspend; resume on the commit
+      // flush (csr_fence_resolved_i). Mutually exclusive with branch/djump/eret/halt above
+      // (a CSR write is fu=CSR, never a branch/djump/eret/hostcall) and with terminator (CSR
+      // opcodes are not in T), so its order in this chain is safe.
+      else if (csr_fence_i) begin pc_q <= next_pc_c; running_q <= 1'b0; csr_fence_pending_q <= 1'b1; end
       // Host-call (ecalli): advance to the next pc, then suspend so the M-mode
       // handler runs; on resume pvm_fetch continues from this saved next pc.
       else if (halt_i) begin pc_q <= next_pc_c; running_q <= 1'b0; end

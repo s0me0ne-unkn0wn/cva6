@@ -73,6 +73,8 @@ module pvm_front
     // guest-internal trap (ecalli@priv<M committed): stay in PVM, redirect to the guest tvec
     input  logic            trap_redirect_i, // backend committed a stay-in-PVM trap (1-cycle pulse)
     input  logic [VLEN-1:0] trap_pc_i,       // committed guest mtvec/stvec as a PVM instruction-counter
+    // CSR fence (B5): a flush-class CSR write (mstatus/sstatus/satp/mstatush) commit-flushed
+    input  logic            csr_fence_resolved_i, // the flush-class CSR write committed (1-cycle pulse)
     // decoded micro-op (raw; scoreboard_entry_t assembled by cva6.sv)
     output logic            valid_o,
     output logic [VLEN-1:0] pc_o,
@@ -148,6 +150,7 @@ module pvm_front
   // ---- fetch ----------------------------------------------------------------
   logic            f_valid, f_term, f_done, f_is_djump, f_djump_pending, f_phase, f_two_uop;
   logic            f_is_eret;       // decoder: current instr is mret/sret
+  logic            f_is_csr_fence;  // decoder: current instr is a flush-class CSR write (B5)
   logic [VLEN-1:0] f_pc, f_next_pc;
   logic [7:0]      f_opcode;
   logic [127:0]    f_window;
@@ -386,6 +389,8 @@ module pvm_front
       .eret_pc_i     (eret_pc_i),
       .trap_redirect_i(trap_redirect_i),  // guest-internal trap: redirect to guest tvec, stay in PVM
       .trap_pc_i     (trap_pc_i),
+      .csr_fence_i        (f_is_csr_fence),       // flush-class CSR write: advance pc, suspend (B5)
+      .csr_fence_resolved_i(csr_fence_resolved_i),// resume on the CSR write's commit flush
       .code_window_i (code_window),
       .bm_window_i   (bm_window),
       .window_valid_i(window_valid),      // window for pc_o is loaded (BRAM read-FSM)
@@ -422,6 +427,7 @@ module pvm_front
       .hostcall_id_o  (hostcall_id_o),
       .is_trap_o      (is_trap_o),
       .is_eret_o      (f_is_eret),
+      .is_csr_fence_o (f_is_csr_fence),
       .illegal_o      (illegal_o),
       .unsupported_o  (unsupported_o)
   );

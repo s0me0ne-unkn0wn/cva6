@@ -159,7 +159,7 @@ run-dram: loader_dramload.S link.ld
 # code is the per-gate verdict.
 PVM_GATES = run run-ecalli run-banner run-branch run-loop run-djump-halt run-djump-table \
             run-ibranch run-ldij run-csr run-hostcall run-dram run-dram-banner run-user run-user-dram \
-            run-pvmvec run-mret run-priv
+            run-pvmvec run-mret run-priv run-priv-dyn
 run-all:
 	@pass=0; fail=0; failed=""; \
 	 for t in $(PVM_GATES); do \
@@ -249,6 +249,20 @@ run-priv: loader_priv.S link.ld gen_pvm_img.py
 	 echo "$$OUT" | grep -aE 'SUCCESS'; \
 	 EMIT=$$(echo "$$OUT" | grep -aoE '\[.\]' | head -1); echo "   guest emitted = $$EMIT (expect [#])"; \
 	 { [ "$$EMIT" = "[#]" ]; } && echo "   priv OK: M->S mret + ecalli@S stayed in PVM (guest trap)" || { echo "   *** priv FAILED (got '$$EMIT'; [S]=priv stayed M, ''=redirect/trap hung) ***"; exit 1; }
+
+# B5 flush-safe guest CSR write: like run-priv but the GUEST sets mstatus.MPP=S ITSELF (a
+# flush-class CSR write) before its mret, instead of the host pre-setting it. The guest mstatus
+# write raises flush_o; B5's csr-fence stalls pvm_fetch so the write commits ALONE (the younger
+# mret is not discarded) -> the round-trip still prints '[#]'. A HANG (no '[#]') means the flush
+# discarded the mret -> B5 broken. This is the path a real OpenSBI takes (picks its own priv).
+run-priv-dyn: loader_priv_dyn.S link.ld gen_pvm_img.py
+	@CL=$$(python3 gen_pvm_img.py '' priv_dyn.hex priv_dyn | grep CODE_LEN | grep -oE '[0-9]+'); \
+	 echo ">> B5: guest-driven mstatus.MPP=S (flush-class, fenced) + M->S mret round-trip (expect '#'):"; \
+	 $(CC) $(CFLAGS) -DCODE_LEN=$$CL -T link.ld -o loader_priv_dyn.elf loader_priv_dyn.S; \
+	 OUT=$$($(HARNESS) +PVM_IMG=$(abspath priv_dyn.hex) +tohost_addr=$(TOHOST) +time_out=200000 $(abspath loader_priv_dyn.elf) 2>&1); \
+	 echo "$$OUT" | grep -aE 'SUCCESS'; \
+	 EMIT=$$(echo "$$OUT" | grep -aoE '\[.\]' | head -1); echo "   guest emitted = $$EMIT (expect [#])"; \
+	 { [ "$$EMIT" = "[#]" ]; } && echo "   B5 OK: guest mstatus write fenced; mret round-trip survived the flush" || { echo "   *** B5 FAILED (got '$$EMIT'; ''=flush discarded the mret -> pvm_fetch hung) ***"; exit 1; }
 
 clean:
 	rm -f loader.elf loader_jump.elf loader_banner.elf loader_ecalli.elf loader_br.elf loader_loop.elf loader_djhalt.elf loader_djtab.elf loader_ibr.elf loader_ldij.elf loader_csr.elf loader_hostcall.elf loader_dramload.elf loader_drambanner.elf loader_hi.elf baseline.elf banner.hex ecalli.hex hi_banner.hex br_taken.hex br_nottaken.hex loop.hex djhalt.hex djtab.hex ibr_t.hex ibr_nt.hex ldij.hex csr.hex hostcall.hex
