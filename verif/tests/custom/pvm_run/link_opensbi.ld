@@ -8,6 +8,7 @@
  * inside that segment (the copy is contiguous from 0x80000000, so each region lands at its
  * intended DRAM address). Layout (offsets from ram_base=0x80000000):
  *   ro_data  -> 0x80010000  (guest 0x10000)   rw_init -> 0x80030000 (guest 0x30000)
+ *   dtb      -> 0x80020000  (guest 0x20000, the free ro/rw gap; OpenSBI a1)
  *   code+bm  -> 0x80100000  (CFG0 code_base)  jt      -> 0x80200000 (CFG2 jt_base)
  * The loader's own M-mode .text.init sits at 0x80000000 (below the guest 0x10000 window).
  */
@@ -30,6 +31,11 @@ SECTIONS
   /* relocated guest RO data: guest 0x10000 -> phys 0x80010000 */
   . = 0x80010000;
   .pvm_ro : { *(.pvm_ro) } :ph
+
+  /* staged devicetree blob: guest 0x20000 (the free ro/rw gap) -> phys 0x80020000.
+   * OpenSBI's fw_platform_init reads the DTB through the aperture from a1=0x20000. */
+  . = 0x80020000;
+  .pvm_dtb : { *(.pvm_dtb) } :ph
 
   /* relocated guest RW init: guest 0x30000 -> phys 0x80030000 */
   . = 0x80030000;

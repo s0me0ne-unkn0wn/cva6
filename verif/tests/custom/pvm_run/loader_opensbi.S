@@ -40,6 +40,11 @@
 #define RAM_BASE   0x80000000
 #define BSS_LO     0x80030b00          /* guest 0x30b00 relocated */
 #define BSS_HI     0x80031738          /* guest 0x31738 relocated */
+#define DTB_GUEST  0x20000             /* a1: guest DTB ptr (free ro/rw gap); phys 0x80020000 */
+
+#ifndef DTB_PATH
+#define DTB_PATH "/home/claude/pvm/cva6-sdk/configs/genesys2/cv64a6_emac_sv39.dtb"
+#endif
 
 #define FETCH_DRAM (1 << 34)           /* CFG1[34]: fetch code/bitmask/jt from DRAM via dcache */
 #define PVM_ACTIVE (1 << 32)
@@ -87,7 +92,7 @@ _start:
     # ---- seed guest entry registers (shared regfile persists through the PVM switch) ----
     # OpenSBI _start: a0=hartid, a1=opaque(dtb ptr), a2=FW_NEXT_ARG (-> stored at [0x30058]).
     li   x8, 0                          # a0 (r7) = hartid 0
-    li   x9, 0                          # a1 (r8) = dtb ptr (0 for now; see report)
+    li   x9, DTB_GUEST                  # a1 (r8) = guest DTB ptr (staged at phys 0x80020000)
     li   x10, 0                         # a2 (r9) = next-stage arg (stored to guest 0x30058)
 
     fence                               # publish ro/rw/code/jt DRAM writes to the fetch dcache
@@ -193,6 +198,11 @@ pvm_jt:
     .globl pvm_ro
 pvm_ro:
     .incbin "opensbi.ro.bin"
+
+    .section .pvm_dtb,"a",@progbits
+    .globl pvm_dtb
+pvm_dtb:
+    .incbin DTB_PATH
 
     .section .pvm_rw,"a",@progbits
     .globl pvm_rw
