@@ -58,6 +58,17 @@ module pvm_fetch
     // same-cycle front redirect for unconditional jumps (target known at decode)
     input  logic            redirect_valid_i,
     input  logic [VLEN-1:0] redirect_pc_i,
+    // return-from-handler (mret/sret): suspend at the eret like a conditional branch,
+    // then on the backend's commit redirect the PVM-pc to mepc/sepc (the privilege
+    // change is applied by the backend; pvm_active stays 1 -- mret is not an exception).
+    input  logic            eret_i,           // current instr is mret/sret
+    input  logic            eret_resolved_i,  // backend committed the eret (1-cycle pulse)
+    input  logic [VLEN-1:0] eret_pc_i,        // committed mepc/sepc as a PVM instruction-counter
+    // guest-internal trap (ecalli@priv<M): the backend delivered a trap to the guest's
+    // mtvec/stvec while STAYING in PVM. pvm_fetch is halt-suspended at the ecalli; on this
+    // commit pulse it redirects to the guest trap vector (no host involvement).
+    input  logic            trap_redirect_i,  // backend committed a stay-in-PVM trap (1-cycle pulse)
+    input  logic [VLEN-1:0] trap_pc_i,        // committed guest mtvec/stvec as a PVM instruction-counter
     // BRAM windows (combinational, addressed by pc_o):
     //   code_window_i : 16 code bytes starting at pc_o (byte 0 = opcode at pc_o)
     //   bm_window_i   : 32 bitmask bits starting at pc_o+1 (LSB = position pc_o+1)
@@ -79,6 +90,7 @@ module pvm_fetch
   logic            running_q;
   logic            branch_pending_q;  // suspended at a conditional branch, awaiting resolution
   logic            djump_pending_q;   // suspended at a dynamic jump, awaiting resolution
+  logic            eret_pending_q;    // suspended at an mret/sret, awaiting the backend commit
   logic            done_q;            // PVM run terminated cleanly (djump-halt / off-the-end)
   logic            phase_q;           // micro-op phase for 2-uop (imm-branch) macro-expansion
 
@@ -111,6 +123,7 @@ module pvm_fetch
       running_q        <= 1'b0;
       branch_pending_q <= 1'b0;
       djump_pending_q  <= 1'b0;
+      eret_pending_q   <= 1'b0;
       done_q           <= 1'b0;
       phase_q          <= 1'b0;
     end else if (start_i) begin
@@ -120,6 +133,7 @@ module pvm_fetch
       running_q        <= 1'b1;
       branch_pending_q <= 1'b0;
       djump_pending_q  <= 1'b0;
+      eret_pending_q   <= 1'b0;
       done_q           <= 1'b0;
       phase_q          <= 1'b0;
     end else if (branch_pending_q) begin
@@ -145,6 +159,28 @@ module pvm_fetch
         if (djump_halt_i) done_q <= 1'b1;
         else begin pc_q <= djump_target_i; running_q <= 1'b1; end
       end
+    end else if (eret_pending_q) begin
+      // Suspended at an mret/sret: wait for the backend to COMMIT it (eret_resolved_i),
+      // then resume PVM fetch at the committed mepc/sepc (the privilege change is applied
+      // by the backend at the same commit). We stall until commit -- not redirect at
+      // issue -- so the post-handler code never runs at the pre-mret privilege.
+      if (eret_resolved_i) begin
+        pc_q           <= eret_pc_i;
+        running_q      <= 1'b1;
+        eret_pending_q <= 1'b0;
+        phase_q        <= 1'b0;
+      end
+    end else if (trap_redirect_i) begin
+      // Guest-internal trap (ecalli@priv<M): pvm_fetch was halt-suspended at the ecalli
+      // (running_q=0, post-ecalli pc held). The backend delivered the trap to the guest
+      // mtvec/stvec and STAYED in PVM; redirect fetch there and resume. Exclusive with
+      // start_i (a stay-trap involves no host resume) and the branch/djump/eret arms.
+      pc_q             <= trap_pc_i;
+      running_q        <= 1'b1;
+      branch_pending_q <= 1'b0;
+      djump_pending_q  <= 1'b0;
+      eret_pending_q   <= 1'b0;
+      phase_q          <= 1'b0;
     end else if (running_q && next_ready_i && window_valid_i) begin
       // Macro-expansion phase 0 (imm-branch): the load-scratch uop just issued; stay
       // at this pc and present phase 1 (the branch) next cycle.
@@ -156,6 +192,10 @@ module pvm_fetch
       else if (branch_i) begin running_q <= 1'b0; branch_pending_q <= 1'b1; end
       // Dynamic jump (jump_ind): suspend until the backend resolves a = reg+imm.
       else if (djump_i) begin running_q <= 1'b0; djump_pending_q <= 1'b1; end
+      // Return-from-handler (mret/sret): suspend until the backend commits it, then
+      // redirect to mepc/sepc. Not a terminator, so without this it would fall through
+      // to the sequential next pc -- wrong (must resume at the handler return target).
+      else if (eret_i) begin running_q <= 1'b0; eret_pending_q <= 1'b1; end
       // Host-call (ecalli): advance to the next pc, then suspend so the M-mode
       // handler runs; on resume pvm_fetch continues from this saved next pc.
       else if (halt_i) begin pc_q <= next_pc_c; running_q <= 1'b0; end

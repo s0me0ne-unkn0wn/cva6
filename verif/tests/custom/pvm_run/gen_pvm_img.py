@@ -33,6 +33,8 @@ LOAD_IMM     = 0x33
 STORE_IND_U8 = 0x78
 LOAD_IND_U8  = 0x7c   # 124: rd = [rbase + off]; nibble lo=rd, hi=rbase
 ECALLI       = 0x0a   # 10: host-call; imm = host-call id (read from offset 1)
+MRET         = 0xed   # 237: return-from-handler (PVM-pc redirect to mepc)
+SRET         = 0xee   # 238: return-from-handler (PVM-pc redirect to sepc)
 
 UART_THR = 0x10000000  # ariane_soc::UARTBase; mock_uart THR @ ((paddr>>2)&7)==0
 UART_LSR_OFF = 0x14    # line status register offset (reg 5, 4-byte stride)
@@ -244,6 +246,8 @@ CSR_RS   = 0xE8   # 232
 CSR_RC   = 0xE9   # 233
 MSCRATCH = 0x340  # an M-mode CSR unused by the loader -> safe to clobber from PVM
 MTVEC    = 0x305  # M-mode trap vector: the guest clobbers it to prove the B4 PVM-exit decouple
+MEPC     = 0x341  # M-mode exception PC: mret redirects PVM fetch here (writing it sets no flush)
+MSTATUS  = 0x300  # M-mode status (MPP etc.); written by the HOST loader, not the guest (flush)
 
 
 def emit_csr_test():
@@ -324,6 +328,81 @@ def emit_mtvec_test():
     return code, starts
 
 
+def emit_mret_test():
+    """Phase-A mret PVM-pc-redirect proof (isolates the redirect). The guest sets
+    mepc = <success-block PVM-pc L> and executes `mret`; the HW must REDIRECT pvm_fetch
+    to L, not fall through to the sequential next pc (a DECOY that prints 'X'). The
+    success block at L prints '#'. Privilege is set to M by the HOST loader (not the
+    guest) so the success block's ecalli is a host-exit in BOTH Phase A and Phase B;
+    writing mepc raises NO pipeline flush (unlike mstatus), so no younger PVM uop is lost.
+      load_imm r1,L ; csr_rw r2,r1,mepc ; mret          -> must resume at L
+      @decoy (seq. after mret): load_imm r7,'X' ; ecalli #0 ; trap     (FAIL marker)
+      @L:                       load_imm r7,'#' ; ecalli #0 ; trap     (SUCCESS marker)
+    Prints '#' iff pvm_fetch redirected to mepc; 'X' iff the redirect fell through."""
+    def b1(rd, rs1):
+        return ((rd & 0xF) << 4) | (rs1 & 0xF)
+    mepc = le(MEPC, 2)                            # [0x41, 0x03]
+    L = 14                                        # PVM-pc of the success block (see layout)
+    code = (
+        [LOAD_IMM, 0x01, L]                       # r1 = L                       @0  (3B)
+        + [CSR_RW, b1(2, 1)] + mepc               # mepc = r1 = L                @3  (4B)
+        + [MRET]                                  # mret -> redirect to L        @7  (1B)
+        + [LOAD_IMM, 0x07, ord('X')]              # DECOY  r7 = 'X'              @8  (3B)
+        + [ECALLI, 0x00]                          # putchar('X')  (FAIL)         @11 (2B)
+        + [TRAP]                                  # trap                         @13 (1B)
+        + [LOAD_IMM, 0x07, ord('#')]              # SUCCESS r7 = '#'  (== L)     @14 (3B)
+        + [ECALLI, 0x00]                          # putchar('#')                 @17 (2B)
+        + [TRAP]                                  # trap                         @19 (1B)
+    )
+    starts = [0, 3, 7, 8, 11, 13, 14, 17, 19]
+    assert L == 14 and len(code) == 20
+    return code, starts
+
+
+def emit_priv_test():
+    """Phase-B/C multi-privilege round-trip (the OpenSBI-on-PVM core): the guest drops
+    M->S via mret, then a guest-internal ecalli@S traps to the guest's OWN mtvec while
+    STAYING in PVM (it is NOT a host-boundary exit), reaching an M-mode handler that
+    host-exits '#'. Privilege MPP=S is set by the HOST loader (a guest mstatus write would
+    raise a flush); the guest only writes mtvec/mepc (flush-free).
+      @M  csr_rw mtvec,Lh ; csr_rw mepc,Ls ; mret        -> redirect to Ls, priv->S
+      @15 trap                                            (DECOY: mret-redirect-fail exit)
+      @Ls(S) load_imm r7,'S' ; ecalli #0                  -> guest-trap to mtvec=Lh, priv->M
+      @21 trap                                            (safety exit)
+      @Lh(M) load_imm r7,'#' ; ecalli #0 (host '#') ; trap
+    Prints '#' iff: mret redirected to Ls AND priv became S AND ecalli@S stayed in PVM and
+    redirected to the guest mtvec=Lh AND priv became M there. Prints 'S' (no '#') iff the
+    mret redirected but priv stayed M (ecalli@Ls would host-exit directly). Expect '#'."""
+    def b1(rd, rs1):
+        return ((rd & 0xF) << 4) | (rs1 & 0xF)
+    mtvec = le(MTVEC, 2)                          # [0x05, 0x03]
+    mepc  = le(MEPC, 2)                           # [0x41, 0x03]
+    # ALIGNMENT (a real RISC-V constraint on the PVM-pc targets): mtvec is 4-byte aligned
+    # in direct mode (bits[1:0] forced 0), so the guest M-handler PVM-pc Lh MUST be 4-byte
+    # aligned -- else trap_vector_base = Lh & ~3 lands mid-instruction (a hang/illegal).
+    # mepc clears only bit 0, so the S-entry PVM-pc Ls must be 2-byte aligned. Here Lh=16
+    # (4-aligned, right after the decoy) and Ls=22 (2-aligned).
+    Lh = 16                                       # M-mode guest trap handler PVM-pc (4-aligned)
+    Ls = 22                                       # S-mode entry PVM-pc (2-aligned)
+    code = (
+        [LOAD_IMM, 0x01, Lh]                      # r1 = Lh                      @0  (3B)
+        + [CSR_RW, b1(2, 1)] + mtvec              # mtvec = Lh (guest M tvec)    @3  (4B)
+        + [LOAD_IMM, 0x01, Ls]                    # r1 = Ls                      @7  (3B)
+        + [CSR_RW, b1(2, 1)] + mepc               # mepc = Ls                    @10 (4B)
+        + [MRET]                                  # mret -> Ls, priv->S          @14 (1B)
+        + [TRAP]                                  # DECOY (redirect fail -> exit)@15 (1B)
+        + [LOAD_IMM, 0x07, ord('#')]              # Lh: r7 = '#' (4-aligned=16)  @16 (3B)
+        + [ECALLI, 0x00]                          # ecalli@M -> host putchar '#' @19 (2B)
+        + [TRAP]                                  # trap -> exit SUCCESS         @21 (1B)
+        + [LOAD_IMM, 0x07, ord('S')]              # Ls: r7 = 'S' (priv-fail char)@22 (3B)
+        + [ECALLI, 0x00]                          # ecalli@S -> guest-trap to Lh @25 (2B)
+        + [TRAP]                                  # safety exit                  @27 (1B)
+    )
+    starts = [0, 3, 7, 10, 14, 15, 16, 19, 21, 22, 25, 27]
+    assert Lh == 16 and Ls == 22 and len(code) == 28
+    return code, starts
+
+
 def build_image(code, starts, jumptable=None, z=1):
     """Pad code to align16, append the LSB-first opcode bitmask, then (optionally)
     the dynamic jump table (z bytes/entry, LE). Returns (img, code_len, bm_off, jt_off)."""
@@ -384,6 +463,10 @@ def main():
         code, starts = emit_csr_test()
     elif mode == "mtvec":
         code, starts = emit_mtvec_test()
+    elif mode == "mret":
+        code, starts = emit_mret_test()
+    elif mode == "priv":
+        code, starts = emit_priv_test()
     elif mode == "hostcall":
         code, starts = emit_hostcall_test()
     else:

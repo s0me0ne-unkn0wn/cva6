@@ -67,6 +67,12 @@ module pvm_front
     input  logic            br_resolved_i,   // a PVM branch/jump resolved this cycle (pulse)
     input  logic            br_taken_i,      // resolved conditional-branch outcome (1 = taken)
     input  logic [VLEN-1:0] br_target_i,     // resolved address (cond: unused; djump: a=reg+imm)
+    // return-from-handler resolution (mret/sret committed in the backend -> PVM-pc redirect)
+    input  logic            eret_resolved_i, // backend committed an mret/sret (1-cycle pulse)
+    input  logic [VLEN-1:0] eret_pc_i,       // committed mepc/sepc as a PVM instruction-counter
+    // guest-internal trap (ecalli@priv<M committed): stay in PVM, redirect to the guest tvec
+    input  logic            trap_redirect_i, // backend committed a stay-in-PVM trap (1-cycle pulse)
+    input  logic [VLEN-1:0] trap_pc_i,       // committed guest mtvec/stvec as a PVM instruction-counter
     // decoded micro-op (raw; scoreboard_entry_t assembled by cva6.sv)
     output logic            valid_o,
     output logic [VLEN-1:0] pc_o,
@@ -141,6 +147,7 @@ module pvm_front
 
   // ---- fetch ----------------------------------------------------------------
   logic            f_valid, f_term, f_done, f_is_djump, f_djump_pending, f_phase, f_two_uop;
+  logic            f_is_eret;       // decoder: current instr is mret/sret
   logic [VLEN-1:0] f_pc, f_next_pc;
   logic [7:0]      f_opcode;
   logic [127:0]    f_window;
@@ -374,6 +381,11 @@ module pvm_front
       .done_o        (f_done),
       .redirect_valid_i(is_jump_o),       // unconditional jump -> front redirect
       .redirect_pc_i   (branch_target_o),
+      .eret_i        (f_is_eret),         // mret/sret: suspend, then redirect to mepc/sepc on commit
+      .eret_resolved_i(eret_resolved_i),
+      .eret_pc_i     (eret_pc_i),
+      .trap_redirect_i(trap_redirect_i),  // guest-internal trap: redirect to guest tvec, stay in PVM
+      .trap_pc_i     (trap_pc_i),
       .code_window_i (code_window),
       .bm_window_i   (bm_window),
       .window_valid_i(window_valid),      // window for pc_o is loaded (BRAM read-FSM)
@@ -409,6 +421,7 @@ module pvm_front
       .is_hostcall_o  (is_hostcall_o),
       .hostcall_id_o  (hostcall_id_o),
       .is_trap_o      (is_trap_o),
+      .is_eret_o      (f_is_eret),
       .illegal_o      (illegal_o),
       .unsupported_o  (unsupported_o)
   );

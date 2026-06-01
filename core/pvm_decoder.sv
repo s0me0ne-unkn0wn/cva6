@@ -50,6 +50,7 @@ module pvm_decoder
     output logic            is_hostcall_o,   // ecalli
     output logic [63:0]     hostcall_id_o,
     output logic            is_trap_o,       // trap opcode (panic)
+    output logic            is_eret_o,       // mret/sret: return-from-handler (PVM-pc redirect to mepc/sepc)
     output logic            illegal_o,       // opcode not in valid set U
     output logic            unsupported_o    // valid but not handled in this increment
 );
@@ -117,6 +118,7 @@ module pvm_decoder
     is_hostcall_o   = 1'b0;
     hostcall_id_o   = 64'd0;
     is_trap_o       = 1'b0;
+    is_eret_o       = 1'b0;
     illegal_o       = 1'b0;
     unsupported_o   = 1'b0;
     two_uop_o       = 1'b0;
@@ -126,8 +128,8 @@ module pvm_decoder
       PVM_OP_TRAP:        is_trap_o = 1'b1;
       PVM_OP_FALLTHROUGH: fu_o = NONE;                       // sequential fallthrough
       PVM_OP_UNLIKELY:    fu_o = NONE;                       // hint, no-op
-      PVM_OP_MRET:      begin fu_o = CSR; op_o = MRET; end
-      PVM_OP_SRET:      begin fu_o = CSR; op_o = SRET; end
+      PVM_OP_MRET:      begin fu_o = CSR; op_o = MRET; is_eret_o = 1'b1; end
+      PVM_OP_SRET:      begin fu_o = CSR; op_o = SRET; is_eret_o = 1'b1; end
       PVM_OP_WFI:       begin fu_o = CSR; op_o = WFI;  end
 
       // ---- host call ----

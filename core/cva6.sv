@@ -451,6 +451,8 @@ module cva6
   logic                    pvm_resume;
   logic                    pvm_br_resolved, pvm_br_taken, pvm_done;
   logic [CVA6Cfg.VLEN-1:0] pvm_br_target;
+  logic                    pvm_eret_resolved;  // committed mret/sret while pvm_active -> redirect pvm_fetch
+  logic [CVA6Cfg.VLEN-1:0] pvm_eret_pc;        // committed mepc/sepc as a PVM-pc (low 32 bits)
   fu_t                     pvm_fu;
   fu_op                    pvm_op;
   logic [4:0]              pvm_rd, pvm_rs1, pvm_rs2;
@@ -461,6 +463,10 @@ module cva6
   // in M-mode). fetch_from_dram = CFG1[34]; pvm_dreq is muxed onto port 0 when active.
   logic pvm_fetch_from_dram;
   logic pvm_use_vec;                 // B4: this PVM exit is a host-boundary one -> CSR_PVM_VEC
+  logic pvm_ecalli_at_m;             // ecalli executed at M-mode = a host-boundary exit (vs @<M = guest trap)
+  logic pvm_stay;                    // guest-internal trap (ecalli@priv<M): stay in PVM, go to guest tvec
+  logic                    pvm_trap_redirect;  // committed stay-trap -> redirect pvm_fetch to the guest tvec
+  logic [CVA6Cfg.VLEN-1:0] pvm_trap_pc;        // committed trap_vector_base (guest mtvec/stvec) as a PVM-pc
   dcache_req_i_t pvm_dreq;
   logic pvm_d_req, pvm_d_tag_valid, pvm_d_kill, pvm_d_gnt, pvm_d_rvalid;
   logic [CVA6Cfg.DCACHE_INDEX_WIDTH-1:0] pvm_d_addr_index;
@@ -488,7 +494,12 @@ module cva6
     end else begin
       pvm_req_q <= pvm_req;
       if (pvm_req & ~pvm_req_q)                 pvm_active_q <= 1'b1;
-      else if (pvm_active_q & ex_commit.valid)  pvm_active_q <= 1'b0;
+      // A guest-internal trap (ecalli@priv<M, pvm_stay) stays in PVM: do NOT clear
+      // pvm_active -- it redirects pvm_fetch to the guest tvec instead (Phase B). All
+      // other commit-exceptions (host-boundary ecalli@M / trap / illegal / clean-halt)
+      // exit to the host as before. pvm_stay feeds ONLY this registered next-state (no
+      // combinational pvm_active path -> no cont.11-style feedback).
+      else if (pvm_active_q & ex_commit.valid & ~pvm_stay)  pvm_active_q <= 1'b0;
     end
   end
   // pvm_active is purely REGISTERED -- no combinational `& ~ex_commit.valid` gate
@@ -510,6 +521,13 @@ module cva6
   // in flight is the suspended PVM branch, so resolved_branch.valid is its outcome.
   assign pvm_br_resolved = CVA6Cfg.PvmPresent & pvm_active & resolved_branch.valid;
   assign pvm_br_taken    = resolved_branch.is_taken;
+  // Return-from-handler (mret/sret): on the committed `eret` pulse while PVM owns the
+  // pipe, redirect pvm_fetch to mepc/sepc. `eret`/`epc_commit_pcgen` are the existing
+  // commit-stage outputs from csr_regfile (mret/sret never raise ex_commit.valid --
+  // asserted in csr_regfile -- so pvm_active stays 1). PVM-pc is 32-bit, so slice +
+  // zero-extend like pvm_entry_pc: a high bit in mepc would desync the window addressing.
+  assign pvm_eret_resolved = CVA6Cfg.PvmPresent & pvm_active & eret;
+  assign pvm_eret_pc       = {{(CVA6Cfg.VLEN-32){1'b0}}, epc_commit_pcgen[31:0]};
   // For a dynamic jump (JALR), the branch_unit's target_address = reg_A + imm_X = a.
   assign pvm_br_target   = resolved_branch.target_address;
   assign pvm_entry_pc  = {{(CVA6Cfg.VLEN-32){1'b0}}, pvm_cfg0_csr[31:0]};
@@ -523,8 +541,26 @@ module cva6
   // below) routes to CSR_PVM_VEC instead of mtvec. Same combinational set that drives
   // pvm_sbe.ex, so it reaches csr_regfile.ex_i coherently (pvm_front holds the uop to commit).
   // Guest-internal RISC-V faults arrive via the FU writeback (not flagged here) -> keep mtvec.
+  // Phase B (guest-privilege): ecalli is a HOST-boundary exit only at M-mode (the guest
+  // OpenSBI asking the host hypervisor). At priv<M a sub-guest's ecalli is a guest-internal
+  // supervisor call -> it must STAY in PVM and trap to the guest's mtvec/stvec, so it is
+  // NOT in the host-vector class (pvm_use_vec excludes it -> trap_vector_base = guest tvec).
+  // Single source of truth for the ecalli split, so pvm_use_vec (host class) and pvm_stay
+  // (guest-internal class) are SYNTACTICALLY disjoint and can't desync on a future edit.
+  assign pvm_ecalli_at_m = pvm_is_hostcall & (priv_lvl == riscv::PRIV_LVL_M);
   assign pvm_use_vec = CVA6Cfg.PvmPresent & pvm_active &
-                       (pvm_is_hostcall | pvm_is_trap | pvm_illegal | pvm_unsupported | pvm_done);
+                       (pvm_ecalli_at_m | pvm_is_trap | pvm_illegal | pvm_unsupported | pvm_done);
+  // pvm_stay = a guest-internal trap (ecalli@priv<M): suppress the pvm_active exit and
+  // redirect pvm_fetch to the guest trap vector. Held-to-commit, same coherence as
+  // pvm_use_vec (B4: pvm_front holds the exception uop's decode stable through commit, and
+  // priv_lvl_q still holds the from-priv at the trap's commit cycle).
+  assign pvm_stay = CVA6Cfg.PvmPresent & pvm_active & pvm_is_hostcall & ~pvm_ecalli_at_m;
+  // On the committed stay-trap, redirect PVM fetch to the guest tvec (mtvec/stvec) that
+  // csr_regfile computed for this trap (pvm_use_vec=0 here, so it is the guest vector, not
+  // CSR_PVM_VEC). Mutually exclusive with pvm_eret_resolved (eret vs ex_commit.valid can
+  // never both assert -- asserted in csr_regfile). PVM-pc is 32-bit (slice + zero-extend).
+  assign pvm_trap_redirect = CVA6Cfg.PvmPresent & pvm_active & ex_commit.valid & pvm_stay;
+  assign pvm_trap_pc       = {{(CVA6Cfg.VLEN-32){1'b0}}, trap_vector_base_commit_pcgen[31:0]};
   // M1 image load: the M-mode bootrom writes img_mem via CSR_PVM_IMG (csr_regfile
   // pulses pvm_img_we_csr with {addr,data} in pvm_img_w_csr), so JAM code can be
   // copied in from DRAM before entering PVM. (No baked ROM anymore.)
@@ -560,6 +596,10 @@ module cva6
         .br_resolved_i  (pvm_br_resolved),
         .br_taken_i     (pvm_br_taken),
         .br_target_i    (pvm_br_target),
+        .eret_resolved_i(pvm_eret_resolved),
+        .eret_pc_i      (pvm_eret_pc),
+        .trap_redirect_i(pvm_trap_redirect),
+        .trap_pc_i      (pvm_trap_pc),
         .jumptable_base_i({{(CVA6Cfg.VLEN-32){1'b0}}, pvm_cfg2_csr[31:0]}),
         .jumptable_z_i  (pvm_cfg2_csr[35:32]),
         .done_o         (pvm_done),
@@ -629,7 +669,13 @@ module cva6
     pvm_sbe.valid    = pvm_is_trap | pvm_illegal | pvm_unsupported | pvm_is_hostcall | pvm_done;
     // trap/illegal/host-call/clean-halt -> exception to M-mode
     pvm_sbe.ex.valid = pvm_is_trap | pvm_illegal | pvm_unsupported | pvm_is_hostcall | pvm_done;
-    pvm_sbe.ex.cause = pvm_is_hostcall ? riscv::ENV_CALL_MMODE : riscv::ILLEGAL_INSTR;
+    // host-call cause is privilege-dependent: ENV_CALL_M at M (host-boundary exit) vs
+    // ENV_CALL_S/U at lower privilege (guest-internal supervisor call -> guest tvec).
+    pvm_sbe.ex.cause = pvm_is_hostcall ?
+                         ((priv_lvl == riscv::PRIV_LVL_M) ? riscv::ENV_CALL_MMODE :
+                          (priv_lvl == riscv::PRIV_LVL_S) ? riscv::ENV_CALL_SMODE :
+                                                            riscv::ENV_CALL_UMODE)
+                       : riscv::ILLEGAL_INSTR;
     // Host-call ABI (B3): deliver the host-call number (the ecalli immediate) to the
     // M-mode handler via mtval, so it can dispatch (the handler does `csrr x, mtval`).
     // CVA6 only zeroes mtval for ENV_CALL_* under SPIKE_TANDEM (ZERO_TVAL=1); the

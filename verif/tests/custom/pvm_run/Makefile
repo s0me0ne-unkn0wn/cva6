@@ -158,7 +158,8 @@ run-dram: loader_dramload.S link.ld
 # returns non-zero on failure (the SUCCESS grep / the hardened '#' asserts), so the exit
 # code is the per-gate verdict.
 PVM_GATES = run run-ecalli run-banner run-branch run-loop run-djump-halt run-djump-table \
-            run-ibranch run-ldij run-csr run-hostcall run-dram run-dram-banner run-user run-user-dram run-pvmvec
+            run-ibranch run-ldij run-csr run-hostcall run-dram run-dram-banner run-user run-user-dram \
+            run-pvmvec run-mret run-priv
 run-all:
 	@pass=0; fail=0; failed=""; \
 	 for t in $(PVM_GATES); do \
@@ -222,6 +223,32 @@ run-pvmvec: loader_pvmvec.S link.ld gen_pvm_img.py
 	 OUT=$$($(HARNESS) +PVM_IMG=$(abspath pvmvec.hex) +tohost_addr=$(TOHOST) +time_out=200000 $(abspath loader_pvmvec.elf) 2>&1); \
 	 echo "$$OUT" | grep -aE 'SUCCESS'; \
 	 echo "$$OUT" | grep -qa '#' && echo "   B4 OK: ecalli host-exit decoupled from mtvec (CSR_PVM_VEC)" || { echo "   *** B4 FAILED ($$(echo "$$OUT" | grep -qa X && echo 'used mtvec -> X' || echo 'no #/X')) ***"; exit 1; }
+
+# Phase A (mret/sret PVM-pc redirect): the guest sets mepc=<success pc L> and executes
+# `mret`; the HW must REDIRECT pvm_fetch to L (not fall through to the sequential next pc,
+# a DECOY that prints 'X'). The success block at L prints '#'. Privilege is M (host-set),
+# so the success ecalli is a host-exit. Expect '#', never 'X'.
+run-mret: loader_mret.S link.ld gen_pvm_img.py
+	@CL=$$(python3 gen_pvm_img.py '' mret.hex mret | grep CODE_LEN | grep -oE '[0-9]+'); \
+	 echo ">> Phase A: guest mret must redirect PVM fetch to mepc (expect '#', not 'X'):"; \
+	 $(CC) $(CFLAGS) -DCODE_LEN=$$CL -T link.ld -o loader_mret.elf loader_mret.S; \
+	 OUT=$$($(HARNESS) +PVM_IMG=$(abspath mret.hex) +tohost_addr=$(TOHOST) +time_out=200000 $(abspath loader_mret.elf) 2>&1); \
+	 echo "$$OUT" | grep -aE 'SUCCESS'; \
+	 { echo "$$OUT" | grep -qa '#' && ! echo "$$OUT" | grep -qa 'X'; } && echo "   mret OK: PVM-pc redirected to mepc" || { echo "   *** mret FAILED ($$(echo "$$OUT" | grep -qa X && echo 'fell through -> X' || echo 'no #')) ***"; exit 1; }
+
+# Phase B/C (multi-privilege round-trip = OpenSBI-on-PVM core): the guest drops M->S via
+# mret, then a guest-internal ecalli@S traps to the guest's OWN mtvec while STAYING in PVM
+# (not a host-boundary exit), reaching an M-mode handler that host-exits '#'. '#' proves the
+# whole round-trip (mret redirect + priv->S + ecalli@S stays in PVM + redirect to guest tvec
+# + priv->M). 'S' (no '#') would mean priv stayed M after mret. Expect '#', never 'S'.
+run-priv: loader_priv.S link.ld gen_pvm_img.py
+	@CL=$$(python3 gen_pvm_img.py '' priv.hex priv | grep CODE_LEN | grep -oE '[0-9]+'); \
+	 echo ">> Phase B/C: guest M->S mret + ecalli@S guest-trap (expect '#', not 'S'):"; \
+	 $(CC) $(CFLAGS) -DCODE_LEN=$$CL -T link.ld -o loader_priv.elf loader_priv.S; \
+	 OUT=$$($(HARNESS) +PVM_IMG=$(abspath priv.hex) +tohost_addr=$(TOHOST) +time_out=200000 $(abspath loader_priv.elf) 2>&1); \
+	 echo "$$OUT" | grep -aE 'SUCCESS'; \
+	 EMIT=$$(echo "$$OUT" | grep -aoE '\[.\]' | head -1); echo "   guest emitted = $$EMIT (expect [#])"; \
+	 { [ "$$EMIT" = "[#]" ]; } && echo "   priv OK: M->S mret + ecalli@S stayed in PVM (guest trap)" || { echo "   *** priv FAILED (got '$$EMIT'; [S]=priv stayed M, ''=redirect/trap hung) ***"; exit 1; }
 
 clean:
 	rm -f loader.elf loader_jump.elf loader_banner.elf loader_ecalli.elf loader_br.elf loader_loop.elf loader_djhalt.elf loader_djtab.elf loader_ibr.elf loader_ldij.elf loader_csr.elf loader_hostcall.elf loader_dramload.elf loader_drambanner.elf loader_hi.elf baseline.elf banner.hex ecalli.hex hi_banner.hex br_taken.hex br_nottaken.hex loop.hex djhalt.hex djtab.hex ibr_t.hex ibr_nt.hex ldij.hex csr.hex hostcall.hex
