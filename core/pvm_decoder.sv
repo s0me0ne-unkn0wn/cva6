@@ -76,6 +76,12 @@ module pvm_decoder
   // lY = min(4, max(0, skip - lX - 1)), imm_Y(offset) @offset 2+lX, target = pc + imm_Y.
   int unsigned len_x, len_y, len_x2, len_y2;
   logic [63:0] imm_x, imm_y, imm_x2, imm_y2;
+  // 2 immediates, no register (store_imm absolute 30-33): read_args_imm2 strips the
+  // opcode so chunk[0]=b1 is BOTH the imm1-length selector (low 3 bits) AND unused as a
+  // reg. lA = min(4, b1[2:0]), imm_A(addr) @offset 2; lB = min(4, max(0, skip - lA - 1)),
+  // imm_B(value) @offset 2+lA. Same shape as the imm-branch slices but selector = b1[2:0].
+  int unsigned len_a, len_b;
+  logic [63:0] imm_a, imm_b;
   always_comb begin
     int unsigned skip_int;
     skip_int = int'(skip_i);
@@ -98,6 +104,13 @@ module pvm_decoder
     if (len_y2 > 4) len_y2 = 4;
     imm_x2 = pvm_sext(pvm_le_bytes(instr_window_i, 3, len_x2), len_x2);
     imm_y2 = pvm_sext(pvm_le_bytes(instr_window_i, 3 + len_x2, len_y2), len_y2);
+    // store_imm absolute (30-33): lA from b1[2:0], imm_A @offset 2, imm_B @offset 2+lA.
+    len_a  = int'({1'b0, b1[2:0]});
+    if (len_a > 4) len_a = 4;
+    len_b  = (skip_int > (len_a + 1)) ? (skip_int - len_a - 1) : 0;
+    if (len_b > 4) len_b = 4;
+    imm_a  = pvm_sext(pvm_le_bytes(instr_window_i, 2, len_a), len_a);
+    imm_b  = pvm_sext(pvm_le_bytes(instr_window_i, 2 + len_a, len_b), len_b);
   end
 
   localparam logic [4:0] PVM_SCRATCH = 5'd14;  // x14: outside PVM r0..r12 (==x1..x13)
@@ -317,6 +330,99 @@ module pvm_decoder
             PVM_OP_BRANCH_LE_S_IMM: begin op_o = GES; rs1_o = PVM_SCRATCH; rs2_o = g_lo; end
             default:                begin op_o = LTS; rs1_o = PVM_SCRATCH; rs2_o = g_lo; end // GT_S
           endcase
+        end
+      end
+
+      // ---- reg + 2imm: store-immediate, indirect (uN [reg_A + imm_X] = imm_Y) ----
+      // 2-uop macro (mirrors the imm-branch): the STORE backend takes the store data from
+      // rs2, so phase 0 loads PVM_SCRATCH = imm_Y (the value); phase 1 is a normal STORE
+      // [reg_A + imm_X] = scratch. reg_imm2 family: reg_A = g_lo, imm_X(offset) = imm_x,
+      // imm_Y(value) = imm_y (selector b1[6:4], same as the imm-branches).
+      PVM_OP_STORE_IMM_IND_U8, PVM_OP_STORE_IMM_IND_U16,
+      PVM_OP_STORE_IMM_IND_U32, PVM_OP_STORE_IMM_IND_U64: begin
+        two_uop_o = 1'b1;
+        if (!phase_i) begin
+          fu_o = ALU; op_o = ADD; rd_o = PVM_SCRATCH; rs1_o = 5'd0;
+          imm_o = imm_y; use_imm_o = 1'b1;
+        end else begin
+          fu_o = STORE; rs1_o = g_lo; rs2_o = PVM_SCRATCH; imm_o = imm_x; use_imm_o = 1'b1;
+          unique case (opcode_i)
+            PVM_OP_STORE_IMM_IND_U8:  op_o = SB;
+            PVM_OP_STORE_IMM_IND_U16: op_o = SH;
+            PVM_OP_STORE_IMM_IND_U32: op_o = SW;
+            default:                  op_o = SD;  // STORE_IMM_IND_U64
+          endcase
+        end
+      end
+
+      // ---- 2imm: store-immediate, absolute (uN [imm_A] = imm_B) ----
+      // Same 2-uop macro with no base register: phase 0 scratch = imm_B (value); phase 1
+      // STORE [x0 + imm_A] = scratch. imm_imm family: imm_A(addr) = imm_a, imm_B(value) = imm_b.
+      PVM_OP_STORE_IMM_U8, PVM_OP_STORE_IMM_U16,
+      PVM_OP_STORE_IMM_U32, PVM_OP_STORE_IMM_U64: begin
+        two_uop_o = 1'b1;
+        if (!phase_i) begin
+          fu_o = ALU; op_o = ADD; rd_o = PVM_SCRATCH; rs1_o = 5'd0;
+          imm_o = imm_b; use_imm_o = 1'b1;
+        end else begin
+          fu_o = STORE; rs1_o = 5'd0; rs2_o = PVM_SCRATCH; imm_o = imm_a; use_imm_o = 1'b1;
+          unique case (opcode_i)
+            PVM_OP_STORE_IMM_U8:  op_o = SB;
+            PVM_OP_STORE_IMM_U16: op_o = SH;
+            PVM_OP_STORE_IMM_U32: op_o = SW;
+            default:              op_o = SD;  // STORE_IMM_U64
+          endcase
+        end
+      end
+
+      // ---- reg + imm reverse-operand ALU ("imm OP reg") + cmov-imm (2-uop macros) ----
+      // CVA6's reg-imm datapath puts the register in operand_a and the immediate in
+      // operand_b (use_imm), i.e. it can only compute "reg OP imm". These ops need
+      // "imm OP reg" (or a cmov whose moved value is an immediate), so we synthesise:
+      //   phase 0: PVM_SCRATCH = imm   (ALU ADD scratch = x0 + imm_ri)
+      //   phase 1: a reg-reg op with rs1 = scratch (the imm) and rs2 = reg_B (g_hi).
+      // reg_reg_imm family: rd = g_lo (low nibble), reg = g_hi (high nibble), imm = imm_ri.
+      //   NEG_ADD_IMM_{32,64} (141/154): d = imm - reg   -> SUB(W) scratch - reg     (program.rs s2.wrapping_sub(s1))
+      //   SET_GT_U_IMM        (142):     d = (reg > imm) -> SLTU (imm < reg)         (program.rs u64::from(s1 > s2))
+      //   SHLO_L_IMM_ALT_{32,64} (144/155), SHLO_R_IMM_ALT_64 (156): d = imm <</>> reg
+      //     -- the polkavm2 "alt" visitor signature is (d, s2:reg, s1:imm) with s1 <</>> s2,
+      //        i.e. the IMMEDIATE is shifted by the REGISTER -> SLL/SRL scratch by reg.
+      PVM_OP_NEG_ADD_IMM_32, PVM_OP_NEG_ADD_IMM_64, PVM_OP_SET_GT_U_IMM,
+      PVM_OP_SHLO_L_IMM_ALT_32, PVM_OP_SHLO_L_IMM_ALT_64, PVM_OP_SHLO_R_IMM_ALT_64: begin
+        two_uop_o = 1'b1;
+        if (!phase_i) begin
+          fu_o = ALU; op_o = ADD; rd_o = PVM_SCRATCH; rs1_o = 5'd0;
+          imm_o = imm_ri; use_imm_o = 1'b1;
+        end else begin
+          fu_o = ALU; rd_o = g_lo; rs1_o = PVM_SCRATCH; rs2_o = g_hi;
+          unique case (opcode_i)
+            PVM_OP_NEG_ADD_IMM_32:    op_o = SUBW;
+            PVM_OP_NEG_ADD_IMM_64:    op_o = SUB;
+            PVM_OP_SET_GT_U_IMM:      op_o = SLTU;
+            PVM_OP_SHLO_L_IMM_ALT_32: op_o = SLLW;
+            PVM_OP_SHLO_L_IMM_ALT_64: op_o = SLL;
+            default:                  op_o = SRL;  // SHLO_R_IMM_ALT_64
+          endcase
+        end
+      end
+
+      // CMOV with an immediate moved-value (147/148). reg_reg_imm: rd = g_lo, condition
+      // reg = g_hi, moved value = imm. CVA6's Xtheadcondmov needs the moved value in a
+      // register (operand_a) and uses operand_c (read at result[4:0]) as the unchanged-rd
+      // fallback. So phase 0 loads scratch = imm; phase 1 is th.mveqz/mvnez with
+      // rs1 = scratch (moved value), rs2 = g_hi (condition), and imm_o = g_lo so the third
+      // read port fetches the OLD rd value as the keep-rd fallback (use_imm stays 0).
+      //   CMOV_IZ_IMM (147): rd = (reg == 0) ? imm : rd  -> th.mveqz (result = |opB ? imm : opA)
+      //   CMOV_NZ_IMM (148): rd = (reg != 0) ? imm : rd  -> th.mvnez
+      PVM_OP_CMOV_IZ_IMM, PVM_OP_CMOV_NZ_IMM: begin
+        two_uop_o = 1'b1;
+        if (!phase_i) begin
+          fu_o = ALU; op_o = ADD; rd_o = PVM_SCRATCH; rs1_o = 5'd0;
+          imm_o = imm_ri; use_imm_o = 1'b1;
+        end else begin
+          fu_o = ALU; rd_o = g_lo; rs1_o = PVM_SCRATCH; rs2_o = g_hi;
+          imm_o = {59'd0, g_lo};  // result[4:0] = rd -> operand_c reads old rd (fallback)
+          op_o  = (opcode_i == PVM_OP_CMOV_IZ_IMM) ? XHEAD_MVEQZ : XHEAD_MVNEZ;
         end
       end
 
