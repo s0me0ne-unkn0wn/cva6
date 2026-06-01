@@ -449,6 +449,69 @@ def emit_priv_dyn_test():
     return code, starts
 
 
+def emit_priv_return_test():
+    """B6 handler-return: prove a guest M-handler can `mret` BACK to the trapped
+    S-guest (the enter->serve->return trap cycle a real SBI handler needs), NOT just
+    host-exit. cont.20's round-trip M-handler EXITED; here the FIRST handler RETURNS to
+    S, then a SECOND guest-trap (via a re-pointed vector) reaches the exit handler.
+
+    Two-vector scheme (avoids the mpp-clobber + any branch). The HOST loader pre-sets
+    mstatus.MPP=S (loader_priv.S); the guest writes only mtvec/mepc (flush-free, no B5).
+      @0  (M): csr_rw mtvec=Lh1 ; csr_rw mepc=Ls ; mret             -> S@Ls (priv->S)
+      @15      trap                                       (DECOY: mret-redirect-fail exit)
+      @Ls (S): ecalli #0  -> guest-trap -> Lh1 (priv->M, mepc<-Ls's PVM-pc, mpp<-S)
+      @18      trap                                       (DECOY: trap-redirect-fail exit)
+      @Lh1(M, 4-aligned): csr_rw mtvec=Lh2 (RE-POINT the vector) ; csr_rw mepc=Sr ; mret
+               -> S@Sr.  NB: NO host-exit before this mret, so mstatus.mpp stays S and the
+               mret returns to S (a host-exit ecalli@M would clobber mpp=M -> wrongly to M).
+      @35      trap                                       (DECOY: handler-return-fail exit)
+      @Sr (S, 2-aligned): ecalli #0  -> guest-trap -> Lh2 (the NEW vector)
+      @38      trap                                       (DECOY)
+      @Lh2(M, 4-aligned): load_imm r7,'#' ; ecalli #0 (host-exit '#') ; trap -> exit
+    '#' (framed '[#]' by the host loader) is reachable ONLY if Lh1's mret RETURNED to
+    S@Sr (priv=S there so ecalli@Sr is a guest-trap, pc=Sr so it hits the re-pointed
+    vector Lh2). A failed handler-return would either fall through Lh1's mret to the
+    DECOY trap@35 (exit, no '#') or land at the wrong priv/pc. ALIGNMENT (RISC-V WARL):
+    mtvec targets Lh1/Lh2 are 4-aligned (direct mode bits[1:0]=0); mepc/sepc targets
+    Ls/Sr are 2-aligned. TRAP(0x00) pad bytes realign each section (@19, @39)."""
+    def b1(rd, rs1):
+        return ((rd & 0xF) << 4) | (rs1 & 0xF)
+    mtvec = le(MTVEC, 2)                          # [0x05, 0x03]
+    mepc  = le(MEPC, 2)                           # [0x41, 0x03]
+    Lh1 = 20                                      # 1st M-handler PVM-pc (4-aligned)
+    Ls  = 16                                      # S-entry PVM-pc (2-aligned)
+    Lh2 = 40                                      # 2nd (re-pointed) M-handler PVM-pc (4-aligned)
+    Sr  = 36                                      # S-resume PVM-pc (2-aligned)
+    code = (
+        [LOAD_IMM, 0x01, Lh1]                     # r1 = Lh1                     @0  (3B)
+        + [CSR_RW, b1(2, 1)] + mtvec              # mtvec = Lh1 (guest M tvec)   @3  (4B)
+        + [LOAD_IMM, 0x01, Ls]                    # r1 = Ls                      @7  (3B)
+        + [CSR_RW, b1(2, 1)] + mepc               # mepc = Ls                    @10 (4B)
+        + [MRET]                                  # mret -> Ls, priv->S          @14 (1B)
+        + [TRAP]                                  # DECOY (mret-redirect fail)   @15 (1B)
+        + [ECALLI, 0x00]                          # Ls(2al=16): ecalli@S -> Lh1  @16 (2B)
+        + [TRAP]                                  # DECOY (trap-redirect fail)   @18 (1B)
+        + [TRAP]                                  # pad -> Lh1 4-align            @19 (1B)
+        + [LOAD_IMM, 0x01, Lh2]                   # Lh1(4al=20): r1 = Lh2        @20 (3B)
+        + [CSR_RW, b1(2, 1)] + mtvec              # mtvec = Lh2 (RE-POINT)       @23 (4B)
+        + [LOAD_IMM, 0x01, Sr]                    # r1 = Sr                      @27 (3B)
+        + [CSR_RW, b1(2, 1)] + mepc               # mepc = Sr                    @30 (4B)
+        + [MRET]                                  # mret -> Sr (mpp stays S)     @34 (1B)
+        + [TRAP]                                  # DECOY (handler-return fail)  @35 (1B)
+        + [ECALLI, 0x00]                          # Sr(2al=36): ecalli@S -> Lh2  @36 (2B)
+        + [TRAP]                                  # DECOY                        @38 (1B)
+        + [TRAP]                                  # pad -> Lh2 4-align            @39 (1B)
+        + [LOAD_IMM, 0x07, ord('#')]              # Lh2(4al=40): r7 = '#'        @40 (3B)
+        + [ECALLI, 0x00]                          # ecalli@M -> host putchar '#' @43 (2B)
+        + [TRAP]                                  # trap -> exit SUCCESS         @45 (1B)
+    )
+    starts = [0, 3, 7, 10, 14, 15, 16, 18, 19, 20, 23, 27, 30, 34, 35, 36, 38, 39, 40, 43, 45]
+    assert Lh1 == 20 and Ls == 16 and Lh2 == 40 and Sr == 36 and len(code) == 46
+    assert Lh1 % 4 == 0 and Lh2 % 4 == 0          # RISC-V WARL: mtvec 4-aligned
+    assert Ls % 2 == 0 and Sr % 2 == 0            # RISC-V WARL: mepc/sepc 2-aligned
+    return code, starts
+
+
 def build_image(code, starts, jumptable=None, z=1):
     """Pad code to align16, append the LSB-first opcode bitmask, then (optionally)
     the dynamic jump table (z bytes/entry, LE). Returns (img, code_len, bm_off, jt_off)."""
@@ -515,6 +578,8 @@ def main():
         code, starts = emit_priv_test()
     elif mode == "priv_dyn":
         code, starts = emit_priv_dyn_test()
+    elif mode == "priv_return":
+        code, starts = emit_priv_return_test()
     elif mode == "hostcall":
         code, starts = emit_hostcall_test()
     else:

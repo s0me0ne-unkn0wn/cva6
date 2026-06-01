@@ -159,7 +159,7 @@ run-dram: loader_dramload.S link.ld
 # code is the per-gate verdict.
 PVM_GATES = run run-ecalli run-banner run-branch run-loop run-djump-halt run-djump-table \
             run-ibranch run-ldij run-csr run-hostcall run-dram run-dram-banner run-user run-user-dram \
-            run-pvmvec run-mret run-priv run-priv-dyn
+            run-pvmvec run-mret run-priv run-priv-dyn run-priv-return
 run-all:
 	@pass=0; fail=0; failed=""; \
 	 for t in $(PVM_GATES); do \
@@ -264,7 +264,22 @@ run-priv-dyn: loader_priv_dyn.S link.ld gen_pvm_img.py
 	 EMIT=$$(echo "$$OUT" | grep -aoE '\[.\]' | head -1); echo "   guest emitted = $$EMIT (expect [#])"; \
 	 { [ "$$EMIT" = "[#]" ]; } && echo "   B5 OK: guest mstatus write fenced; mret round-trip survived the flush" || { echo "   *** B5 FAILED (got '$$EMIT'; ''=flush discarded the mret -> pvm_fetch hung) ***"; exit 1; }
 
+# B6 handler-return: prove a guest M-handler can `mret` BACK to the trapped S-guest (the
+# enter->serve->return trap cycle a real SBI handler needs), not just host-exit. Two-vector
+# scheme: the 1st M-handler RE-POINTS mtvec then mret-returns to S (mstatus.MPP still S, NO
+# host-exit before the mret); a 2nd guest-trap@S then reaches the (re-pointed) exit handler
+# that host-exits '#'. '[#]' is reachable ONLY if the handler-return mret returned to S at the
+# right PVM-pc. Expect '[#]'; '' (no frame) = the return mret fell through / wrong priv/pc.
+run-priv-return: loader_priv.S link.ld gen_pvm_img.py
+	@CL=$$(python3 gen_pvm_img.py '' priv_return.hex priv_return | grep CODE_LEN | grep -oE '[0-9]+'); \
+	 echo ">> B6: guest M-handler mret-RETURNS to S, 2nd trap -> re-pointed handler host-exits (expect '#'):"; \
+	 $(CC) $(CFLAGS) -DCODE_LEN=$$CL -T link.ld -o loader_priv_return.elf loader_priv.S; \
+	 OUT=$$($(HARNESS) +PVM_IMG=$(abspath priv_return.hex) +tohost_addr=$(TOHOST) +time_out=200000 $(abspath loader_priv_return.elf) 2>&1); \
+	 echo "$$OUT" | grep -aE 'SUCCESS'; \
+	 EMIT=$$(echo "$$OUT" | grep -aoE '\[.\]' | head -1); echo "   guest emitted = $$EMIT (expect [#])"; \
+	 { [ "$$EMIT" = "[#]" ]; } && echo "   B6 OK: M-handler mret returned to S; full enter->serve->return cycle" || { echo "   *** B6 FAILED (got '$$EMIT'; ''=handler-return mret fell through / wrong priv/pc) ***"; exit 1; }
+
 clean:
 	rm -f loader.elf loader_jump.elf loader_banner.elf loader_ecalli.elf loader_br.elf loader_loop.elf loader_djhalt.elf loader_djtab.elf loader_ibr.elf loader_ldij.elf loader_csr.elf loader_hostcall.elf loader_dramload.elf loader_drambanner.elf loader_hi.elf baseline.elf banner.hex ecalli.hex hi_banner.hex br_taken.hex br_nottaken.hex loop.hex djhalt.hex djtab.hex ibr_t.hex ibr_nt.hex ldij.hex csr.hex hostcall.hex
 
-.PHONY: all run run-jump run-banner run-ecalli run-branch run-loop run-djump-halt run-djump-table run-ibranch run-ldij run-csr run-hostcall run-dram run-dram-banner run-user run-user-dram run-pvmvec run-all clean
+.PHONY: all run run-jump run-banner run-ecalli run-branch run-loop run-djump-halt run-djump-table run-ibranch run-ldij run-csr run-hostcall run-dram run-dram-banner run-user run-user-dram run-pvmvec run-mret run-priv run-priv-dyn run-priv-return run-all clean
