@@ -158,7 +158,7 @@ run-dram: loader_dramload.S link.ld
 # returns non-zero on failure (the SUCCESS grep / the hardened '#' asserts), so the exit
 # code is the per-gate verdict.
 PVM_GATES = run run-ecalli run-banner run-branch run-loop run-djump-halt run-djump-table \
-            run-ibranch run-ldij run-csr run-hostcall run-dram run-dram-banner run-user
+            run-ibranch run-ldij run-csr run-hostcall run-dram run-dram-banner run-user run-user-dram run-pvmvec
 run-all:
 	@pass=0; fail=0; failed=""; \
 	 for t in $(PVM_GATES); do \
@@ -196,7 +196,34 @@ run-user: loader_user.S link.ld polkavm_to_img.py
 	 R=$$(echo "$$OUT" | grep -aoE '\[.\]' | head -1); echo "   guest result = $$R (expect [*])"; \
 	 { [ "$$R" = "[*]" ] && echo "$$OUT" | grep -qa 'SUCCESS'; } && echo "   A6 OK: real program ran from DRAM" || { echo "   *** A6 FAILED (got '$$R') ***"; exit 1; }
 
+# M3 (goal B): demand-fetch. Same add_numbers program, but its image is fetched from DRAM
+# ON-DEMAND via the dcache (CFG1[34]=fetch_from_dram), NOT preloaded into img_bram. The
+# blob lives in DRAM as the loader's .text.init data; NO +PVM_IMG. Expect "[*]" -- proving
+# the JAM code is fetched live from DRAM (toward kernel-scale images beyond the 4KB BRAM).
+run-user-dram: loader_userdram.S link.ld polkavm_to_img.py
+	@$(POLKATOOL) emit-image $(USER_BLOB) -o hello.img >/dev/null 2>&1; \
+	 CL=$$(python3 polkavm_to_img.py hello.img hello | grep CODE_LEN | grep -oE '[0-9]+'); \
+	 echo ">> M3: add_numbers fetched from DRAM via dcache (CFG1[34]), CODE_LEN=$$CL (expect [*]):"; \
+	 $(CC) $(CFLAGS) -DCODE_LEN=$$CL -T link.ld -o loader_userdram.elf loader_userdram.S; \
+	 OUT=$$($(HARNESS) +tohost_addr=$(TOHOST) +time_out=600000 $(abspath loader_userdram.elf) 2>&1); \
+	 echo "$$OUT" | grep -aE 'SUCCESS'; \
+	 R=$$(echo "$$OUT" | grep -aoE '\[.\]' | head -1); echo "   guest result = $$R (expect [*])"; \
+	 { [ "$$R" = "[*]" ] && echo "$$OUT" | grep -qa 'SUCCESS'; } && echo "   M3 OK: code fetched from DRAM on-demand" || { echo "   *** M3 FAILED (got '$$R') ***"; exit 1; }
+
+# B4 (goal C): PVM host-boundary exit decoupled from mtvec. The guest clobbers mtvec
+# (simulating OpenSBI's `csrw mtvec`), then ecalli #0 (putchar '#'). The host hook is in
+# CSR_PVM_VEC, so the ecalli still reaches it -> '#'. mtvec is a decoy ('X'): '#' can only
+# come via CSR_PVM_VEC. Proves OpenSBI can install its own trap vector without stealing the
+# host hypervisor's ecalli/panic hook.
+run-pvmvec: loader_pvmvec.S link.ld gen_pvm_img.py
+	@CL=$$(python3 gen_pvm_img.py '' pvmvec.hex mtvec | grep CODE_LEN | grep -oE '[0-9]+'); \
+	 echo ">> B4: guest clobbers mtvec; ecalli must reach host via CSR_PVM_VEC (expect '#', not 'X'):"; \
+	 $(CC) $(CFLAGS) -DCODE_LEN=$$CL -T link.ld -o loader_pvmvec.elf loader_pvmvec.S; \
+	 OUT=$$($(HARNESS) +PVM_IMG=$(abspath pvmvec.hex) +tohost_addr=$(TOHOST) +time_out=200000 $(abspath loader_pvmvec.elf) 2>&1); \
+	 echo "$$OUT" | grep -aE 'SUCCESS'; \
+	 echo "$$OUT" | grep -qa '#' && echo "   B4 OK: ecalli host-exit decoupled from mtvec (CSR_PVM_VEC)" || { echo "   *** B4 FAILED ($$(echo "$$OUT" | grep -qa X && echo 'used mtvec -> X' || echo 'no #/X')) ***"; exit 1; }
+
 clean:
 	rm -f loader.elf loader_jump.elf loader_banner.elf loader_ecalli.elf loader_br.elf loader_loop.elf loader_djhalt.elf loader_djtab.elf loader_ibr.elf loader_ldij.elf loader_csr.elf loader_hostcall.elf loader_dramload.elf loader_drambanner.elf loader_hi.elf baseline.elf banner.hex ecalli.hex hi_banner.hex br_taken.hex br_nottaken.hex loop.hex djhalt.hex djtab.hex ibr_t.hex ibr_nt.hex ldij.hex csr.hex hostcall.hex
 
-.PHONY: all run run-jump run-banner run-ecalli run-branch run-loop run-djump-halt run-djump-table run-ibranch run-ldij run-csr run-hostcall run-dram run-dram-banner run-user run-all clean
+.PHONY: all run run-jump run-banner run-ecalli run-branch run-loop run-djump-halt run-djump-table run-ibranch run-ldij run-csr run-hostcall run-dram run-dram-banner run-user run-user-dram run-pvmvec run-all clean

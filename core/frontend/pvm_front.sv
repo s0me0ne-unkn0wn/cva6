@@ -25,7 +25,12 @@ module pvm_front
   import polkavm_pkg::*;
 #(
     parameter int unsigned VLEN      = 32,
-    parameter int unsigned IMG_BYTES = 4096
+    parameter int unsigned IMG_BYTES = 4096,
+    // M3 demand-fetch: dcache address split widths (from CVA6Cfg.DCACHE_*); the DRAM
+    // fetch path drives a dcache request port with these.
+    parameter int unsigned DC_IDX    = 12,   // DCACHE_INDEX_WIDTH
+    parameter int unsigned DC_TAG    = 44,   // DCACHE_TAG_WIDTH
+    parameter int unsigned DC_PLEN   = 56    // physical address width (DC_IDX + DC_TAG)
 ) (
     input  logic            clk_i,
     input  logic            rst_ni,
@@ -35,10 +40,23 @@ module pvm_front
                                              // pc (suspended in pvm_fetch) instead of entry_pc_i
     input  logic [VLEN-1:0] entry_pc_i,      // instruction-counter to start at
     input  logic [VLEN-1:0] code_len_i,      // |c| in bytes
-    input  logic [VLEN-1:0] code_base_i,     // byte offset of code in image mem
-    input  logic [VLEN-1:0] bitmask_base_i,  // byte offset of bitmask in image mem
-    input  logic [VLEN-1:0] jumptable_base_i,// byte offset of the dynamic jump table
+    input  logic [VLEN-1:0] code_base_i,     // byte offset of code in image mem (BRAM) OR DRAM byte addr (M3)
+    input  logic [VLEN-1:0] bitmask_base_i,  // byte offset/addr of bitmask
+    input  logic [VLEN-1:0] jumptable_base_i,// byte offset/addr of the dynamic jump table
     input  logic [3:0]      jumptable_z_i,   // jump-table entry size in bytes (E1(z), 1..8)
+    // M3: demand-fetch mode -- 0 = legacy BRAM (img_bram preloaded via CSR_PVM_IMG),
+    // 1 = fetch code/bitmask/jt windows from DRAM on-demand via a dcache port.
+    input  logic            fetch_from_dram_i,
+    // M3 dcache request port (discrete signals; cva6.sv assembles the dcache_req_i_t and
+    // muxes this onto dcache port 0 -- PTW, idle in M-mode -- when pvm_active & DRAM mode)
+    output logic            d_req_o,         // data_req
+    output logic [DC_IDX-1:0] d_addr_index_o,// address_index (phase A)
+    output logic [DC_TAG-1:0] d_addr_tag_o,  // address_tag (phase B, physical)
+    output logic            d_tag_valid_o,   // tag_valid (phase B)
+    output logic            d_kill_o,        // kill_req (mode-transition / flush)
+    input  logic            d_gnt_i,         // data_gnt
+    input  logic            d_rvalid_i,      // data_rvalid
+    input  logic [63:0]     d_rdata_i,       // data_rdata (64-bit beat)
     // image memory write port (loader)
     input  logic            img_we_i,
     input  logic [VLEN-1:0] img_addr_i,
@@ -193,13 +211,49 @@ module pvm_front
       if (e >= int'(jumptable_z_i)) djtgt_asm[e*8 +: 8] = 8'h00;
   end
 
+  // ==== M3 DRAM demand-fetch sub-FSM ==========================================
+  // When fetch_from_dram_i, the image is NOT in img_bram; it lives in DRAM. This FSM
+  // fills the SAME holding regs (word0_q/word1_q/bm0_q/bm1_q, or jt0_q/jt1_q) by reading
+  // 64-bit beats from a dcache request port (port 0 / PTW, idle in M-mode), so the window
+  // assembly (code_asm/bm_asm/djtgt_asm) and the pvm_fetch handshake are reused unchanged.
+  // A code+bitmask refill = 8 beats (2 words code + 2 words bitmask, 64b each); a jump-
+  // table read = 4 beats. The 2-phase dcache protocol per beat mirrors load_unit.sv:
+  // drive address_index+data_req until data_gnt, then tag_valid+address_tag, then latch on
+  // data_rvalid (variable latency on a miss). kill_req on the PVM mode transition
+  // (start_pulse) + an expect flag drop any stale beat (the critic's mandatory R2).
+  localparam logic [2:0] D_IDLE=3'd0, D_REQ=3'd1, D_TAG=3'd2, D_WAIT=3'd3, D_ASM=3'd4;
+  logic [2:0]      d_state_q;
+  logic [3:0]      d_beat_q;       // beat index within the current job
+  logic            d_job_q;        // 0 = code+bitmask window, 1 = jump-table
+  logic            d_expect_q;     // a beat's data_rvalid is outstanding (kill-gate)
+  logic [VLEN-1:0] d_base_c, d_base_b, d_base_j, d_byte_addr;
+  logic [DC_PLEN-1:0] d_phys;
+  always_comb begin                                      // beat byte-address by job/beat
+    d_base_c = {CA[VLEN-1:4], 4'b0};                     // 16-aligned code word0 addr
+    d_base_b = {BB[VLEN-1:4], 4'b0};                     // 16-aligned bitmask word0 addr
+    d_base_j = {JE[VLEN-1:4], 4'b0};                     // 16-aligned jump-table addr
+    if (d_job_q) d_byte_addr = d_base_j + (VLEN'(d_beat_q) << 3);
+    else if (d_beat_q < 4) d_byte_addr = d_base_c + (VLEN'(d_beat_q) << 3);
+    else                   d_byte_addr = d_base_b + (VLEN'(d_beat_q - 4'd4) << 3);
+    d_phys = DC_PLEN'(d_byte_addr);                      // M-mode Bare: paddr = zero-ext(vaddr)
+  end
+  logic d_en;
+  assign d_en           = fetch_from_dram_i & pvm_active_i & ~start_pulse;
+  assign d_req_o        = (d_state_q == D_REQ) & d_en;
+  assign d_addr_index_o = d_byte_addr[DC_IDX-1:0];
+  assign d_addr_tag_o   = d_phys[DC_PLEN-1:DC_IDX];
+  assign d_tag_valid_o  = (d_state_q == D_TAG) & d_en;
+  assign d_kill_o       = start_pulse;                   // fence any in-flight beat on (re)entry
+
   always_ff @(posedge clk_i or negedge rst_ni) begin : p_fetch_read
     if (!rst_ni) begin
       fsm_step_q <= 4'd0; loaded_addr_q <= {VLEN{1'b1}}; window_valid_q <= 1'b0;
       jt_valid_q <= 1'b0; jt_req_q <= 1'b0; djump_halt_q <= 1'b0;
+      d_state_q <= D_IDLE; d_beat_q <= 4'd0; d_job_q <= 1'b0; d_expect_q <= 1'b0;
     end else if (start_pulse) begin
       loaded_addr_q <= {VLEN{1'b1}}; window_valid_q <= 1'b0; fsm_step_q <= 4'd0;
       jt_valid_q <= 1'b0; jt_req_q <= 1'b0;
+      d_state_q <= D_IDLE; d_beat_q <= 4'd0; d_job_q <= 1'b0; d_expect_q <= 1'b0;
     end else begin
       // capture a djump resolution (a = br_target_i) while suspended at the djump
       if (f_djump_pending && br_resolved_i && !jt_req_q && !jt_valid_q) begin
@@ -209,6 +263,7 @@ module pvm_front
       end
       if (!f_djump_pending) begin jt_valid_q <= 1'b0; jt_req_q <= 1'b0; end
 
+      if (!fetch_from_dram_i) begin                      // ===== legacy BRAM fetch =====
       case (fsm_step_q)
         4'd0: begin                                      // idle: pick the next job
           if (f_code_addr != loaded_addr_q) begin        // code/bitmask window refill
@@ -238,6 +293,58 @@ module pvm_front
         4'd12: begin djump_target_q <= djtgt_asm; jt_valid_q <= 1'b1; fsm_step_q <= 4'd0; end
         default: fsm_step_q <= 4'd0;
       endcase
+      end else begin                                     // ===== M3 DRAM demand-fetch =====
+        // D_REQ drives index+data_req (wait gnt), D_TAG drives tag_valid, then wait for
+        // data_rvalid. A cache HIT returns rvalid in the D_TAG cycle, a MISS later -- so
+        // the rvalid latch (after the case) fires in EITHER D_TAG or D_WAIT and overrides
+        // the case's next-state. d_expect_q gates a stale beat after a kill (R2).
+        case (d_state_q)
+          D_IDLE: begin                                  // pick the next job
+            if (f_code_addr != loaded_addr_q) begin      // code/bitmask window refill (8 beats)
+              rd_addr_q <= f_code_addr; window_valid_q <= 1'b0;
+              d_job_q <= 1'b0; d_beat_q <= 4'd0; d_state_q <= D_REQ;
+            end else if (jt_req_q && !jt_valid_q && djump_halt_q) begin
+              jt_valid_q <= 1'b1;                         // r0 halt magic: no read
+            end else if (jt_req_q && !jt_valid_q) begin   // jump-table read (4 beats)
+              d_job_q <= 1'b1; d_beat_q <= 4'd0; d_state_q <= D_REQ;
+            end
+          end
+          D_REQ:  if (d_gnt_i) begin d_state_q <= D_TAG; d_expect_q <= 1'b1; end
+          D_TAG:  d_state_q <= D_WAIT;
+          D_WAIT: ;                                        // hold; rvalid latched below
+          D_ASM: begin
+            if (!d_job_q) begin                            // code+bitmask window ready
+              window_code_q <= code_asm; window_bm_q <= bm_asm;
+              window_valid_q <= 1'b1; loaded_addr_q <= rd_addr_q;
+            end else begin                                 // jump-table target ready
+              djump_target_q <= djtgt_asm; jt_valid_q <= 1'b1;
+            end
+            d_state_q <= D_IDLE;
+          end
+          default: d_state_q <= D_IDLE;
+        endcase
+        if (d_expect_q && d_rvalid_i) begin                // beat done (hit in D_TAG / miss in D_WAIT)
+          d_expect_q <= 1'b0;
+          unique case ({d_job_q, d_beat_q})
+            {1'b0, 4'd0}: word0_q[63:0]   <= d_rdata_i;
+            {1'b0, 4'd1}: word0_q[127:64] <= d_rdata_i;
+            {1'b0, 4'd2}: word1_q[63:0]   <= d_rdata_i;
+            {1'b0, 4'd3}: word1_q[127:64] <= d_rdata_i;
+            {1'b0, 4'd4}: bm0_q[63:0]     <= d_rdata_i;
+            {1'b0, 4'd5}: bm0_q[127:64]   <= d_rdata_i;
+            {1'b0, 4'd6}: bm1_q[63:0]     <= d_rdata_i;
+            {1'b0, 4'd7}: bm1_q[127:64]   <= d_rdata_i;
+            {1'b1, 4'd0}: jt0_q[63:0]     <= d_rdata_i;
+            {1'b1, 4'd1}: jt0_q[127:64]   <= d_rdata_i;
+            {1'b1, 4'd2}: jt1_q[63:0]     <= d_rdata_i;
+            {1'b1, 4'd3}: jt1_q[127:64]   <= d_rdata_i;
+            default: ;
+          endcase
+          if ((!d_job_q && d_beat_q == 4'd7) || (d_job_q && d_beat_q == 4'd3))
+            d_state_q <= D_ASM;                            // last beat -> assemble
+          else begin d_beat_q <= d_beat_q + 4'd1; d_state_q <= D_REQ; end
+        end
+      end
     end
   end
 

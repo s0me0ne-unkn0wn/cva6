@@ -24,6 +24,7 @@
 
 #define CSR_PVM_CFG0 0xbc0
 #define CSR_PVM_CFG1 0xbc1
+#define CSR_PVM_CFG2 0xbc2
 #define CSR_PVM_IMG  0xbc3          /* write {addr<<8 | byte} -> img_mem[addr] (M1 load port) */
 #define PVM_IMG_LEN  36             /* add_numbers image: 25 code + 7 pad + 4 bitmask */
 #define PVM_CODE_LEN 25             /* |c| of the add_numbers export */
@@ -33,6 +34,7 @@
 #define UART_BASE    0x10000000     /* ariane_soc::UARTBase (apb_uart THR @ +0) */
 #define UART_LSR_OFF 0x14           /* line status register (reg 5, 4-byte stride) */
 #define LSR_THRE     0x20           /* LSR bit 5: transmit holding register empty */
+#define FETCH_DRAM   (1 << 34)      /* M3: CFG1[34] -- fetch code/bitmask/jt from DRAM on-demand */
 
     .section .text,"ax",@progbits
     .globl pvm_boot
@@ -51,24 +53,21 @@ pvm_boot:
     sb   a0, 0(a1)                  # -> DRAM
     addi a3, a3, 1
     blt  a3, t2, 3b
-    li   a3, 0
-4:  add  a2, t1, a3
-    lbu  a0, 0(a2)                  # DRAM byte (read-back)
-    slli a1, a3, 8
-    or   a1, a1, a0                 # {addr<<8 | byte}
-    csrw CSR_PVM_IMG, a1            # -> img_mem[addr]
-    addi a3, a3, 1
-    blt  a3, t2, 4b
+    # M3: the image STAYS in DRAM @0x8000_0000 (t1) and is fetched on-demand via the
+    # dcache -- NO CSR-load into img_bram. code_base = 0x8000_0000; CFG1[34]=fetch_from_dram.
     # --- seed the guest registers (persist through the PVM-mode switch) --------
     li   x1, HALT_MAGIC             # ra (r0) = halt magic -> guest `ret` halts
     li   x2, GUEST_SP               # sp (r1) = DRAM stack top
     li   x8, 10                     # a0 (r7) = 10
     li   x9, 20                     # a1 (r8) = 20
-    # --- enter PVM -------------------------------------------------------------
-    csrw CSR_PVM_CFG0, x0           # entry_pc=0, code_base=0
+    # --- enter PVM (DRAM demand-fetch, M3) -------------------------------------
+    slli a2, t1, 32                 # a2 = 0x8000_0000 << 32  (code_base -> CFG0[63:32])
+    csrw CSR_PVM_CFG0, a2           # entry_pc=0, code_base=0x8000_0000 (DRAM)
+    csrw CSR_PVM_CFG2, x0           # no jump table
+    fence                           # drain the staging stores to DRAM before fetch reads
     csrw CSR_PVM_CFG1, x0           # clear -> clean 0->1 edge on the next write
-    li   t0, (1 << 32) | PVM_CODE_LEN
-    csrw CSR_PVM_CFG1, t0           # rising edge of active -> enter PVM
+    li   t0, FETCH_DRAM | (1 << 32) | PVM_CODE_LEN
+    csrw CSR_PVM_CFG1, t0           # rising edge of active -> enter PVM (fetch from DRAM)
 wait_pvm:
     # busy-loop (NOT wfi): keep the pipeline live so PVM uops flow through issue.
     j    wait_pvm
@@ -86,7 +85,7 @@ pvm_trap_handler:
     li   x8, THIRD                  # a0 = get_third_number()
 hc_resume:
     csrw CSR_PVM_CFG1, x0           # clear-pulse (spaces the re-entry)
-    li   x15, (1 << 33) | (1 << 32) | PVM_CODE_LEN   # resume | active | code_len
+    li   x15, FETCH_DRAM | (1 << 33) | (1 << 32) | PVM_CODE_LEN  # resume|active|fetch_dram|len
     csrw CSR_PVM_CFG1, x15
     j    wait_pvm
 
