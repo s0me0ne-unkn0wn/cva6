@@ -176,6 +176,17 @@ module pvm_decoder
         use_imm_o = 1'b1; is_djump_o = 1'b1;
       end
 
+      // ---- reg + imm + offset: load_imm_jump = (reg_A = imm_X ; jump pc+imm_Y) ----
+      // A STATIC jump (decode-time target, like PVM_OP_JUMP) that also loads reg_A. One uop:
+      // the ALU does reg_A = 0 + imm_X (the load_imm) while is_jump redirects the front to
+      // pc+imm_Y. REG_IMM_OFF args (same family as the imm-branches): imm_X = value @off2,
+      // imm_Y = offset @off2+len_x. Used pervasively by OpenSBI for `ra = <ret> ; jump callee`.
+      PVM_OP_LOAD_IMM_JUMP: begin
+        fu_o = ALU; op_o = ADD; rd_o = g_lo; rs1_o = 5'd0; imm_o = imm_x; use_imm_o = 1'b1;
+        is_jump_o = 1'b1;
+        branch_target_o = pc_i + imm_y[VLEN-1:0];
+      end
+
       // ---- 2reg + 2imm: load_imm_jump_ind = (reg_A = imm_X ; djump(reg_B + imm_Y)) ----
       // Macro-expanded: phase 0 loads reg_A, phase 1 is the dynamic jump on reg_B.
       PVM_OP_LOAD_IMM_JUMP_IND: begin
@@ -368,7 +379,14 @@ module pvm_decoder
       // ---- privileged CSR (reg_reg_imm: rd=b1[7:4], rs1=b1[3:0], imm=csr) ----
       PVM_OP_CSR_RW, PVM_OP_CSR_RS, PVM_OP_CSR_RC,
       PVM_OP_CSR_RWI, PVM_OP_CSR_RSI, PVM_OP_CSR_RCI: begin
-        fu_o = CSR; rd_o = g_hi; rs1_o = g_lo; imm_o = imm_ri; use_imm_o = 1'b1;
+        // polkavm2 (jam_v1_privileged) CSR encoding: rd = LOW nibble, the CSR-source reg =
+        // HIGH nibble (verified against polkatool disasm of real OpenSBI: `a5 = csrrw csr, t1`
+        // has byte1 lo=a5/hi=t1). The earlier rd=hi/rs1=lo was backwards -- it self-agreed
+        // with the hand-rolled gen_pvm_img generator (so the run-csr gate passed trivially) but
+        // mis-decoded real compiled code: e.g. OpenSBI's `_reset_regs` `csrrw mscratch, ra`
+        // (preserve ra) was decoded as writing ra, corrupting the return address -> `ret` to 0
+        // -> _start re-ran -> boot-lottery spin. gen_pvm_img's b1() is flipped to match. B7.
+        fu_o = CSR; rd_o = g_lo; rs1_o = g_hi; imm_o = imm_ri; use_imm_o = 1'b1;
         unique case (opcode_i)
           PVM_OP_CSR_RW, PVM_OP_CSR_RWI: op_o = CSR_WRITE;
           PVM_OP_CSR_RS, PVM_OP_CSR_RSI: op_o = CSR_SET;

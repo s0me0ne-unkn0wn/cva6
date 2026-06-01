@@ -226,8 +226,13 @@ module pvm_fetch
       // Host-call (ecalli): advance to the next pc, then suspend so the M-mode
       // handler runs; on resume pvm_fetch continues from this saved next pc.
       else if (halt_i) begin pc_q <= next_pc_c; running_q <= 1'b0; end
-      // trap (opcode 0) exits via its own exception uop; just stop fetching.
-      else if (terminator_c) running_q <= 1'b0;
+      // trap (opcode 0) exits via its own exception uop; just stop fetching. NOTE: of the
+      // terminator set T only TRAP halts fetch here -- jumps/branches/djumps are handled by
+      // the redirect/branch_i/djump_i arms above, and FALLTHROUGH (the bare basic-block
+      // separator, opcode 1) is NOT a control-flow stop: execution continues sequentially to
+      // next_pc. (Treating fallthrough as a hard stop hung any continuous block-to-block run,
+      // e.g. OpenSBI _start crossing its first basic-block boundary -- B7.)
+      else if (opcode_c == PVM_OP_TRAP) running_q <= 1'b0;
       // Off the end of the code with no explicit trap: clean halt -> synthetic trap.
       else if (next_pc_c >= code_len_i) begin running_q <= 1'b0; done_q <= 1'b1; end
       else pc_q <= next_pc_c;

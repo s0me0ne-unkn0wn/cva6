@@ -238,9 +238,11 @@ def emit_ldij_test():
     return code, starts, [9], 1   # jumptable[0] = TARGET(9), z=1
 
 
-# Privileged CSR opcodes (231-236): reg_reg_imm. byte1 = (rd<<4)|rs1 nibbles (PVM
-# rN -> RISC-V x(N+1)), then the csr-number immediate (LE). csr_rw: rd=old csr,
-# csr=rs1. csr_rs: rd=old csr, csr|=rs1. csr_rc: rd=old csr, csr&=~rs1.
+# Privileged CSR opcodes (231-236): reg_reg_imm. byte1 = (rs1<<4)|rd nibbles -- i.e.
+# rd = LOW nibble, csr-source reg = HIGH nibble (the polkavm2 jam_v1_privileged
+# encoding; verified against polkatool disasm of real OpenSBI). PVM rN -> RISC-V
+# x(N+1), then the csr-number immediate (LE). csr_rw: rd=old csr, csr=rs1. csr_rs:
+# rd=old csr, csr|=rs1. csr_rc: rd=old csr, csr&=~rs1.
 CSR_RW   = 0xE7   # 231
 CSR_RS   = 0xE8   # 232
 CSR_RC   = 0xE9   # 233
@@ -267,8 +269,8 @@ def emit_csr_test():
     sfence_vma are control/privilege ops -- their meaningful test needs the guest-
     privilege scenario from B4, so they are exercised there, not here.)"""
     csr = le(MSCRATCH, 2)                    # [0x40, 0x03]
-    def b1(rd, rs1):                          # nibbles: hi = rd PVM idx, lo = rs1 PVM idx
-        return ((rd & 0xF) << 4) | (rs1 & 0xF)
+    def b1(rd, rs1):                          # nibbles: lo = rd PVM idx, hi = rs1 PVM idx
+        return ((rs1 & 0xF) << 4) | (rd & 0xF)   # polkavm2: rd=LOW nibble, csr-src=HIGH
     code = (
         [LOAD_IMM, 0x07, 0x20]               # r7 = 0x20                @0  (3B)
         + [CSR_RW, b1(1, 7)] + csr           # mscratch = r7 = 0x20     @3  (4B)
@@ -315,7 +317,7 @@ def emit_mtvec_test():
       load_imm r2,0x40 ; csr_rw r1,r2,mtvec  -> mtvec = 0x40 (CLOBBER)
       load_imm r7,0x23 ; ecalli #0 (putchar '#') ; trap."""
     def b1(rd, rs1):
-        return ((rd & 0xF) << 4) | (rs1 & 0xF)
+        return ((rs1 & 0xF) << 4) | (rd & 0xF)   # polkavm2: rd=LOW nibble, csr-src=HIGH
     mtv = le(MTVEC, 2)                        # [0x05, 0x03]
     code = (
         [LOAD_IMM, 0x02, 0x40]               # r2 = 0x40 (bogus handler)   @0  (3B)
@@ -340,7 +342,7 @@ def emit_mret_test():
       @L:                       load_imm r7,'#' ; ecalli #0 ; trap     (SUCCESS marker)
     Prints '#' iff pvm_fetch redirected to mepc; 'X' iff the redirect fell through."""
     def b1(rd, rs1):
-        return ((rd & 0xF) << 4) | (rs1 & 0xF)
+        return ((rs1 & 0xF) << 4) | (rd & 0xF)   # polkavm2: rd=LOW nibble, csr-src=HIGH
     mepc = le(MEPC, 2)                            # [0x41, 0x03]
     L = 14                                        # PVM-pc of the success block (see layout)
     code = (
@@ -374,7 +376,7 @@ def emit_priv_test():
     redirected to the guest mtvec=Lh AND priv became M there. Prints 'S' (no '#') iff the
     mret redirected but priv stayed M (ecalli@Ls would host-exit directly). Expect '#'."""
     def b1(rd, rs1):
-        return ((rd & 0xF) << 4) | (rs1 & 0xF)
+        return ((rs1 & 0xF) << 4) | (rd & 0xF)   # polkavm2: rd=LOW nibble, csr-src=HIGH
     mtvec = le(MTVEC, 2)                          # [0x05, 0x03]
     mepc  = le(MEPC, 2)                           # [0x41, 0x03]
     # ALIGNMENT (a real RISC-V constraint on the PVM-pc targets): mtvec is 4-byte aligned
@@ -417,7 +419,7 @@ def emit_priv_dyn_test():
     Prints '#' iff B5 fences the guest mstatus write (no hang) AND the priv round-trip works.
     A hang (no output / timeout) means the flush discarded the mret -> B5 is broken."""
     def b1(rd, rs1):
-        return ((rd & 0xF) << 4) | (rs1 & 0xF)
+        return ((rs1 & 0xF) << 4) | (rd & 0xF)   # polkavm2: rd=LOW nibble, csr-src=HIGH
     mstatus = le(MSTATUS, 2)                      # [0x00, 0x03]
     mtvec   = le(MTVEC, 2)                         # [0x05, 0x03]
     mepc    = le(MEPC, 2)                          # [0x41, 0x03]
@@ -475,7 +477,7 @@ def emit_priv_return_test():
     mtvec targets Lh1/Lh2 are 4-aligned (direct mode bits[1:0]=0); mepc/sepc targets
     Ls/Sr are 2-aligned. TRAP(0x00) pad bytes realign each section (@19, @39)."""
     def b1(rd, rs1):
-        return ((rd & 0xF) << 4) | (rs1 & 0xF)
+        return ((rs1 & 0xF) << 4) | (rd & 0xF)   # polkavm2: rd=LOW nibble, csr-src=HIGH
     mtvec = le(MTVEC, 2)                          # [0x05, 0x03]
     mepc  = le(MEPC, 2)                           # [0x41, 0x03]
     Lh1 = 20                                      # 1st M-handler PVM-pc (4-aligned)

@@ -1,0 +1,207 @@
+# Copyright 2026 CVA6-PolkaVM contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# B7 step-1: boot a REAL OpenSBI build as a PVM/JAM guest in Verilator. The image is the
+# genuine fw_payload.bin (PVMI emit-image, 125 KB) split by opensbi_to_dram.py into:
+#   .pvm_code (code+pad+bitmask) @ 0x80100000  (M3 demand-fetch code_base)
+#   .pvm_jt   (jump table z=3)   @ 0x80200000  (CFG2 jt_base)
+#   .pvm_ro   (ro_data)          @ 0x80010000  (= ram_base + guest 0x10000)
+#   .pvm_rw   (rw_init)          @ 0x80030000  (= ram_base + guest 0x30000)
+# placed there by link_opensbi.ld + .incbin below. The loader (M-mode RISC-V) zeroes the
+# guest bss [0x80030b00,0x80031738), installs a host trap vector in CSR_PVM_VEC, programs the
+# guest-RAM->DRAM aperture (CSR_PVM_RAM = base 0x80000000, window [0x10000,0x40000)), points
+# CFG0 at the DRAM code, CFG2 at the jump table, seeds a0/a1/a2, and enters PVM in
+# DRAM-demand-fetch mode (CFG1[34]). OpenSBI's `_start` then: s0=a0, s1=a1, store a2->[0x30058]
+# (the FIRST guest store -- relocated into DRAM by the aperture), boot-lottery, bss-zero,
+# csrw mtvec=0x16, clear an mstatus bit, sp=0x32b00, then call into C (console/DTB).
+#
+# SUCCESS = the first OpenSBI UART byte ($write from mock_uart). A precise first-fault
+# localization (via the commit trace) is the fallback observable -- see run-opensbi.
+
+#define CSR_PVM_CFG0 0xbc0
+#define CSR_PVM_CFG1 0xbc1
+#define CSR_PVM_CFG2 0xbc2
+#define CSR_PVM_VEC  0xbc4
+#define CSR_PVM_RAM  0xbc5
+
+#ifndef CODE_LEN
+#define CODE_LEN 85668
+#endif
+#ifndef JT_Z
+#define JT_Z 3
+#endif
+
+#ifndef CODE_BASE
+#define CODE_BASE  0x80100000
+#endif
+#ifndef JT_BASE
+#define JT_BASE    0x80200000
+#endif
+#define RAM_BASE   0x80000000
+#define BSS_LO     0x80030b00          /* guest 0x30b00 relocated */
+#define BSS_HI     0x80031738          /* guest 0x31738 relocated */
+
+#define FETCH_DRAM (1 << 34)           /* CFG1[34]: fetch code/bitmask/jt from DRAM via dcache */
+#define PVM_ACTIVE (1 << 32)
+#define PVM_RESUME (1 << 33)
+
+    .section .text.init,"ax",@progbits
+    .globl _start
+_start:
+    # ---- host trap vector (PVM host-boundary exit) ----
+    la   t0, host_trap
+    csrw mtvec, t0                      # safety net
+    csrw CSR_PVM_VEC, t0                # B4: ecalli/panic host-exit vector
+
+    # ---- zero the guest bss [BSS_LO, BSS_HI) (OpenSBI _start expects it pre-zeroed too,
+    #      but its loop re-zeroes; do it here so a partial bss can't poison early reads) ----
+    li   t0, BSS_LO
+    li   t1, BSS_HI
+1:  sd   x0, 0(t0)
+    addi t0, t0, 8
+    bltu t0, t1, 1b
+
+    # ---- guest-RAM -> DRAM aperture: ram_base=0x80000000, window [0x10000,0x40000) ----
+    # CSR_PVM_RAM = [31:0]=ram_base, [47:32]=ram_lo_page(1<<16=0x10000), [63:48]=ram_hi_page(4<<16=0x40000)
+    li   t0, RAM_BASE                   # [31:0]
+    li   t1, 1
+    slli t1, t1, 32                     # ram_lo_page = 1  -> 0x10000
+    or   t0, t0, t1
+    li   t1, 4
+    slli t1, t1, 48                     # ram_hi_page = 4  -> 0x40000
+    or   t0, t0, t1
+    csrw CSR_PVM_RAM, t0
+
+    # ---- CFG0 = {code_base=0x80100000 [63:32], entry_pc=0 [31:0]} ----
+    li   t0, CODE_BASE
+    slli t0, t0, 32
+    csrw CSR_PVM_CFG0, t0
+
+    # ---- CFG2 = {jt_z [35:32], jt_base=0x80200000 [31:0]} ----
+    li   t0, JT_BASE
+    li   t1, JT_Z
+    slli t1, t1, 32
+    or   t0, t0, t1
+    csrw CSR_PVM_CFG2, t0
+
+    # ---- seed guest entry registers (shared regfile persists through the PVM switch) ----
+    # OpenSBI _start: a0=hartid, a1=opaque(dtb ptr), a2=FW_NEXT_ARG (-> stored at [0x30058]).
+    li   x8, 0                          # a0 (r7) = hartid 0
+    li   x9, 0                          # a1 (r8) = dtb ptr (0 for now; see report)
+    li   x10, 0                         # a2 (r9) = next-stage arg (stored to guest 0x30058)
+
+    fence                               # publish ro/rw/code/jt DRAM writes to the fetch dcache
+
+#ifdef SELFCHECK
+    # DIAG: read code[0] from CODE_BASE and bitmask[0] from CODE_BASE+align16(CODE_LEN);
+    # putchar each as 2 hex nibbles framed '<cc bb>' so we can confirm the ELF DRAM load.
+    li   x15, 0x10000000                 # UART THR
+    li   x14, '<'
+    sb   x14, 0(x15)
+    lbu  x14, 0x14(x15)
+    li   x11, CODE_BASE
+    lbu  x12, 0(x11)                     # code[0] (expect 0x64)
+    li   x11, CODE_BASE + ((CODE_LEN + 15) & ~15)
+    lbu  x13, 0(x11)                     # bitmask[0] (expect 0x15)
+    # print x12 as 2 hex digits
+    srli x14, x12, 4
+    call hexnib
+    mv   x14, x12
+    call hexnib
+    li   x14, ' '
+    sb   x14, 0(x15)
+    lbu  x14, 0x14(x15)
+    srli x14, x13, 4
+    call hexnib
+    mv   x14, x13
+    call hexnib
+    li   x14, '>'
+    sb   x14, 0(x15)
+    lbu  x14, 0x14(x15)
+#endif
+
+    # ---- enter PVM in DRAM demand-fetch mode ----
+    li   t0, FETCH_DRAM | PVM_ACTIVE | CODE_LEN
+    csrw CSR_PVM_CFG1, t0
+
+wait_pvm:
+    j    wait_pvm
+
+    # ---------------------------------------------------------------------------
+    # Host trap handler: any PVM host-boundary exit (ecalli/panic/fault) lands here.
+    # OpenSBI uses ecalli=0 only as its host-call ABI base; early boot makes NO host
+    # calls (console is direct MMIO), so reaching here early == a fault. We emit a
+    # one-char marker ('!'+the mcause low nibble is overkill; just print 'X' and the
+    # raw mcause/mepc are visible in the trace) then resume so the trace keeps going.
+    # ---------------------------------------------------------------------------
+    .align 2
+host_trap:
+    csrr x14, mcause
+    li   x15, 11                        # ENV_CALL_M (ecalli host-boundary)
+    bne  x14, x15, trap_fault
+    # ecalli host-call: OpenSBI early boot shouldn't hit this; just resume.
+    csrw CSR_PVM_CFG1, x0
+    li   x15, FETCH_DRAM | PVM_RESUME | PVM_ACTIVE | CODE_LEN
+    csrw CSR_PVM_CFG1, x15
+    j    wait_pvm
+
+trap_fault:
+    # A real fault (load/store access, illegal, etc.). Mark it on the UART, then park.
+    # The trace_rvfi dump carries the precise pc/cause/tval for the post-mortem.
+    li   x15, 0x10000000                # UART THR
+    li   x14, '!'
+    sb   x14, 0(x15)
+    lbu  x14, 0x14(x15)
+    li   x14, 'F'
+    sb   x14, 0(x15)
+    lbu  x14, 0x14(x15)
+    li   t2, 4000
+2:  addi t2, t2, -1
+    bnez t2, 2b
+    li   t0, 1
+    la   t1, tohost
+    sd   t0, 0(t1)
+fault_park:
+    j    fault_park
+
+#ifdef SELFCHECK
+    # print low nibble of x14 as a hex char to UART (x15 = THR). Clobbers x14.
+    .align 2
+hexnib:
+    andi x14, x14, 0xf
+    li   x6, 10
+    blt  x14, x6, 1f
+    addi x14, x14, 'a' - 10 - '0'
+1:  addi x14, x14, '0'
+    sb   x14, 0(x15)
+    lbu  x14, 0x14(x15)
+    ret
+#endif
+
+    # ---- embedded guest image regions (placed by link_opensbi.ld) ----
+    .section .pvm_code,"a",@progbits
+    .globl pvm_code
+pvm_code:
+    .incbin "opensbi.code.bin"
+
+    .section .pvm_jt,"a",@progbits
+    .globl pvm_jt
+pvm_jt:
+    .incbin "opensbi.jt.bin"
+
+    .section .pvm_ro,"a",@progbits
+    .globl pvm_ro
+pvm_ro:
+    .incbin "opensbi.ro.bin"
+
+    .section .pvm_rw,"a",@progbits
+    .globl pvm_rw
+pvm_rw:
+    .incbin "opensbi.rw.bin"
+
+    .section .tohost,"aw",@progbits
+    .align 6
+    .globl tohost
+tohost:   .dword 0
+    .globl fromhost
+fromhost: .dword 0
