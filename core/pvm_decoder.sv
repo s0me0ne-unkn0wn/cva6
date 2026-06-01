@@ -66,6 +66,14 @@ module pvm_decoder
   assign g_lo = {1'b0, pvm_reg_lo(b1)} + 5'd1;                       // rA = low nibble
   assign g_hi = {1'b0, pvm_reg_hi(b1)} + 5'd1;                       // rB = high nibble
   assign g_d3 = (b2 > 8'd12) ? 5'd13 : ({1'b0, b2[3:0]} + 5'd1);     // rD = min(12,c[i+2])
+  // CSR source register: the linker lowers a RISC-V `csrr*` whose rs1=x0 (e.g. `csrr
+  // mhartid` == `csrrs rd,mhartid,x0`, a pure read) to a PVM csr_rs/rc/rw with source =
+  // RawReg(0) (PolkaVM has no zero reg; Reg::RA==0 doubles as the x0 stand-in, see
+  // polkavm-linker program_from_elf.rs:661/8826-8834). So in the CSR *source* slot a high
+  // nibble of 0 means x0/zero, NOT x1(ra): map it to x0 so set/clear add no bits (legal on
+  // read-only CSRs like mhartid) and a write supplies 0. Data-reg slots keep g_hi (+1).
+  logic [4:0] g_hi_csr;
+  assign g_hi_csr = (pvm_reg_hi(b1) == 4'd0) ? 5'd0 : g_hi;
 
   // immediate lengths (graypaper): reg+imm / 2reg+imm / 2reg+off use
   // lX = min(4, max(0, skip-1)), immediate at byte offset 2. ecalli uses
@@ -492,11 +500,18 @@ module pvm_decoder
         // mis-decoded real compiled code: e.g. OpenSBI's `_reset_regs` `csrrw mscratch, ra`
         // (preserve ra) was decoded as writing ra, corrupting the return address -> `ret` to 0
         // -> _start re-ran -> boot-lottery spin. gen_pvm_img's b1() is flipped to match. B7.
-        fu_o = CSR; rd_o = g_lo; rs1_o = g_hi; imm_o = imm_ri; use_imm_o = 1'b1;
+        fu_o = CSR; rd_o = g_lo; rs1_o = g_hi_csr; imm_o = imm_ri; use_imm_o = 1'b1;
+        // A csrrs/csrrc whose source is x0 (high nibble 0 -- the linker's x0/zimm=0 stand-in for
+        // `csrr csr` reads, e.g. `csrr mhartid`) must NOT request a CSR write: CVA6's csr_regfile
+        // sets csr_we=1 for any CSR_SET/CSR_CLEAR (it does not re-derive rs1==x0), so a SET/CLEAR
+        // to a READ-ONLY CSR (mhartid 0xf14, mhpmcounter 0xb0x, mvendorid 0xf1x ...) traps ILLEGAL.
+        // The stock RISC-V decoder.sv (290-321) maps rs1==x0 csrrs/csrrc -> CSR_READ; mirror that
+        // here so the read is side-effect-free. csrrw/csrrwi always write (RISC-V: write 0 when
+        // the source is x0), so they are unaffected.
         unique case (opcode_i)
           PVM_OP_CSR_RW, PVM_OP_CSR_RWI: op_o = CSR_WRITE;
-          PVM_OP_CSR_RS, PVM_OP_CSR_RSI: op_o = CSR_SET;
-          default:                       op_o = CSR_CLEAR;  // RC / RCI
+          PVM_OP_CSR_RS, PVM_OP_CSR_RSI: op_o = (pvm_reg_hi(b1) == 4'd0) ? CSR_READ : CSR_SET;
+          default:                       op_o = (pvm_reg_hi(b1) == 4'd0) ? CSR_READ : CSR_CLEAR; // RC/RCI
         endcase
         // B5: a write to a flush-class CSR (mstatus/sstatus/satp/mstatush) raises flush_o in
         // csr_regfile (side-effects on translation/MPP etc.). In PVM mode that flush would
