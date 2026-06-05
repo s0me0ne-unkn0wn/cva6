@@ -40,21 +40,32 @@
 #define RAM_BASE   0x80000000
 #define BSS_LO     0x80030b00          /* guest 0x30b00 relocated */
 #define BSS_HI     0x80031738          /* guest 0x31738 relocated */
-#define DTB_GUEST  0x20000             /* a1: guest DTB ptr (free ro/rw gap); phys 0x80020000 */
+/* a1 / FDT location = guest 0x90000 == FW_PAYLOAD_FDT_OFFSET in the rebuilt OpenSBI.
+ * BOTH consumers must agree: fw_platform_init() parses the DTB at boot-a1, and
+ * generic_early_init()->fdt_serial_init() (the console path, just before the banner)
+ * parses fdt_get_address()==scratch->next_arg1==fw_next_arg1()==_fw_start+0x90000.
+ * Staging the DTB at 0x90000 and passing a1=0x90000 makes both reads hit the same
+ * valid blob (phys 0x80090000, inside the widened aperture). */
+#define DTB_GUEST  0x90000             /* a1 = FW_PAYLOAD_FDT_OFFSET; phys 0x80090000 */
 
 #ifndef DTB_PATH
 #define DTB_PATH "/home/claude/pvm/cva6-sdk/configs/genesys2/cv64a6_emac_sv39.dtb"
 #endif
 
-#define FETCH_DRAM (1 << 34)           /* CFG1[34]: fetch code/bitmask/jt from DRAM via dcache */
-#define PVM_ACTIVE (1 << 32)
-#define PVM_RESUME (1 << 33)
+/* CFG1 flag bits are >32-bit; DO NOT use (1<<34) in #define — C preprocessor integer
+ * arithmetic is 32-bit and overflows silently.  Build the 64-bit value with explicit
+ * li+slli+or sequences in assembly (see enter_pvm / host_trap below). */
+#define CFG1_CODE_LEN_MASK 0xFFFFFFFF   /* low 32 bits of CFG1 = code_len */
+/* Bit positions (for documentation; use assembly not macros for >31-bit shifts): */
+#define CFG1_BIT_ACTIVE 32
+#define CFG1_BIT_RESUME 33
+#define CFG1_BIT_FETCH  34
 
     .section .text.init,"ax",@progbits
     .globl _start
 _start:
     # ---- host trap vector (PVM host-boundary exit) ----
-    la   t0, host_trap
+    lla  t0, host_trap                  # lla = PC-relative, bare-metal safe (la uses GOT -> 0)
     csrw mtvec, t0                      # safety net
     csrw CSR_PVM_VEC, t0                # B4: ecalli/panic host-exit vector
 
@@ -66,14 +77,18 @@ _start:
     addi t0, t0, 8
     bltu t0, t1, 1b
 
-    # ---- guest-RAM -> DRAM aperture: ram_base=0x80000000, window [0x10000,0x40000) ----
-    # CSR_PVM_RAM = [31:0]=ram_base, [47:32]=ram_lo_page(1<<16=0x10000), [63:48]=ram_hi_page(4<<16=0x40000)
+    # ---- guest-RAM -> DRAM aperture: ram_base=0x80000000, window [0x10000,0x100000) ----
+    # Widened from [0x10000,0x40000) to cover the rebuilt OpenSBI's in-aperture FDT-reloc
+    # dest (guest 0x90000, FW_PAYLOAD_FDT_OFFSET) + next-stage payload (guest 0xC0000,
+    # FW_PAYLOAD_OFFSET); both now map to DRAM 0x800{90,C0}000. Nothing between guest
+    # 0x40000 and 0x100000 is MMIO, so all of it passes through to DRAM.
+    # CSR_PVM_RAM = [31:0]=ram_base, [47:32]=ram_lo_page(1<<16=0x10000), [63:48]=ram_hi_page(0x10<<16=0x100000)
     li   t0, RAM_BASE                   # [31:0]
     li   t1, 1
     slli t1, t1, 32                     # ram_lo_page = 1  -> 0x10000
     or   t0, t0, t1
-    li   t1, 4
-    slli t1, t1, 48                     # ram_hi_page = 4  -> 0x40000
+    li   t1, 0x10
+    slli t1, t1, 48                     # ram_hi_page = 0x10 -> 0x100000
     or   t0, t0, t1
     csrw CSR_PVM_RAM, t0
 
@@ -92,7 +107,7 @@ _start:
     # ---- seed guest entry registers (shared regfile persists through the PVM switch) ----
     # OpenSBI _start: a0=hartid, a1=opaque(dtb ptr), a2=FW_NEXT_ARG (-> stored at [0x30058]).
     li   x8, 0                          # a0 (r7) = hartid 0
-    li   x9, DTB_GUEST                  # a1 (r8) = guest DTB ptr (staged at phys 0x80020000)
+    li   x9, DTB_GUEST                  # a1 (r8) = guest DTB ptr 0x90000 (staged at phys 0x80090000)
     li   x10, 0                         # a2 (r9) = next-stage arg (stored to guest 0x30058)
 
     fence                               # publish ro/rw/code/jt DRAM writes to the fetch dcache
@@ -126,7 +141,14 @@ _start:
 #endif
 
     # ---- enter PVM in DRAM demand-fetch mode ----
-    li   t0, FETCH_DRAM | PVM_ACTIVE | CODE_LEN
+    # CFG1 = (1<<34)|(1<<32)|CODE_LEN  -- built with explicit shifts (li+slli safe for >31 bits)
+    li   t0, CODE_LEN
+    li   t1, 1
+    slli t1, t1, 34                     # FETCH_DRAM bit
+    or   t0, t0, t1
+    li   t1, 1
+    slli t1, t1, 32                     # PVM_ACTIVE bit
+    or   t0, t0, t1
     csrw CSR_PVM_CFG1, t0
 
 wait_pvm:
@@ -145,8 +167,18 @@ host_trap:
     li   x15, 11                        # ENV_CALL_M (ecalli host-boundary)
     bne  x14, x15, trap_fault
     # ecalli host-call: OpenSBI early boot shouldn't hit this; just resume.
+    # CFG1 = (1<<34)|(1<<33)|(1<<32)|CODE_LEN -- explicit shifts, >31 bits unsafe in #define
     csrw CSR_PVM_CFG1, x0
-    li   x15, FETCH_DRAM | PVM_RESUME | PVM_ACTIVE | CODE_LEN
+    li   x15, CODE_LEN
+    li   x14, 1
+    slli x14, x14, 34                   # FETCH_DRAM
+    or   x15, x15, x14
+    li   x14, 1
+    slli x14, x14, 33                   # PVM_RESUME
+    or   x15, x15, x14
+    li   x14, 1
+    slli x14, x14, 32                   # PVM_ACTIVE
+    or   x15, x15, x14
     csrw CSR_PVM_CFG1, x15
     j    wait_pvm
 
@@ -164,7 +196,7 @@ trap_fault:
 2:  addi t2, t2, -1
     bnez t2, 2b
     li   t0, 1
-    la   t1, tohost
+    lla  t1, tohost                     # lla = PC-relative, bare-metal safe
     sd   t0, 0(t1)
 fault_park:
     j    fault_park

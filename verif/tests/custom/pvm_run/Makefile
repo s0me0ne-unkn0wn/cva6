@@ -159,7 +159,7 @@ run-dram: loader_dramload.S link.ld
 # code is the per-gate verdict.
 PVM_GATES = run run-ecalli run-banner run-branch run-loop run-djump-halt run-djump-table \
             run-ibranch run-ldij run-csr run-hostcall run-dram run-dram-banner run-user run-user-dram \
-            run-pvmvec run-mret run-priv run-priv-dyn run-priv-return
+            run-pvmvec run-mret run-priv run-priv-dyn run-priv-return run-storeimm
 run-all:
 	@pass=0; fail=0; failed=""; \
 	 for t in $(PVM_GATES); do \
@@ -279,6 +279,21 @@ run-priv-return: loader_priv.S link.ld gen_pvm_img.py
 	 EMIT=$$(echo "$$OUT" | grep -aoE '\[.\]' | head -1); echo "   guest emitted = $$EMIT (expect [#])"; \
 	 { [ "$$EMIT" = "[#]" ]; } && echo "   B6 OK: M-handler mret returned to S; full enter->serve->return cycle" || { echo "   *** B6 FAILED (got '$$EMIT'; ''=handler-return mret fell through / wrong priv/pc) ***"; exit 1; }
 
+# store_imm RTL bug gate: a PVM store_imm of a >16-bit immediate (low 16 bits ZERO, e.g.
+# 0x230000) to a NON-ZERO offset must store the FULL value, not just the low 16 bits.
+# Mirrors polkatool folding `li a5,0x10000; sd a5,off(base)` into store_imm_u64. The guest
+# does store_imm_ind_u64 [r1+8] and store_imm_u32 [imm], loads each back, shifts right 16,
+# ANDs the two 0x23 results, and host-call putchars it framed as "[a0]". '[#]' iff BOTH
+# full-width stores kept their high bits; '[ ]'/no-# iff the macro dropped bits above 16.
+run-storeimm: loader_storeimm.S link.ld gen_pvm_img.py
+	@CL=$$(python3 gen_pvm_img.py '' storeimm.hex storeimm | grep CODE_LEN | grep -oE '[0-9]+'); \
+	 echo ">> store_imm >16-bit immediate to a non-zero offset (expect '#', not NUL):"; \
+	 $(CC) $(CFLAGS) -DCODE_LEN=$$CL -T link.ld -o loader_storeimm.elf loader_storeimm.S; \
+	 OUT=$$($(HARNESS) +PVM_IMG=$(abspath storeimm.hex) +tohost_addr=$(TOHOST) +time_out=200000 $(abspath loader_storeimm.elf) 2>&1); \
+	 echo "$$OUT" | grep -aE 'SUCCESS'; \
+	 EMIT=$$(echo "$$OUT" | grep -aoE '\[.\]' | head -1); echo "   guest emitted = $$EMIT (expect [#])"; \
+	 { [ "$$EMIT" = "[#]" ]; } && echo "   store_imm OK: full-width immediate stored at a non-zero offset" || { echo "   *** store_imm FAILED (got '$$EMIT'; high bits of the store value were dropped -> stored 0) ***"; exit 1; }
+
 # B7 step-1: boot a REAL OpenSBI build as a PVM/JAM guest from DRAM (M3 demand-fetch).
 # opensbi_to_dram.py splits the 125 KB emit-image (fw_payload.bin) into code+bitmask / jt /
 # ro / rw binary blobs; link_opensbi.ld pins them at the DRAM addresses the aperture
@@ -288,23 +303,36 @@ run-priv-return: loader_priv.S link.ld gen_pvm_img.py
 # mock_uart byte. If none, the commit trace (trace_rvfi_hart_00.dasm) localizes the first
 # fault: its PVM-pc, priv level, and (for a load/store) the faulting data address.
 OPENSBI_IMG ?= /home/claude/pvm/cva6-sdk/install64e_genesys2/fw_payload.bin
-run-opensbi: loader_opensbi.S link_opensbi.ld opensbi_to_dram.py
-	@G=$$(python3 opensbi_to_dram.py $(OPENSBI_IMG) opensbi); \
+# libfdt init is correct-but-slow (O(nodes x drivers), re-decodes the BE header each call);
+# raise the cycle budget so OpenSBI clears FDT-parse + CPU-enumeration and reaches the console.
+OPENSBI_TIMEOUT ?= 400000000
+# wall-clock cap (s) for the run-opensbi harness invocation; raise for big cycle budgets
+# (the banner is ~600M+ cycles ≈ tens of minutes of Verilator wall-clock).
+OPENSBI_WALLCLOCK ?= 1800
+# In-aperture DTB (memory@10000 + reserve in [0x10000,0xd0000)); staged at guest 0x90000 ==
+# the rebuilt OpenSBI's FW_PAYLOAD_FDT_OFFSET (what fdt_get_address()==next_arg1 parses).
+OPENSBI_DTS ?= cv64a6_pvm_inaperture.dts
+OPENSBI_DTB ?= cv64a6_pvm_inaperture.dtb
+run-opensbi: loader_opensbi.S link_opensbi.ld opensbi_to_dram.py $(OPENSBI_DTS)
+	@dtc -I dts -O dtb -o $(OPENSBI_DTB) $(OPENSBI_DTS) 2>/dev/null; \
+	 G=$$(python3 opensbi_to_dram.py $(OPENSBI_IMG) opensbi); \
 	 CL=$$(echo "$$G" | grep '^CODE_LEN' | grep -oE '[0-9]+'); \
 	 JZ=$$(echo "$$G" | grep '^JT_Z' | grep -oE '[0-9]+'); \
 	 echo ">> B7: real OpenSBI as a PVM guest from DRAM (CODE_LEN=$$CL JT_Z=$$JZ):"; \
-	 $(CC) $(CFLAGS) -DCODE_LEN=$$CL -DJT_Z=$$JZ -T link_opensbi.ld -o loader_opensbi.elf loader_opensbi.S; \
-	 OUT=$$(timeout 600 $(HARNESS) +tohost_addr=$(TOHOST) +time_out=6000000 $(abspath loader_opensbi.elf) 2>&1); \
+	 $(CC) $(CFLAGS) -DCODE_LEN=$$CL -DJT_Z=$$JZ -DDTB_PATH='"$(OPENSBI_DTB)"' -T link_opensbi.ld -o loader_opensbi.elf loader_opensbi.S; \
+	 OUT=$$(timeout $(OPENSBI_WALLCLOCK) $(HARNESS) +tohost_addr=$(TOHOST) +time_out=$(OPENSBI_TIMEOUT) $(abspath loader_opensbi.elf) 2>&1); \
 	 PVMPC=$$(grep -E '^core   0: 0x0000000000[0-9a-f]+ ' trace_rvfi_hart_00.dasm | grep -oE '0x0000000000[0-9a-f]+' | sort -u | tail -1); \
 	 NC=$$(grep -cE '^core   0: 0x0000000000[0-9a-f]+ ' trace_rvfi_hart_00.dasm); \
 	 echo "=== PVM guest committed $$NC instructions; max PVM-pc = $$PVMPC ==="; \
 	 echo "=== first PVM fault (non-breakpoint exception): ==="; \
 	 C1=$$(grep -n 'bc129073' trace_rvfi_hart_00.dasm | head -1 | cut -d: -f1); \
 	 awk -v s="$$C1" 'NR>s && /exception/ && !/BREAKPOINT/ {print; exit}' trace_rvfi_hart_00.dasm; \
-	 echo "=== guest UART bytes (mock_uart \$$write; '!F' = the loader trap-fault marker): ==="; \
-	 echo "$$OUT" | grep -ao '!F' | head -1
+	 echo "=== guest UART output (mock_uart \$$write -- the OpenSBI banner if it printed; '!F' = the loader trap-fault marker): ==="; \
+	 echo "$$OUT" | grep -avE 'FAILED|JTAG|Listening|CPU time|Wall clock|emulator' | grep -aiE 'OpenSBI|Copyright|Platform Name|Boot HART|Firmware Base|cva6-bare|!F' | head -20 || true; \
+	 echo "=== UART MMIO accesses (phys 0x10000000; >0 => console driver reached the UART): ==="; \
+	 grep -cE 'mem 0x0000000010000[0-9a-f]+' trace_rvfi_hart_00.dasm || true
 
 clean:
 	rm -f loader.elf loader_jump.elf loader_banner.elf loader_ecalli.elf loader_br.elf loader_loop.elf loader_djhalt.elf loader_djtab.elf loader_ibr.elf loader_ldij.elf loader_csr.elf loader_hostcall.elf loader_dramload.elf loader_drambanner.elf loader_hi.elf baseline.elf banner.hex ecalli.hex hi_banner.hex br_taken.hex br_nottaken.hex loop.hex djhalt.hex djtab.hex ibr_t.hex ibr_nt.hex ldij.hex csr.hex hostcall.hex loader_opensbi.elf opensbi.code.bin opensbi.jt.bin opensbi.ro.bin opensbi.rw.bin
 
-.PHONY: all run run-jump run-banner run-ecalli run-branch run-loop run-djump-halt run-djump-table run-ibranch run-ldij run-csr run-hostcall run-dram run-dram-banner run-user run-user-dram run-pvmvec run-mret run-priv run-priv-dyn run-priv-return run-opensbi run-all clean
+.PHONY: all run run-jump run-banner run-ecalli run-branch run-loop run-djump-halt run-djump-table run-ibranch run-ldij run-csr run-hostcall run-dram run-dram-banner run-user run-user-dram run-pvmvec run-mret run-priv run-priv-dyn run-priv-return run-storeimm run-opensbi run-all clean

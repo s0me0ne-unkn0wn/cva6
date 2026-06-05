@@ -44,6 +44,36 @@ INCLUDES = -I./ -I./src
 
 SRCS_C = src/main.c src/uart.c src/spi.c src/sd.c src/gpt.c src/dw_mmc.c src/bouncebuf.c
 SRCS_ASM = startup.S pvm_boot.S
+
+# OpenSBI-on-PVM (B9): opt-in with `make ... OPENSBI_PVM=1` (also threaded by the top Makefile
+# when building the FPGA bootrom for the OpenSBI demo). Adds the DRAM-launch routine + selects
+# the opensbi_pvm_boot() branch in main.c. CODE_LEN/JT_Z track the staged fw_payload.bin
+# (opensbi_to_dram.py header code_size / jt_entry); override on the make line if the image is
+# rebuilt, e.g. `make OPENSBI_PVM=1 CODE_LEN=85658 JT_Z=3 bootrom_64.sv`.
+ifeq ($(OPENSBI_PVM), 1)
+SRCS_ASM += opensbi_boot.S
+CFLAGS += -DOPENSBI_PVM
+ifdef CODE_LEN
+CFLAGS += -DCODE_LEN=$(CODE_LEN)
+endif
+ifdef JT_Z
+CFLAGS += -DJT_Z=$(JT_Z)
+endif
+# UART-download variant: receive the 2.1 MB OpenSBI DRAM image over the serial UART in C
+# (main.c uart_load_dram) instead of an out-of-band JTAG/gdb preload. Pair with OPENSBI_NO_WAIT=1
+# so opensbi_boot.S skips the JTAG ready-magic spin (the C download is the staging handshake).
+# Override LOAD_BYTES if the image size changes (default 2102750).
+ifeq ($(OPENSBI_UART_LOAD), 1)
+CFLAGS += -DOPENSBI_UART_LOAD
+ifdef LOAD_BYTES
+CFLAGS += -DLOAD_BYTES=$(LOAD_BYTES)
+endif
+endif
+ifeq ($(OPENSBI_NO_WAIT), 1)
+CFLAGS += -DOPENSBI_NO_WAIT
+endif
+endif
+
 OBJS_C = $(SRCS_C:.c=.o)
 OBJS_S = $(SRCS_ASM:.S=.o)
 

@@ -32,14 +32,19 @@ SECTIONS
   . = 0x80010000;
   .pvm_ro : { *(.pvm_ro) } :ph
 
-  /* staged devicetree blob: guest 0x20000 (the free ro/rw gap) -> phys 0x80020000.
-   * OpenSBI's fw_platform_init reads the DTB through the aperture from a1=0x20000. */
-  . = 0x80020000;
-  .pvm_dtb : { *(.pvm_dtb) } :ph
-
   /* relocated guest RW init: guest 0x30000 -> phys 0x80030000 */
   . = 0x80030000;
   .pvm_rw : { *(.pvm_rw) } :ph
+
+  /* staged devicetree blob: guest 0x90000 -> phys 0x80090000. This MUST equal the
+   * rebuilt OpenSBI's FW_PAYLOAD_FDT_OFFSET, because fdt_get_address()==next_arg1==
+   * that offset is what generic_early_init()->fdt_serial_init() (the console path
+   * before the banner) parses. The loader also passes a1=0x90000 so fw_platform_init's
+   * early parse hits the same blob. Inside the widened aperture [0x10000,0x100000);
+   * clear of rw/bss (<=0x80031738), the next-payload dest (0x800C0000) and code
+   * (0x80100000). Address order kept monotonic for the single contiguous PT_LOAD. */
+  . = 0x80090000;
+  .pvm_dtb : { *(.pvm_dtb) } :ph
 
   /* M3 demand-fetch code region (code + pad + bitmask): code_base = 0x80100000 */
   . = 0x80100000;

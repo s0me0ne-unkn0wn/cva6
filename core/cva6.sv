@@ -469,6 +469,7 @@ module cva6
   logic                    pvm_trap_redirect;  // committed stay-trap -> redirect pvm_fetch to the guest tvec
   logic [CVA6Cfg.VLEN-1:0] pvm_trap_pc;        // committed trap_vector_base (guest mtvec/stvec) as a PVM-pc
   logic                    pvm_csr_fence_resolved;  // B5: a flush-class CSR write committed while pvm_active
+  logic                    pvm_storeimm_resolved;   // a store_imm macro's store drained while pvm_active
   dcache_req_i_t pvm_dreq;
   logic pvm_d_req, pvm_d_tag_valid, pvm_d_kill, pvm_d_gnt, pvm_d_rvalid;
   logic [CVA6Cfg.DCACHE_INDEX_WIDTH-1:0] pvm_d_addr_index;
@@ -573,6 +574,13 @@ module cva6
   // flush (issued only by the host, between PVM activations) nor a RISC-V-mode CSR write (those
   // have pvm_active=0). Gated strictly on pvm_active; pvm_fetch further gates on csr_fence_pending.
   assign pvm_csr_fence_resolved = CVA6Cfg.PvmPresent & pvm_active & flush_csr_ctrl;
+  // store_imm serialization: pvm_fetch suspends after a store_imm 2-uop macro (storeimm_pending)
+  // and resumes when the macro's store has drained -- i.e. no store is pending and the dcache
+  // write buffer is empty (no_st_pending_commit). pvm_fetch gates this on its own storeimm_pending,
+  // so this is just "the store side is idle while PVM owns the pipe". Resuming only after the store
+  // drains guarantees the NEXT macro's phase-0 scratch write cannot overlap this store's scratch
+  // read -> the operand forwarding never crosses macros (the back-to-back store_imm data-stale bug).
+  assign pvm_storeimm_resolved = CVA6Cfg.PvmPresent & pvm_active & no_st_pending_commit;
   // M1 image load: the M-mode bootrom writes img_mem via CSR_PVM_IMG (csr_regfile
   // pulses pvm_img_we_csr with {addr,data} in pvm_img_w_csr), so JAM code can be
   // copied in from DRAM before entering PVM. (No baked ROM anymore.)
@@ -613,6 +621,7 @@ module cva6
         .trap_redirect_i(pvm_trap_redirect),
         .trap_pc_i      (pvm_trap_pc),
         .csr_fence_resolved_i(pvm_csr_fence_resolved),
+        .storeimm_resolved_i(pvm_storeimm_resolved),
         .jumptable_base_i({{(CVA6Cfg.VLEN-32){1'b0}}, pvm_cfg2_csr[31:0]}),
         .jumptable_z_i  (pvm_cfg2_csr[35:32]),
         .done_o         (pvm_done),
@@ -660,6 +669,64 @@ module cva6
     assign pvm_d_addr_tag = '0;
     assign pvm_d_tag_valid = 1'b0;
     assign pvm_d_kill = 1'b0;
+  end
+
+  // ===========================================================================
+  // ILA debug tap (PVM DRAM-demand-fetch / decode observability) -- NON-PERTURBING.
+  // The OpenSBI-on-PVM hang is FPGA-only + perturbation-sensitive (code markers move it),
+  // so we need RTL-level observability that does NOT alter the PVM instruction stream.
+  // These dedicated mark_debug wires mirror the cva6-level PVM nets so a Vivado ILA can
+  // observe, on the CVA6 core clock: the DRAM-fetch dcache handshake (req/gnt/rvalid +
+  // address_index), the decoded micro-op going to issue (fu/opcode-class/valid + illegal/
+  // trap/hostcall), the issue-ack, and pvm_active/fetch-from-dram mode. Combined with the
+  // mark_debug regs inside pvm_fetch (pc_q + suspend FSM) and pvm_front (M3 fetch FSM), the
+  // ILA can tell a fetch-STALL (no gnt/rvalid, FSM wedged) from a decode/issue spin (pc not
+  // advancing while running). gen_pvm_debug is purely additive; it only assigns local wires
+  // (no functional effect) and synthesizes away if MARK_DEBUG is stripped.
+  if (CVA6Cfg.PvmPresent) begin : gen_pvm_debug
+    (* mark_debug = "true" *) logic        dbg_pvm_active;
+    (* mark_debug = "true" *) logic        dbg_pvm_fetch_from_dram;
+    (* mark_debug = "true" *) logic [23:0] dbg_pvm_pc;          // PVM instruction-counter (low 24b; OpenSBI code < 16b)
+    (* mark_debug = "true" *) logic        dbg_pvm_valid;       // a decoded uop is presented to issue
+    (* mark_debug = "true" *) logic        dbg_pvm_issue_ack;   // issue accepted the uop (-> pvm_fetch advance)
+    (* mark_debug = "true" *) logic [3:0]  dbg_pvm_fu;          // decoded functional-unit class
+    (* mark_debug = "true" *) logic [7:0]  dbg_pvm_op;          // decoded fu_op (low 8b)
+    (* mark_debug = "true" *) logic        dbg_pvm_is_branch;
+    (* mark_debug = "true" *) logic        dbg_pvm_is_jump;
+    (* mark_debug = "true" *) logic        dbg_pvm_is_hostcall;
+    (* mark_debug = "true" *) logic        dbg_pvm_is_trap;
+    (* mark_debug = "true" *) logic        dbg_pvm_illegal;
+    (* mark_debug = "true" *) logic        dbg_pvm_unsupported;
+    (* mark_debug = "true" *) logic        dbg_pvm_done;
+    // M3 DRAM demand-fetch dcache handshake (the prime-suspect path):
+    (* mark_debug = "true" *) logic        dbg_pvm_d_req;       // pvm_front asserts a dcache request
+    (* mark_debug = "true" *) logic        dbg_pvm_d_gnt;       // dcache granted the request phase
+    (* mark_debug = "true" *) logic        dbg_pvm_d_tag_valid;
+    (* mark_debug = "true" *) logic        dbg_pvm_d_rvalid;    // dcache returned a 64b beat
+    (* mark_debug = "true" *) logic        dbg_pvm_d_kill;
+    (* mark_debug = "true" *) logic [11:0] dbg_pvm_d_addr_index;// dcache index of the in-flight fetch beat
+    always_comb begin
+      dbg_pvm_active          = pvm_active;
+      dbg_pvm_fetch_from_dram = pvm_fetch_from_dram;
+      dbg_pvm_pc              = pvm_pc[23:0];
+      dbg_pvm_valid           = pvm_valid;
+      dbg_pvm_issue_ack       = pvm_active & issue_instr_issue_id[0];
+      dbg_pvm_fu              = 4'(pvm_fu);   // fu_t is enum logic[3:0]
+      dbg_pvm_op              = 8'(pvm_op);   // fu_op is enum logic[7:0]
+      dbg_pvm_is_branch       = pvm_is_branch;
+      dbg_pvm_is_jump         = pvm_is_jump;
+      dbg_pvm_is_hostcall     = pvm_is_hostcall;
+      dbg_pvm_is_trap         = pvm_is_trap;
+      dbg_pvm_illegal         = pvm_illegal;
+      dbg_pvm_unsupported     = pvm_unsupported;
+      dbg_pvm_done            = pvm_done;
+      dbg_pvm_d_req           = pvm_d_req;
+      dbg_pvm_d_gnt           = pvm_d_gnt;
+      dbg_pvm_d_tag_valid     = pvm_d_tag_valid;
+      dbg_pvm_d_rvalid        = pvm_d_rvalid;
+      dbg_pvm_d_kill          = pvm_d_kill;
+      dbg_pvm_d_addr_index    = pvm_d_addr_index[11:0];
+    end
   end
 
   // Adapter: PVM raw micro-op -> scoreboard_entry_t

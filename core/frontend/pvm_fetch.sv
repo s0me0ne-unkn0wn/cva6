@@ -76,6 +76,13 @@ module pvm_fetch
     // write then commits ALONE and its flush is harmless (identical safety argument to the eret).
     input  logic            csr_fence_i,          // current instr is a flush-class CSR write
     input  logic            csr_fence_resolved_i, // the CSR write committed/flushed (1-cycle pulse)
+    // store_imm serialization: a store_imm is a 2-uop macro (phase0: scratch GPR = value; phase1:
+    // STORE [base+off] = scratch). pvm_fetch does not drain between macros, so two store_imm whose
+    // store-phases overlap make the younger store read a STALE scratch GPR and store the older
+    // store's data (RVFI-confirmed). Suspend after phase1 like csr_fence; resume when the store has
+    // drained (storeimm_resolved_i = no store pending), so the scratch read can never cross macros.
+    input  logic            store_imm_i,          // current instr is a store_imm 2-uop macro
+    input  logic            storeimm_resolved_i,  // the store_imm's store has committed/drained (level)
     // BRAM windows (combinational, addressed by pc_o):
     //   code_window_i : 16 code bytes starting at pc_o (byte 0 = opcode at pc_o)
     //   bm_window_i   : 32 bitmask bits starting at pc_o+1 (LSB = position pc_o+1)
@@ -93,14 +100,20 @@ module pvm_fetch
     output logic            terminator_o   // c[i] in basic-block terminator set T
 );
 
-  logic [VLEN-1:0] pc_q;
-  logic            running_q;
-  logic            branch_pending_q;  // suspended at a conditional branch, awaiting resolution
-  logic            djump_pending_q;   // suspended at a dynamic jump, awaiting resolution
-  logic            eret_pending_q;    // suspended at an mret/sret, awaiting the backend commit
-  logic            csr_fence_pending_q;// B5: suspended at a flush-class CSR write, awaiting the commit flush
-  logic            done_q;            // PVM run terminated cleanly (djump-halt / off-the-end)
-  logic            phase_q;           // micro-op phase for 2-uop (imm-branch) macro-expansion
+  // ILA debug (non-perturbing observability for the FPGA-only OpenSBI demand-fetch hang):
+  // mark_debug the instruction-counter + the full suspend/resume FSM state so a Vivado ILA can
+  // see WHETHER the PVM-pc is advancing and, if not, WHICH pending flag is stuck (a fetch-stall
+  // vs a never-resolved branch/djump/eret/csr-fence/store-imm). Pure attribute -- does NOT change
+  // the synthesized PVM instruction stream/layout (unlike code markers), so it does not move the bug.
+  (* mark_debug = "true" *) logic [VLEN-1:0] pc_q;
+  (* mark_debug = "true" *) logic            running_q;
+  (* mark_debug = "true" *) logic            branch_pending_q;  // suspended at a conditional branch, awaiting resolution
+  (* mark_debug = "true" *) logic            djump_pending_q;   // suspended at a dynamic jump, awaiting resolution
+  (* mark_debug = "true" *) logic            eret_pending_q;    // suspended at an mret/sret, awaiting the backend commit
+  (* mark_debug = "true" *) logic            csr_fence_pending_q;// B5: suspended at a flush-class CSR write, awaiting the commit flush
+  (* mark_debug = "true" *) logic            storeimm_pending_q; // suspended after a store_imm macro, awaiting the store to drain
+  (* mark_debug = "true" *) logic            done_q;            // PVM run terminated cleanly (djump-halt / off-the-end)
+  (* mark_debug = "true" *) logic            phase_q;           // micro-op phase for 2-uop (imm-branch) macro-expansion
 
   // ---- combinational skip encoder (LSB-first, append-1s past code_len) ------
   logic [4:0] skip_c;
@@ -133,6 +146,7 @@ module pvm_fetch
       djump_pending_q  <= 1'b0;
       eret_pending_q   <= 1'b0;
       csr_fence_pending_q <= 1'b0;
+      storeimm_pending_q  <= 1'b0;
       done_q           <= 1'b0;
       phase_q          <= 1'b0;
     end else if (start_i) begin
@@ -144,6 +158,7 @@ module pvm_fetch
       djump_pending_q  <= 1'b0;
       eret_pending_q   <= 1'b0;
       csr_fence_pending_q <= 1'b0;
+      storeimm_pending_q  <= 1'b0;
       done_q           <= 1'b0;
       phase_q          <= 1'b0;
     end else if (branch_pending_q) begin
@@ -191,6 +206,18 @@ module pvm_fetch
         csr_fence_pending_q <= 1'b0;
         phase_q             <= 1'b0;
       end
+    end else if (storeimm_pending_q) begin
+      // Suspended after a store_imm 2-uop macro (pc_q already advanced to next_pc; the macro's
+      // store executes). Wait for the store to commit/drain (storeimm_resolved_i = no store
+      // pending while pvm_active, gated in cva6.sv). Resuming only after the store drains means
+      // the NEXT 2-uop macro's phase-0 scratch write cannot overlap this store's scratch read --
+      // so the operand forwarding never crosses macros (the back-to-back store_imm data-stale
+      // bug). The store committed ALONE (issue was suspended), so this is otherwise transparent.
+      if (storeimm_resolved_i) begin
+        running_q          <= 1'b1;
+        storeimm_pending_q <= 1'b0;
+        phase_q            <= 1'b0;
+      end
     end else if (trap_redirect_i) begin
       // Guest-internal trap (ecalli@priv<M): pvm_fetch was halt-suspended at the ecalli
       // (running_q=0, post-ecalli pc held). The backend delivered the trap to the guest
@@ -206,6 +233,13 @@ module pvm_fetch
       // Macro-expansion phase 0 (imm-branch): the load-scratch uop just issued; stay
       // at this pc and present phase 1 (the branch) next cycle.
       if (two_uop_i && !phase_q) phase_q <= 1'b1;
+      // store_imm phase 1 (the STORE) just issued: advance pc to next_pc, then SUSPEND until the
+      // store drains (storeimm_pending). This serializes back-to-back store_imm so the next
+      // macro's phase-0 scratch write cannot overlap this store's scratch read -> no cross-macro
+      // forwarding (the data-stale bug). Placed before the generic pc-advance; mutually exclusive
+      // with branch/djump/eret/csr-fence (a store is fu=STORE) and only fires on phase 1 (phase 0
+      // took the arm above), so the store is in flight when we suspend. next_pc like halt_i/B5.
+      else if (store_imm_i && phase_q) begin pc_q <= next_pc_c; running_q <= 1'b0; storeimm_pending_q <= 1'b1; phase_q <= 1'b0; end
       // Unconditional jump: redirect to the decode-time target (overrides the
       // terminator-halt, since `jump` is itself a basic-block terminator).
       else if (redirect_valid_i) pc_q <= redirect_pc_i;

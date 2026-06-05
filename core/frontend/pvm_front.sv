@@ -75,6 +75,8 @@ module pvm_front
     input  logic [VLEN-1:0] trap_pc_i,       // committed guest mtvec/stvec as a PVM instruction-counter
     // CSR fence (B5): a flush-class CSR write (mstatus/sstatus/satp/mstatush) commit-flushed
     input  logic            csr_fence_resolved_i, // the flush-class CSR write committed (1-cycle pulse)
+    // store_imm serialization: the store_imm macro's store has committed/drained (no store pending)
+    input  logic            storeimm_resolved_i,
     // decoded micro-op (raw; scoreboard_entry_t assembled by cva6.sv)
     output logic            valid_o,
     output logic [VLEN-1:0] pc_o,
@@ -151,6 +153,7 @@ module pvm_front
   logic            f_valid, f_term, f_done, f_is_djump, f_djump_pending, f_phase, f_two_uop;
   logic            f_is_eret;       // decoder: current instr is mret/sret
   logic            f_is_csr_fence;  // decoder: current instr is a flush-class CSR write (B5)
+  logic            f_is_store_imm;  // decoder: current instr is a store_imm 2-uop macro (serialize)
   logic [VLEN-1:0] f_pc, f_next_pc;
   logic [7:0]      f_opcode;
   logic [127:0]    f_window;
@@ -166,9 +169,12 @@ module pvm_front
   localparam logic [31:0] DJUMP_HALT = 32'hFFFF0000;
 
   logic [127:0]    word0_q, word1_q, bm0_q, bm1_q, jt0_q, jt1_q;  // read holding regs
-  logic [VLEN-1:0] rd_addr_q, loaded_addr_q;
-  logic [3:0]      fsm_step_q;
-  logic            window_valid_q;
+  // ILA debug (M3 DRAM-demand-fetch observability): mark_debug the refill/loaded addresses, the
+  // BRAM read-FSM step, and the window-valid so the ILA can see whether a refill ever COMPLETES
+  // (loaded_addr_q reaching f_code_addr, window_valid_q rising) or whether it is wedged mid-FSM.
+  (* mark_debug = "true" *) logic [VLEN-1:0] rd_addr_q, loaded_addr_q;
+  (* mark_debug = "true" *) logic [3:0]      fsm_step_q;
+  (* mark_debug = "true" *) logic            window_valid_q;
   logic [127:0]    window_code_q;
   logic [31:0]     window_bm_q;
   logic [VLEN-1:0] djump_a_q, djump_target_q;
@@ -232,10 +238,14 @@ module pvm_front
   // data_rvalid (variable latency on a miss). kill_req on the PVM mode transition
   // (start_pulse) + an expect flag drop any stale beat (the critic's mandatory R2).
   localparam logic [2:0] D_IDLE=3'd0, D_REQ=3'd1, D_TAG=3'd2, D_WAIT=3'd3, D_ASM=3'd4;
-  logic [2:0]      d_state_q;
-  logic [3:0]      d_beat_q;       // beat index within the current job
-  logic            d_job_q;        // 0 = code+bitmask window, 1 = jump-table
-  logic            d_expect_q;     // a beat's data_rvalid is outstanding (kill-gate)
+  // ILA debug: the M3 DRAM-demand-fetch FSM is the prime suspect for the FPGA-only hang. mark_debug
+  // the state/beat/job/expect so the ILA shows EXACTLY where a fetch wedges: stuck in D_REQ (no
+  // d_gnt), in D_WAIT (no d_rvalid -> a lost/never-returned dcache beat), or a beat-counter that
+  // never reaches the last beat (7 for code+bitmask, 3 for the jump-table) -> window never assembled.
+  (* mark_debug = "true" *) logic [2:0]      d_state_q;
+  (* mark_debug = "true" *) logic [3:0]      d_beat_q;       // beat index within the current job
+  (* mark_debug = "true" *) logic            d_job_q;        // 0 = code+bitmask window, 1 = jump-table
+  (* mark_debug = "true" *) logic            d_expect_q;     // a beat's data_rvalid is outstanding (kill-gate)
   logic [VLEN-1:0] d_base_c, d_base_b, d_base_j, d_byte_addr;
   logic [DC_PLEN-1:0] d_phys;
   always_comb begin                                      // beat byte-address by job/beat
@@ -391,6 +401,8 @@ module pvm_front
       .trap_pc_i     (trap_pc_i),
       .csr_fence_i        (f_is_csr_fence),       // flush-class CSR write: advance pc, suspend (B5)
       .csr_fence_resolved_i(csr_fence_resolved_i),// resume on the CSR write's commit flush
+      .store_imm_i        (f_is_store_imm),       // store_imm macro: advance pc, suspend until drain
+      .storeimm_resolved_i(storeimm_resolved_i),  // resume when the store has drained
       .code_window_i (code_window),
       .bm_window_i   (bm_window),
       .window_valid_i(window_valid),      // window for pc_o is loaded (BRAM read-FSM)
@@ -428,6 +440,7 @@ module pvm_front
       .is_trap_o      (is_trap_o),
       .is_eret_o      (f_is_eret),
       .is_csr_fence_o (f_is_csr_fence),
+      .is_store_imm_o (f_is_store_imm),
       .illegal_o      (illegal_o),
       .unsupported_o  (unsupported_o)
   );

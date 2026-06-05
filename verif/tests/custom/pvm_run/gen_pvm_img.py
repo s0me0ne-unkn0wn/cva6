@@ -200,6 +200,71 @@ def emit_djump_halt():
     return code, starts
 
 
+STORE_IMM_IND_U32 = 0x48  # 72: [reg_A + imm_X] = imm_Y(u32); byte1=(lX<<4)|rA, imm_X, imm_Y
+STORE_IMM_IND_U64 = 0x49  # 73: [reg_A + imm_X] = imm_Y(u64); byte1=(lX<<4)|rA, imm_X, imm_Y
+STORE_IMM_U32     = 0x20  # 32: [imm_A] = imm_B(u32); byte1 low3=lA, imm_A, imm_B
+STORE_IMM_U64     = 0x21  # 33: [imm_A] = imm_B(u64); byte1 low3=lA, imm_A, imm_B
+LOAD_IND_U64      = 0x82  # 130: rd = [rbase + off](u64); nibble lo=rd, hi=rbase
+LOAD_IND_U32      = 0x80  # 128: rd = [rbase + off](u32, zero-ext); nibble lo=rd, hi=rbase
+SHLO_R_IMM_64     = 0x98  # 152: rd = rs >> imm (logical, 64b); nibble lo=rd, hi=rs
+ADD_IMM_64        = 0x95  # 149: rd = rs + imm (64b); nibble lo=rd, hi=rs
+AND_REG           = 0xD2  # 210: rd = rs1 & rs2 (3-reg); byte1=(rs2<<4)|rs1, byte2=rd
+OR_REG            = 0xD4  # 212: rd = rs1 | rs2 (3-reg); byte1=(rs2<<4)|rs1, byte2=rd
+XOR_IMM           = 0x85  # 133: rd = rs ^ imm (reg+imm); byte1=(rs<<4)|rd, then imm
+CMOV_NZ           = 0xDB  # 219: rd = (cond!=0)?src:rd (3-reg th.mvnez); byte1=(cond<<4)|src, byte2=rd
+
+
+def emit_storeimm_test():
+    """store_imm RTL bug gate -- the BACK-TO-BACK store_imm data-stale hazard.
+
+    A single, isolated store_imm of a full-width (>16-bit, up to 64-bit sign-extended)
+    immediate to a non-zero offset stores CORRECTLY -- verified exhaustively against
+    polkatool's exact byte encodings (indirect/absolute, u32/u64, +/- sign-extended
+    offsets, bit-31-set values). The REAL defect is cross-instruction: each store_imm is
+    a 2-uop macro (phase 0: scratch GPR x14 = value; phase 1: STORE [base+off] = x14) and
+    pvm_fetch does NOT drain between a macro's phase 1 and the next instruction's phase 0.
+    Two store_imm whose store-phases overlap make the YOUNGER store read a STALE x14, so it
+    stores the OLDER store's data. RVFI-confirmed: three store_imm of 0x41/0x42/0x43 to
+    distinct slots wrote addresses 8/16/24 correctly but DATA 0x41/0x41/0x41.
+
+    This gate writes THREE consecutive store_imm_ind_u64 of distinct values to adjacent DRAM
+    slots, then reads them back and checks all three match. It prints '[#]' (0x23) iff each
+    store kept its OWN data; on the bug it prints '[X]'. (A single store passes -- the bug
+    only bites when the next instruction issues before the store's data is consumed.)
+
+    Verify: load each back, fold (loaded_i == expected_i) into a running flag; r7 = '#' if
+    all three matched else 'X'. Guest reg<->GPR: r1=x2 base, r7=x8 a0 (loader frames [a0])."""
+    BASE = 0x80100000
+    vals = [0x410000, 0x420000, 0x430000]   # distinct values, low 16 bits 0, byte2 = 0x41/42/43
+    offs = [0x10, 0x18, 0x20]
+    instrs = []
+    instrs.append([LOAD_IMM_64, 0x01] + le(BASE, 8))                  # r1 = BASE (DRAM)
+    # THREE consecutive store_imm_ind_u64 (no instruction between) -- the failing pattern.
+    for V, off in zip(vals, offs):
+        instrs.append([STORE_IMM_IND_U64, (1 << 4) | 0x1] + le(off, 1) + le(V, 4))
+    # read each back, >>16 -> byte2 (0x41/42/43 if OK), compare to expected; accumulate diffs in r9(x10).
+    instrs.append([LOAD_IMM, 0x09, 0x00])                            # r9 = 0 (diff accumulator)
+    for V, off in zip(vals, offs):
+        exp = (V >> 16) & 0xFF                                       # expected byte2
+        instrs.append([LOAD_IND_U64, (0x1 << 4) | 0x7, off])         # r7 = [r1+off]
+        instrs.append([SHLO_R_IMM_64, (0x7 << 4) | 0x7, 16])         # r7 >>= 16  -> byte2 (+ high)
+        instrs.append([XOR_IMM, (0x7 << 4) | 0x7, exp])              # r7 ^= expected -> 0 iff match
+        instrs.append([OR_REG, (0x7 << 4) | 0x9, 0x9])               # r9 |= r7 (byte1=(rs2=r7<<4)|rs1=r9, byte2=rd=r9)
+    # r7 = (r9 == 0) ? '#' : 'X'. r9!=0 means some store was wrong. Compute via set_lt_u + select:
+    #   r10 = (0 < r9) = (r9 != 0)  [SET_LT_U_IMM rd=r10, rs=r9, imm=0 gives (r9<0)=0 -- wrong dir];
+    # simpler: r7='#'; cmov_if_not_zero r7 <- 'X' when r9!=0 (reg-reg cmov keeps r7 if r9==0).
+    instrs.append([LOAD_IMM, 0x07, 0x23])                            # r7 = '#'
+    instrs.append([LOAD_IMM, 0x0b, ord('X')])                        # r11 = 'X' (x12)
+    instrs.append([CMOV_NZ, ((0x9 & 0xF) << 4) | 0x0b, 0x07])        # r7 = (r9!=0) ? r11 : r7  (rd=r7,rs1=r11,cond=r9)
+    instrs.append([ECALLI, 0x00])                                    # putchar(r7) -> '[' r7 ']'
+    instrs.append([TRAP])
+
+    code, starts = [], []
+    for ins in instrs:
+        starts.append(len(code)); code.extend(ins)
+    return code, starts
+
+
 def emit_djump_table():
     """jump_ind through the jump table: load_imm r2,2 ; jump_ind r2 -> j[0] = TARGET.
     djump(2): index = 2/2-1 = 0 -> target = jumptable[0]. Prints 'J' then traps.
@@ -584,6 +649,8 @@ def main():
         code, starts = emit_priv_return_test()
     elif mode == "hostcall":
         code, starts = emit_hostcall_test()
+    elif mode == "storeimm":
+        code, starts = emit_storeimm_test()
     else:
         code, starts = emit_banner(text)
     img, code_len, bm_off, jt_off = build_image(code, starts, jumptable, z)

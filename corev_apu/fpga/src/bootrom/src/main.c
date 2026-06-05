@@ -41,6 +41,34 @@ int update(uint8_t *dest)
     return 0;
 }
 
+#ifdef OPENSBI_UART_LOAD
+// UART-download bootloader for OpenSBI-on-PVM (no JTAG path available on this board).
+// The 2.1 MB OpenSBI DRAM image (flat objcopy of loader_opensbi.elf: code/jt/ro/rw/dtb at
+// their offsets, mapped 1:1 from 0x80000000) is streamed in over the ns16550 UART and written
+// byte-for-byte into DRAM at physical 0x80000000. opensbi_pvm_boot() then programs the PVM CSRs.
+//
+// No flow control is needed: at 50 MHz the CPU's uart_getc() poll loop is far faster than the
+// 115200-baud byte arrival rate, so the RX FIFO never overruns. A '.' is emitted every 0x40000
+// bytes so download progress is visible on the host terminal.
+#ifndef LOAD_BYTES
+#define LOAD_BYTES 2102750
+#endif
+void uart_load_dram(void)
+{
+    volatile unsigned char *p = (volatile unsigned char *)0x80000000UL;
+    unsigned long i;
+
+    print_uart("\r\nUART-load: send 2102750 bytes now\r\n");
+    for (i = 0; i < LOAD_BYTES; i++) {
+        p[i] = uart_getc();
+        if ((i & 0x3FFFF) == 0) {
+            print_uart(".");
+        }
+    }
+    print_uart("\r\nload done, launching OpenSBI\r\n");
+}
+#endif
+
 int main()
 {
     int i, ret = 0;
@@ -55,9 +83,27 @@ int main()
 
     // PolkaVM bring-up (Stage 5): enter PVM mode and run the banner baked into
     // pvm_front.img_mem. pvm_boot() services ecalli host-calls and never returns.
+    //
+    // OpenSBI-on-PVM (B9): build with -DOPENSBI_PVM to instead launch a REAL OpenSBI build
+    // as a PVM/JAM guest demand-fetched from DRAM (see opensbi_boot.S + OPENSBI_FPGA_BRINGUP.md).
+    // The 2 MB OpenSBI DRAM image is staged out-of-band (JTAG/gdb or SD) BEFORE this call; by
+    // default opensbi_pvm_boot() spins on a "ready" magic in DRAM until the host signals it.
+    // The plain banner path (pvm_boot) is kept intact as the default fallback.
+#ifdef OPENSBI_PVM
+    print_uart("Entering PolkaVM (OpenSBI)...\r\n");
+#ifdef OPENSBI_UART_LOAD
+    // Receive the OpenSBI DRAM image over the UART (no JTAG preload here), then launch.
+    // opensbi_pvm_boot() must NOT spin on the JTAG ready-magic in this mode -> build with
+    // OPENSBI_NO_WAIT too (the C download replaces the out-of-band staging handshake).
+    uart_load_dram();
+#endif
+    extern void opensbi_pvm_boot(void);
+    opensbi_pvm_boot();
+#else
     print_uart("Entering PolkaVM...\r\n");
     extern void pvm_boot(void);
     pvm_boot();
+#endif
 
     // See if we should enter update mode
     print_uart("Hit any key to enter update mode ");

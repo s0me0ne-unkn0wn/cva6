@@ -91,6 +91,11 @@ launch_runs synth_1
 wait_on_run synth_1
 open_run synth_1
 
+# PVM ILA debug-core insertion (opt-in via env PVM_ILA=1; no-op otherwise).
+# Must run on the open synth_1 netlist, before impl, so impl builds the ILA in
+# and write_bitstream emits the matching .ltx probe map. See debug_insert.tcl.
+source scripts/debug_insert.tcl
+
 exec mkdir -p reports/
 exec rm -rf reports/*
 

@@ -59,6 +59,16 @@ int read_serial(uint8_t *res)
     return 1;
 }
 
+// Blocking single-byte receive: spin on the ns16550 LSR Data-Ready bit (bit 0),
+// then read the byte from RBR. Mirrors write_serial()'s THRE-poll register style
+// (same 0x10000000 base, reg-shift=2 -> LSR @ +0x14, RBR @ +0x0). Used by the
+// UART-download bootloader (OPENSBI_UART_LOAD) to stream the OpenSBI DRAM image.
+uint8_t uart_getc(void)
+{
+    while (!(read_reg_u8(UART_LINE_STATUS) & 0x1)) {};
+    return read_reg_u8(UART_RBR);
+}
+
 void init_uart(uint32_t freq, uint32_t baud)
 {
     uint32_t divisor = freq / (baud << 4);

@@ -1168,7 +1168,11 @@ module csr_regfile
         riscv::CSR_MTVEC: begin
           logic DirVecOnly;
           DirVecOnly = CVA6Cfg.DirectVecOnly ? 1'b0 : csr_wdata[0];
-          mtvec_d = {csr_wdata[CVA6Cfg.XLEN-1:2], 1'b0, DirVecOnly};
+          // PVM code-addresses are 2-byte-aligned (bit 1 is significant), so for a PVM
+          // guest preserve mtvec bit 1 -- a guest trap handler can sit at an odd dyn-index
+          // (e.g. OpenSBI's _trap_handler @ PVM code-addr 0x16); the RISC-V WARL (bit1=0)
+          // would mangle 0x16 -> 0x14 and send every guest trap into the wrong block.
+          mtvec_d = {csr_wdata[CVA6Cfg.XLEN-1:2], (CVA6Cfg.PvmPresent ? csr_wdata[1] : 1'b0), DirVecOnly};
           // we are in vector mode, this implementation requires the additional
           // alignment constraint of 64 * 4 bytes
           if (DirVecOnly) mtvec_d = {csr_wdata[CVA6Cfg.XLEN-1:8], 7'b0, DirVecOnly};
@@ -1861,7 +1865,8 @@ module csr_regfile
 
   // output assignments dependent on privilege mode
   always_comb begin : priv_output
-    trap_vector_base_o = {mtvec_q[CVA6Cfg.VLEN-1:2], 2'b0};
+    // PVM: preserve mtvec bit 1 (2B-aligned PVM code-address) on the trap-vector redirect.
+    trap_vector_base_o = {mtvec_q[CVA6Cfg.VLEN-1:2], (CVA6Cfg.PvmPresent ? mtvec_q[1] : 1'b0), 1'b0};
     // output user mode stvec
     if (CVA6Cfg.RVS && trap_to_priv_lvl == riscv::PRIV_LVL_S) begin
       trap_vector_base_o = {stvec_q[CVA6Cfg.VLEN-1:2], 2'b0};

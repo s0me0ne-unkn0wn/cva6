@@ -52,6 +52,7 @@ module pvm_decoder
     output logic            is_trap_o,       // trap opcode (panic)
     output logic            is_eret_o,       // mret/sret: return-from-handler (PVM-pc redirect to mepc/sepc)
     output logic            is_csr_fence_o,  // B5: a CSR write to a flush-class CSR (mstatus/sstatus/satp/mstatush)
+    output logic            is_store_imm_o,  // a store_imm 2-uop macro (serialize: drain the store before the next instr)
     output logic            illegal_o,       // opcode not in valid set U
     output logic            unsupported_o    // valid but not handled in this increment
 );
@@ -142,6 +143,7 @@ module pvm_decoder
     is_trap_o       = 1'b0;
     is_eret_o       = 1'b0;
     is_csr_fence_o  = 1'b0;
+    is_store_imm_o  = 1'b0;
     illegal_o       = 1'b0;
     unsupported_o   = 1'b0;
     two_uop_o       = 1'b0;
@@ -349,6 +351,7 @@ module pvm_decoder
       PVM_OP_STORE_IMM_IND_U8, PVM_OP_STORE_IMM_IND_U16,
       PVM_OP_STORE_IMM_IND_U32, PVM_OP_STORE_IMM_IND_U64: begin
         two_uop_o = 1'b1;
+        is_store_imm_o = 1'b1;  // serialize: drain this store before the next instr (scratch-reuse hazard)
         if (!phase_i) begin
           fu_o = ALU; op_o = ADD; rd_o = PVM_SCRATCH; rs1_o = 5'd0;
           imm_o = imm_y; use_imm_o = 1'b1;
@@ -369,6 +372,7 @@ module pvm_decoder
       PVM_OP_STORE_IMM_U8, PVM_OP_STORE_IMM_U16,
       PVM_OP_STORE_IMM_U32, PVM_OP_STORE_IMM_U64: begin
         two_uop_o = 1'b1;
+        is_store_imm_o = 1'b1;  // serialize: drain this store before the next instr (scratch-reuse hazard)
         if (!phase_i) begin
           fu_o = ALU; op_o = ADD; rd_o = PVM_SCRATCH; rs1_o = 5'd0;
           imm_o = imm_b; use_imm_o = 1'b1;
@@ -445,6 +449,10 @@ module pvm_decoder
       PVM_OP_MAX, PVM_OP_MAX_U, PVM_OP_MIN, PVM_OP_MIN_U,
       PVM_OP_CMOV_IZ, PVM_OP_CMOV_NZ: begin
         rd_o = g_d3; rs1_o = g_lo; rs2_o = g_hi; fu_o = ALU;
+        // reg-reg cmov (218/219): d = (c {==,!=} 0) ? s : d. th.mveqz/mvnez supply the
+        // keep-d fallback from operand_c, read at result[4:0]=imm_o[4:0]. Point it at the
+        // DEST reg (g_d3) so an untaken cmov preserves d (default imm_o=0 wrongly reads x0=0).
+        if (opcode_i inside {PVM_OP_CMOV_IZ, PVM_OP_CMOV_NZ}) imm_o = {59'd0, g_d3};
         unique case (opcode_i)
           PVM_OP_ADD_32:        op_o = ADDW;
           PVM_OP_SUB_32:        op_o = SUBW;
