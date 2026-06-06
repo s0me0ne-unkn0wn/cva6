@@ -521,18 +521,24 @@ module pvm_decoder
           PVM_OP_CSR_RS, PVM_OP_CSR_RSI: op_o = (pvm_reg_hi(b1) == 4'd0) ? CSR_READ : CSR_SET;
           default:                       op_o = (pvm_reg_hi(b1) == 4'd0) ? CSR_READ : CSR_CLEAR; // RC/RCI
         endcase
-        // B5: a write to a flush-class CSR (mstatus/sstatus/satp/mstatush) raises flush_o in
+        // B5: a WRITE to a flush-class CSR (mstatus/sstatus/satp/mstatush) raises flush_o in
         // csr_regfile (side-effects on translation/MPP etc.). In PVM mode that flush would
         // discard the YOUNGER in-flight uop (e.g. a following mret) -> the eret never commits
         // and pvm_fetch hangs. Flag it so pvm_fetch fences: it advances pc, suspends, and
         // resumes on the commit flush (the CSR write commits ALONE, like the eret). The CSR
         // address is the decoded immediate imm_ri; only its low 12 bits select the CSR.
-        // (CSR_SET/CLEAR with rs1=x0 don't write/flush; conservatively fencing them too is
-        // harmless -- they are rare and the fence just costs one extra commit round-trip.)
-        unique case (imm_ri[11:0])
-          12'h300, 12'h100, 12'h180, 12'h310: is_csr_fence_o = 1'b1;  // mstatus/sstatus/satp/mstatush
-          default: ;
-        endcase
+        // CRITICAL -- fence WRITES ONLY: a pure CSR_READ (csrr, or csrrs/csrrc with rs1=x0)
+        // does NOT write the CSR and raises NO flush, so csr_fence_resolved_i never pulses and
+        // pvm_fetch would stay suspended FOREVER. (Fencing reads hung OpenSBI's
+        // sbi_hart_switch_mode `csr_read(mstatus)` and every trap handler that reads mstatus ->
+        // it blocked the S-mode handoff and the SBI console.) op_o (decoded just above) tells
+        // write vs read.
+        if (op_o != CSR_READ) begin
+          unique case (imm_ri[11:0])
+            12'h300, 12'h100, 12'h180, 12'h310: is_csr_fence_o = 1'b1;  // mstatus/sstatus/satp/mstatush
+            default: ;
+          endcase
+        end
       end
       PVM_OP_SFENCE_VMA: begin fu_o = CSR; op_o = SFENCE_VMA; rs1_o = g_hi; rs2_o = g_lo; end
 
