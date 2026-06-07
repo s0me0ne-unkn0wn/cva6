@@ -70,6 +70,7 @@ module pvm_front
     // return-from-handler resolution (mret/sret committed in the backend -> PVM-pc redirect)
     input  logic            eret_resolved_i, // backend committed an mret/sret (1-cycle pulse)
     input  logic [VLEN-1:0] eret_pc_i,       // committed mepc/sepc as a PVM instruction-counter
+    input  logic            eret_via_jt_i,   // Stage 1: committed eret's mepc is a JT-encoded code addr
     // guest-internal trap (ecalli@priv<M committed): stay in PVM, redirect to the guest tvec
     input  logic            trap_redirect_i, // backend committed a stay-in-PVM trap (1-cycle pulse)
     input  logic [VLEN-1:0] trap_pc_i,       // committed guest mtvec/stvec as a PVM instruction-counter
@@ -280,8 +281,17 @@ module pvm_front
         djump_a_q    <= br_target_i;
         djump_halt_q <= (br_target_i[31:0] == DJUMP_HALT);
         jt_req_q     <= 1'b1;
+      end else if (eret_via_jt_i && !jt_req_q && !jt_valid_q) begin
+        // Stage 1: a committed eret whose mepc is a JT-encoded code address (the M->S handoff
+        // target). Map it through the SAME jump-table read as a djump (JE = base+((a>>1)-1)*z),
+        // never a halt. pvm_fetch enters djump_pending this same cycle, so from the NEXT cycle
+        // f_djump_pending=1 keeps the JT FSM alive; the eret_via_jt_i guard below covers THIS
+        // cycle (djump_pending not yet visible), so the reset never clears the jt_req we just set.
+        djump_a_q    <= eret_pc_i;
+        djump_halt_q <= 1'b0;
+        jt_req_q     <= 1'b1;
       end
-      if (!f_djump_pending) begin jt_valid_q <= 1'b0; jt_req_q <= 1'b0; end
+      if (!f_djump_pending && !eret_via_jt_i) begin jt_valid_q <= 1'b0; jt_req_q <= 1'b0; end
 
       if (!fetch_from_dram_i) begin                      // ===== legacy BRAM fetch =====
       case (fsm_step_q)
@@ -397,6 +407,7 @@ module pvm_front
       .eret_i        (f_is_eret),         // mret/sret: suspend, then redirect to mepc/sepc on commit
       .eret_resolved_i(eret_resolved_i),
       .eret_pc_i     (eret_pc_i),
+      .eret_via_jt_i (eret_via_jt_i),
       .trap_redirect_i(trap_redirect_i),  // guest-internal trap: redirect to guest tvec, stay in PVM
       .trap_pc_i     (trap_pc_i),
       .csr_fence_i        (f_is_csr_fence),       // flush-class CSR write: advance pc, suspend (B5)

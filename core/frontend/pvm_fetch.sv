@@ -64,6 +64,8 @@ module pvm_fetch
     input  logic            eret_i,           // current instr is mret/sret
     input  logic            eret_resolved_i,  // backend committed the eret (1-cycle pulse)
     input  logic [VLEN-1:0] eret_pc_i,        // committed mepc/sepc as a PVM instruction-counter
+    input  logic            eret_via_jt_i,    // Stage 1: this committed eret's mepc is a JT-encoded code
+                                              // address (M->S handoff), NOT a PVM-pc -> map it via the JT
     // guest-internal trap (ecalli@priv<M): the backend delivered a trap to the guest's
     // mtvec/stvec while STAYING in PVM. pvm_fetch is halt-suspended at the ecalli; on this
     // commit pulse it redirects to the guest trap vector (no host involvement).
@@ -190,10 +192,18 @@ module pvm_fetch
       // by the backend at the same commit). We stall until commit -- not redirect at
       // issue -- so the post-handler code never runs at the pre-mret privilege.
       if (eret_resolved_i) begin
-        pc_q           <= eret_pc_i;
-        running_q      <= 1'b1;
         eret_pending_q <= 1'b0;
         phase_q        <= 1'b0;
+        if (eret_via_jt_i) begin
+          // Stage 1: mepc holds a JT-encoded code address (the M->S handoff target), not a
+          // PVM-pc. Route it through the jump table like a djump: enter djump_pending and wait
+          // for the JT read (pvm_front captures djump_a = eret_pc_i on eret_via_jt_i), then the
+          // djump_pending arm sets pc_q <= djump_target_i. Stay suspended (running_q=0) meanwhile.
+          djump_pending_q <= 1'b1;
+        end else begin
+          pc_q           <= eret_pc_i;   // normal eret: mepc is already a PVM-pc (trap round-trip)
+          running_q      <= 1'b1;
+        end
       end
     end else if (csr_fence_pending_q) begin
       // B5: suspended at a flush-class CSR write (pc_q already advanced to next_pc when we

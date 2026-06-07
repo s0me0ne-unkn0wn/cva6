@@ -453,6 +453,7 @@ module cva6
   logic [CVA6Cfg.VLEN-1:0] pvm_br_target;
   logic                    pvm_eret_resolved;  // committed mret/sret while pvm_active -> redirect pvm_fetch
   logic [CVA6Cfg.VLEN-1:0] pvm_eret_pc;        // committed mepc/sepc as a PVM-pc (low 32 bits)
+  logic                    pvm_eret_via_jt;    // Stage 1: committed eret's mepc is a JT-encoded code addr (M->S handoff)
   fu_t                     pvm_fu;
   fu_op                    pvm_op;
   logic [4:0]              pvm_rd, pvm_rs1, pvm_rs2;
@@ -531,6 +532,10 @@ module cva6
   // zero-extend like pvm_entry_pc: a high bit in mepc would desync the window addressing.
   assign pvm_eret_resolved = CVA6Cfg.PvmPresent & pvm_active & eret;
   assign pvm_eret_pc       = {{(CVA6Cfg.VLEN-32){1'b0}}, epc_commit_pcgen[31:0]};
+  // Stage 1 (M->S handoff): CSR_PVM_CFG2[36]=1 means the committed eret's mepc holds a JT-encoded
+  // code address (a PolkaVM jump target (idx+1)*2), NOT a PVM-pc -> frontend maps it via the jump
+  // table (like a djump) instead of using mepc[31:0] directly. Default 0 -> eret unchanged.
+  assign pvm_eret_via_jt   = pvm_eret_resolved & pvm_cfg2_csr[36];
   // For a dynamic jump (JALR), the branch_unit's target_address = reg_A + imm_X = a.
   assign pvm_br_target   = resolved_branch.target_address;
   assign pvm_entry_pc  = {{(CVA6Cfg.VLEN-32){1'b0}}, pvm_cfg0_csr[31:0]};
@@ -618,6 +623,7 @@ module cva6
         .br_target_i    (pvm_br_target),
         .eret_resolved_i(pvm_eret_resolved),
         .eret_pc_i      (pvm_eret_pc),
+        .eret_via_jt_i  (pvm_eret_via_jt),
         .trap_redirect_i(pvm_trap_redirect),
         .trap_pc_i      (pvm_trap_pc),
         .csr_fence_resolved_i(pvm_csr_fence_resolved),
