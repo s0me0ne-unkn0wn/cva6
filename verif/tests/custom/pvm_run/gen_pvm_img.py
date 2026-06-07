@@ -265,13 +265,17 @@ def emit_storeimm_test():
     return code, starts
 
 
-def emit_djump_table():
-    """jump_ind through the jump table: load_imm r2,2 ; jump_ind r2 -> j[0] = TARGET.
-    djump(2): index = 2/2-1 = 0 -> target = jumptable[0]. Prints 'J' then traps.
-    Returns (code, starts, jumptable_bytes, z). The image builder appends the table
-    after the bitmask; CFG2 = jumptable_base | (z<<32)."""
+def emit_djump_table(idx=0, z=1):
+    """jump_ind through the jump table: load_imm r2,(idx+1)*2 ; jump_ind r2 -> j[idx] = TARGET.
+    djump((idx+1)*2): index = (idx+1) - 1 = idx -> target = jumptable[idx]. Prints 'J' then traps.
+    Returns (code, starts, jumptable_bytes, z). The image builder appends the table after the
+    bitmask; CFG2 = jumptable_base | (z<<32). idx>0 places the live entry FAR from code -> a
+    COLD-miss JT read on the DRAM demand-fetch path; z>1 = wider JT entries (real OpenSBI uses z=3).
+    The A/B control for the eret-via-jt handoff (same JE/JT-read, triggered by a djump not an eret)."""
+    target = (idx + 1) * 2
+    assert 0 <= target <= 127, f"target {target} needs a multi-byte load_imm (use idx<=62)"
     code = (
-        [LOAD_IMM, 0x02, 2]            # load_imm r2, 2 (djump addr -> index 0) @0 (3B)
+        [LOAD_IMM, 0x02, target]       # load_imm r2, (idx+1)*2 (djump addr -> index idx) @0 (3B)
         + [JUMP_IND, 0x02]             # jump_ind r2                            @3 (2B)
         + [TRAP]                       # (error catch: djump must skip this)    @5 (1B)
         + [LOAD_IMM, 0x07, ord('J')]   # TARGET: load_imm r7, 'J'               @6 (3B)
@@ -279,8 +283,7 @@ def emit_djump_table():
         + [TRAP]                       # trap                                   @11(1B)
     )
     starts = [0, 3, 5, 6, 9, 11]
-    z = 1
-    jumptable = [6]                    # j[0] = TARGET pc (6)
+    jumptable = [0] * idx + [6]        # j[idx] = TARGET pc (6)
     return code, starts, jumptable, z
 
 
@@ -424,6 +427,255 @@ def emit_mret_test():
     starts = [0, 3, 7, 8, 11, 13, 14, 17, 19]
     assert L == 14 and len(code) == 20
     return code, starts
+
+
+def emit_handoff_test(idx=0, z=1):
+    """Stage 1 M->S handoff via JT-mapped eret. The guest sets mepc = a JT-ENCODED code
+    address ((idx+1)*2, a PolkaVM jump target), NOT a PVM-pc, and executes mret while
+    CSR_PVM_CFG2[36]=1 (set by the HOST loader). The HW must map mepc through the jump table
+    (JE = base + (((idx+1)*2 >> 1) - 1)*z = base + idx*z -> jumptable[idx]) and redirect there;
+    jumptable[idx] = the success block's PVM-pc (L=14). Falls through / lands wrong (DECOY 'X' or
+    garbage) if the JT-map did NOT happen (e.g. the eret used mepc[31:0] directly -> a mid-instr pc).
+      load_imm r1,(idx+1)*2 ; csr_rw mepc,r1 ; mret    -> JT[idx] -> success
+      @8  decoy: load_imm r7,'X' ; ecalli ; trap   (FAIL)
+      @14 L:     load_imm r7,'#' ; ecalli ; trap   (SUCCESS) -- jumptable[idx] = 14
+    idx>0 places the live JT entry FAR from the code+bitmask lines, so the DRAM demand-fetch JT
+    read is a COLD cache MISS (the D_WAIT path) -- the FPGA/OpenSBI handoff condition that the
+    idx=0 hot-line read does not exercise. Prints '#' iff the eret JT-mapped mepc."""
+    def b1(rd, rs1):
+        return ((rs1 & 0xF) << 4) | (rd & 0xF)
+    target = (idx + 1) * 2                        # JT-encoded address for index `idx`
+    assert 0 <= target <= 127, f"target {target} needs a multi-byte load_imm (use idx<=62)"
+    mepc = le(MEPC, 2)
+    L = 14
+    code = (
+        [LOAD_IMM, 0x01, target]                  # r1 = (idx+1)*2 (JT-encoded target)  @0  (3B)
+        + [CSR_RW, b1(2, 1)] + mepc               # mepc = r1                           @3  (4B)
+        + [MRET]                                  # mret -> JT-map mepc -> jumptable[idx]@7  (1B)
+        + [LOAD_IMM, 0x07, ord('X')]              # DECOY  r7 = 'X'                     @8  (3B)
+        + [ECALLI, 0x00]                          # putchar('X')  (FAIL)                @11 (2B)
+        + [TRAP]                                  #                                     @13 (1B)
+        + [LOAD_IMM, 0x07, ord('#')]              # SUCCESS r7 = '#'  (== L)            @14 (3B)
+        + [ECALLI, 0x00]                          # putchar('#')                        @17 (2B)
+        + [TRAP]                                  #                                     @19 (1B)
+    )
+    starts = [0, 3, 7, 8, 11, 13, 14, 17, 19]
+    jumptable = [0] * idx + [L]                   # jumptable[idx] = success PVM-pc (14)
+    assert L == 14 and len(code) == 20
+    return code, starts, jumptable, z
+
+
+def emit_handoff_smode(idx=0):
+    """OpenSBI-handoff reproduction: a JT-mapped eret that ALSO drops M->S (the real handoff,
+    vs emit_handoff_test which mret's M->M). The guest sets mtvec=Lh, mepc=a JT-ENCODED target
+    ((idx+1)*2), and mret with CSR_PVM_CFG2[36]=1 + MPP=S (host-set): the HW maps mepc through the
+    jump table -> jumptable[idx]=Ls (the S-entry PVM-pc) AND drops priv to S. At Ls (S-mode) a
+    guest-internal ecalli@S stays in PVM and traps to the guest mtvec=Lh (M handler) -> host '#'.
+    This is emit_priv_test x eret-via-jt: it isolates the [JT-mapped eret] x [M->S priv drop]
+    combination -- the exact FPGA/OpenSBI handoff. Prints '#' iff the JT-mapped M->S mret reached
+    Ls at S-mode and the round-trip closed; 'S' iff JT-mapped to Ls but priv stayed M; nothing iff
+    the JT-map reached the WRONG target (garbage -> fault). Lh=16 (4-aligned, mtvec), Ls=22 (2-aligned)."""
+    def b1(rd, rs1):
+        return ((rs1 & 0xF) << 4) | (rd & 0xF)
+    mtvec  = le(MTVEC, 2)
+    mepc   = le(MEPC, 2)
+    target = (idx + 1) * 2                        # JT-encoded address for index `idx`
+    assert 0 <= target <= 127, f"target {target} needs a multi-byte load_imm (use idx<=62)"
+    Lh = 16                                       # M-mode guest trap handler PVM-pc (4-aligned)
+    Ls = 22                                       # S-mode entry PVM-pc (2-aligned)
+    code = (
+        [LOAD_IMM, 0x01, Lh]                      # r1 = Lh                      @0  (3B)
+        + [CSR_RW, b1(2, 1)] + mtvec              # mtvec = Lh (guest M tvec)    @3  (4B)
+        + [LOAD_IMM, 0x01, target]                # r1 = (idx+1)*2 (JT-encoded)  @7  (3B)
+        + [CSR_RW, b1(2, 1)] + mepc               # mepc = JT-encoded target     @10 (4B)
+        + [MRET]                                  # mret JT-map -> JT[idx]=Ls, priv->S @14 (1B)
+        + [TRAP]                                  # DECOY (redirect fail -> exit)@15 (1B)
+        + [LOAD_IMM, 0x07, ord('#')]              # Lh: r7 = '#' (4-aligned=16)  @16 (3B)
+        + [ECALLI, 0x00]                          # ecalli@M -> host putchar '#' @19 (2B)
+        + [TRAP]                                  # trap -> exit SUCCESS         @21 (1B)
+        + [LOAD_IMM, 0x07, ord('S')]              # Ls: r7 = 'S' (priv-fail char)@22 (3B)
+        + [ECALLI, 0x00]                          # ecalli@S -> guest-trap to Lh @25 (2B)
+        + [TRAP]                                  # safety exit                  @27 (1B)
+    )
+    starts = [0, 3, 7, 10, 14, 15, 16, 19, 21, 22, 25, 27]
+    z = 1
+    jumptable = [0] * idx + [Ls]                  # jumptable[idx] = S-entry PVM-pc (22)
+    assert Lh == 16 and Ls == 22 and len(code) == 28
+    return code, starts, jumptable, z
+
+
+def emit_handoff_smode_dyn(idx=0):
+    """The MOST faithful OpenSBI-handoff repro: the GUEST sets mstatus.MPP=S ITSELF (a flush-class
+    CSR write, B5-fenced) and THEN does a JT-mapped M->S mret -- exactly sbi_hart_switch_mode (which
+    csr_write's MSTATUS then mret's). This is emit_priv_dyn_test x eret-via-jt: it adds the ONE
+    factor the other handoff repros omit -- a guest flush-class CSR write immediately upstream of the
+    JT-mapped mret (the host pre-set MPP in emit_handoff_smode). Layout = emit_priv_dyn_test, but
+    mepc is the JT-ENCODED target ((idx+1)*2) and jumptable[idx]=Ls. Prints '#' iff B5 fences the
+    flush AND the JT-mapped M->S round-trip closes. Lh=24 (4-aligned), Ls=30 (2-aligned)."""
+    def b1(rd, rs1):
+        return ((rs1 & 0xF) << 4) | (rd & 0xF)
+    mstatus = le(MSTATUS, 2)
+    mtvec   = le(MTVEC, 2)
+    mepc    = le(MEPC, 2)
+    target  = (idx + 1) * 2
+    assert 0 <= target <= 127, f"target {target} needs a multi-byte load_imm (use idx<=62)"
+    Lh = 24                                       # M-mode guest trap handler PVM-pc (4-aligned)
+    Ls = 30                                       # S-mode entry PVM-pc (2-aligned)
+    code = (
+        [LOAD_IMM, 0x02, 0x00, 0x08]              # r2 = 0x800 (MPP=S bit, 2-byte imm) @0  (4B)
+        + [CSR_RS, b1(1, 2)] + mstatus            # mstatus |= r2 -> MPP=S (FENCED)     @4  (4B)
+        + [LOAD_IMM, 0x01, Lh]                     # r1 = Lh                             @8  (3B)
+        + [CSR_RW, b1(2, 1)] + mtvec              # mtvec = Lh (guest M tvec)           @11 (4B)
+        + [LOAD_IMM, 0x01, target]                # r1 = (idx+1)*2 (JT-encoded)         @15 (3B)
+        + [CSR_RW, b1(2, 1)] + mepc               # mepc = JT-encoded target            @18 (4B)
+        + [MRET]                                   # mret JT-map -> JT[idx]=Ls, priv->S  @22 (1B)
+        + [TRAP]                                   # DECOY (redirect fail -> exit)       @23 (1B)
+        + [LOAD_IMM, 0x07, ord('#')]              # Lh: r7 = '#' (4-aligned=24)         @24 (3B)
+        + [ECALLI, 0x00]                          # ecalli@M -> host putchar '#'        @27 (2B)
+        + [TRAP]                                   # trap -> exit SUCCESS                @29 (1B)
+        + [LOAD_IMM, 0x07, ord('S')]              # Ls: r7 = 'S' (priv-fail char)       @30 (3B)
+        + [ECALLI, 0x00]                          # ecalli@S -> guest-trap to Lh        @33 (2B)
+        + [TRAP]                                   # safety exit                         @35 (1B)
+    )
+    starts = [0, 4, 8, 11, 15, 18, 22, 23, 24, 27, 29, 30, 33, 35]
+    z = 1
+    jumptable = [0] * idx + [Ls]                  # jumptable[idx] = S-entry PVM-pc (30)
+    assert Lh == 24 and Ls == 30 and len(code) == 36
+    return code, starts, jumptable, z
+
+
+def emit_handoff_clobber(idx=0):
+    """HYPOTHESIS TEST: does a host-call (ecalli) BETWEEN the mepc write and the mret CLOBBER mepc?
+    The HW trap-entry on an ecalli writes mepc <- (ecalli pc); if the guest's mepc=JT-target is not
+    preserved across the host-call, the following JT-mapped mret maps the WRONG value -> no '#'.
+    This mirrors OpenSBI sbi_hart_switch_mode, where pvm_putc('U') (an ecalli) sits between
+    csr_write(MEPC, 0x8a0) and the mret -- the one factor every passing handoff repro omits.
+      load_imm r1,(idx+1)*2 ; csr_rw mepc,r1 ; load_imm r7,'U' ; ecalli ; mret -> JT[idx]
+    Prints 'U' then '#' iff mepc survived the host-call; 'U' then garbage/decoy iff it was clobbered."""
+    def b1(rd, rs1):
+        return ((rs1 & 0xF) << 4) | (rd & 0xF)
+    target = (idx + 1) * 2
+    assert 0 <= target <= 127, f"target {target} needs a multi-byte load_imm (use idx<=62)"
+    mepc = le(MEPC, 2)
+    L = 19
+    code = (
+        [LOAD_IMM, 0x01, target]                  # r1 = (idx+1)*2 (JT-encoded)  @0  (3B)
+        + [CSR_RW, b1(2, 1)] + mepc               # mepc = r1                    @3  (4B)
+        + [LOAD_IMM, 0x07, ord('U')]              # r7 = 'U'                     @7  (3B)
+        + [ECALLI, 0x00]                          # ecalli (host 'U') -- clobbers mepc? @10 (2B)
+        + [MRET]                                  # mret -> JT-map mepc -> JT[idx]@12 (1B)
+        + [LOAD_IMM, 0x07, ord('X')]              # DECOY  r7 = 'X'              @13 (3B)
+        + [ECALLI, 0x00]                          #                              @16 (2B)
+        + [TRAP]                                  #                              @18 (1B)
+        + [LOAD_IMM, 0x07, ord('#')]              # SUCCESS r7 = '#' (== L)      @19 (3B)
+        + [ECALLI, 0x00]                          #                              @22 (2B)
+        + [TRAP]                                  #                              @24 (1B)
+    )
+    starts = [0, 3, 7, 10, 12, 13, 16, 18, 19, 22, 24]
+    z = 1
+    jumptable = [0] * idx + [L]                   # jumptable[idx] = success PVM-pc (19)
+    assert L == 19 and len(code) == 25
+    return code, starts, jumptable, z
+
+
+def emit_handoff_rearm(idx=0):
+    """FIX VALIDATION for emit_handoff_clobber: re-arm mepc AFTER the host-call, immediately before
+    the mret -- so no ecalli sits between the (final) mepc write and the mret. Mirrors the OpenSBI
+    fix (write CSR_MEPC last, after the pvm_putc diagnostics). If the clobber theory + fix are right,
+    this prints 'U' then '#' (mepc survives because it is re-armed past the host-call).
+      load_imm r1,t ; csr_rw mepc,r1 ; load_imm r7,'U' ; ecalli ; load_imm r1,t ; csr_rw mepc,r1 ; mret"""
+    def b1(rd, rs1):
+        return ((rs1 & 0xF) << 4) | (rd & 0xF)
+    target = (idx + 1) * 2
+    assert 0 <= target <= 127, f"target {target} needs a multi-byte load_imm (use idx<=62)"
+    mepc = le(MEPC, 2)
+    L = 26
+    code = (
+        [LOAD_IMM, 0x01, target]                  # r1 = target                  @0  (3B)
+        + [CSR_RW, b1(2, 1)] + mepc               # mepc = r1                    @3  (4B)
+        + [LOAD_IMM, 0x07, ord('U')]              # r7 = 'U'                     @7  (3B)
+        + [ECALLI, 0x00]                          # ecalli (host 'U') clobbers mepc @10 (2B)
+        + [LOAD_IMM, 0x01, target]                # r1 = target (again)          @12 (3B)
+        + [CSR_RW, b1(2, 1)] + mepc               # mepc = r1 (RE-ARM, last)     @15 (4B)
+        + [MRET]                                  # mret -> JT-map mepc -> JT[idx]@19 (1B)
+        + [LOAD_IMM, 0x07, ord('X')]              # DECOY                        @20 (3B)
+        + [ECALLI, 0x00]                          #                              @23 (2B)
+        + [TRAP]                                  #                              @25 (1B)
+        + [LOAD_IMM, 0x07, ord('#')]              # SUCCESS (== L)               @26 (3B)
+        + [ECALLI, 0x00]                          #                              @29 (2B)
+        + [TRAP]                                  #                              @31 (1B)
+    )
+    starts = [0, 3, 7, 10, 12, 15, 19, 20, 23, 25, 26, 29, 31]
+    z = 1
+    jumptable = [0] * idx + [L]                   # jumptable[idx] = success PVM-pc (26)
+    assert L == 26 and len(code) == 32
+    return code, starts, jumptable, z
+
+
+def emit_handoff_djump_eret(idx=0, z=1):
+    """Untested interaction: a DJUMP (jump_ind via JT) immediately UPSTREAM of the JT-mapped eret.
+    OpenSBI's sbi_hart_switch_mode calls misa_extension('H') right before the mret; in PVM a function
+    RETURN (ret = jalr ra) is a jump_ind -> a djump through the JT. So a djump's JT read precedes the
+    eret-via-jt's JT read, and both reuse the SAME regs (djump_a_q/djump_target_q/jt_req_q/jt_valid_q).
+    If the eret picks up STALE djump state, it maps to the wrong target. Every passing handoff repro was
+    straight-line (no djump before the mret) -- this adds that one factor.
+      load_imm r2,2 ; jump_ind r2 -> JT[0]=B ;  B: load_imm r1,4 ; csr_rw mepc,r1 ; mret -> JT[1]=L
+    Prints '#' iff the eret-via-jt JT read is independent of the preceding djump; else 'X'/garbage."""
+    def b1(rd, rs1):
+        return ((rs1 & 0xF) << 4) | (rd & 0xF)
+    mepc = le(MEPC, 2)
+    B = 6                                         # djump target (the eret-setup block)
+    L = 15                                        # eret target (success block)
+    code = (
+        [LOAD_IMM, 0x02, 2]                       # r2 = 2 -> djump index 0       @0  (3B)
+        + [JUMP_IND, 0x02]                        # jump_ind r2 -> JT[0] = B      @3  (2B)
+        + [TRAP]                                  # catch (djump skips)           @5  (1B)
+        + [LOAD_IMM, 0x01, 4]                     # B: r1 = 4 -> eret index 1     @6  (3B)
+        + [CSR_RW, b1(2, 1)] + mepc               # mepc = r1 = 4                 @9  (4B)
+        + [MRET]                                  # mret -> JT-map -> JT[1] = L   @13 (1B)
+        + [TRAP]                                  # catch                         @14 (1B)
+        + [LOAD_IMM, 0x07, ord('#')]              # L: r7 = '#' (success)         @15 (3B)
+        + [ECALLI, 0x00]                          #                              @18 (2B)
+        + [TRAP]                                  #                              @20 (1B)
+    )
+    starts = [0, 3, 5, 6, 9, 13, 14, 15, 18, 20]
+    jumptable = [B, L]                            # JT[0]=djump target B, JT[1]=eret target L
+    assert B == 6 and L == 15 and len(code) == 21
+    return code, starts, jumptable, z
+
+
+def emit_handoff_satp(idx=0, z=1):
+    """Untested OpenSBI factor: a FLUSH-class CSR write (satp) BETWEEN the mepc write and the
+    JT-mapped mret. sbi_hart_switch_mode writes stvec/sscratch/sie/SATP after MEPC, then mret;
+    SATP is flush-class (B5 fences it: pvm_fetch suspends after the write, commits it alone, then
+    resumes -> the mret). Every passing handoff repro put the mret IMMEDIATELY after the mepc write,
+    so the B5-fence-then-eret-via-jt sequence is untested. M->M (the JT-map is priv-independent).
+      load_imm r3,0 ; load_imm r1,t ; csr_rw mepc,r1 ; csr_rw satp,r3 (FLUSH) ; mret -> JT[idx]
+    Prints '#' iff the eret-via-jt survives a flush-class write right before it; else 'X'/garbage."""
+    def b1(rd, rs1):
+        return ((rs1 & 0xF) << 4) | (rd & 0xF)
+    satp = le(0x180, 2)
+    mepc = le(MEPC, 2)
+    target = (idx + 1) * 2
+    assert 0 <= target <= 127, f"target {target} needs a multi-byte load_imm (use idx<=62)"
+    L = 21
+    code = (
+        [LOAD_IMM, 0x03, 0]                       # r3 = 0 (satp value)          @0  (3B)
+        + [LOAD_IMM, 0x01, target]                # r1 = (idx+1)*2 (JT-encoded)  @3  (3B)
+        + [CSR_RW, b1(2, 1)] + mepc               # mepc = r1                    @6  (4B)
+        + [CSR_RW, b1(4, 3)] + satp               # satp = r3 = 0 (FLUSH, last)  @10 (4B)
+        + [MRET]                                  # mret -> JT-map mepc -> JT[idx]@14 (1B)
+        + [LOAD_IMM, 0x07, ord('X')]              # DECOY                        @15 (3B)
+        + [ECALLI, 0x00]                          #                              @18 (2B)
+        + [TRAP]                                  #                              @20 (1B)
+        + [LOAD_IMM, 0x07, ord('#')]              # SUCCESS (== L)               @21 (3B)
+        + [ECALLI, 0x00]                          #                              @24 (2B)
+        + [TRAP]                                  #                              @26 (1B)
+    )
+    starts = [0, 3, 6, 10, 14, 15, 18, 20, 21, 24, 26]
+    jumptable = [0] * idx + [L]                   # jumptable[idx] = success PVM-pc (21)
+    assert L == 21 and len(code) == 27
+    return code, starts, jumptable, z
 
 
 def emit_priv_test():
@@ -606,6 +858,33 @@ def write_hex(path, img):
             f.write(f"{b:02x}\n")
 
 
+def write_blob(path, sym, img):
+    """Emit the PVM image as a .byte array for the DRAM demand-fetch path: the image lives in
+    DRAM as the loader's .text.init data (code_base/jumptable_base point into it), NOT in img_bram
+    via +PVM_IMG. 16-aligned, and padded to 64B so the demand-fetch code/bitmask/jump-table window
+    reads (which fetch 16-aligned 32-byte spans) stay within defined data."""
+    with open(path, "w") as f:
+        f.write("# Auto-generated by gen_pvm_img.py for the DRAM demand-fetch path. Do not edit.\n")
+        f.write(f"    .balign 16\n    .globl {sym}\n{sym}:\n")
+        for i in range(0, len(img), 12):
+            row = ", ".join(f"0x{b:02x}" for b in img[i : i + 12])
+            f.write(f"    .byte {row}\n")
+        pad = (64 - (len(img) % 64)) % 64
+        if pad:
+            f.write(f"    .zero {pad}\n")
+
+
+def _parse_idx_z(text):
+    """Parse the generator's text arg as the JT index and (optional) entry size: "idx" or "idx,z".
+    z>1 widens jump-table entries (real OpenSBI emit-image uses z=3); default idx=0, z=1."""
+    t = text.strip()
+    if "," in t:
+        a, b = t.split(",", 1)
+        return (int(a) if a.strip().lstrip("-").isdigit() else 0,
+                int(b) if b.strip().isdigit() else 1)
+    return (int(t) if t.lstrip("-").isdigit() else 0, 1)
+
+
 def main():
     text = sys.argv[1] if len(sys.argv) > 1 else "PolkaVM on CVA6!\n"
     out  = sys.argv[2] if len(sys.argv) > 2 else "banner.hex"
@@ -625,7 +904,8 @@ def main():
     elif mode == "djump_halt":
         code, starts = emit_djump_halt()
     elif mode == "djump_table":
-        code, starts, jumptable, z = emit_djump_table()
+        _idx, _z = _parse_idx_z(text)
+        code, starts, jumptable, z = emit_djump_table(_idx, _z)
     elif mode == "ibr_taken":
         code, starts = emit_imm_branch_test(True)
     elif mode == "ibr_nottaken":
@@ -641,6 +921,23 @@ def main():
         code, starts = emit_mtvec_test()
     elif mode == "mret":
         code, starts = emit_mret_test()
+    elif mode == "handoff":
+        _idx, _z = _parse_idx_z(text)
+        code, starts, jumptable, z = emit_handoff_test(_idx, _z)
+    elif mode == "handoff_clobber":
+        code, starts, jumptable, z = emit_handoff_clobber(int(text) if text.strip().isdigit() else 0)
+    elif mode == "handoff_satp":
+        _idx, _z = _parse_idx_z(text)
+        code, starts, jumptable, z = emit_handoff_satp(_idx, _z)
+    elif mode == "handoff_djump_eret":
+        _idx, _z = _parse_idx_z(text)
+        code, starts, jumptable, z = emit_handoff_djump_eret(_idx, _z)
+    elif mode == "handoff_rearm":
+        code, starts, jumptable, z = emit_handoff_rearm(int(text) if text.strip().isdigit() else 0)
+    elif mode == "handoff_smode":
+        code, starts, jumptable, z = emit_handoff_smode(int(text) if text.strip().isdigit() else 0)
+    elif mode == "handoff_smode_dyn":
+        code, starts, jumptable, z = emit_handoff_smode_dyn(int(text) if text.strip().isdigit() else 0)
     elif mode == "priv":
         code, starts = emit_priv_test()
     elif mode == "priv_dyn":
@@ -655,6 +952,16 @@ def main():
         code, starts = emit_banner(text)
     img, code_len, bm_off, jt_off = build_image(code, starts, jumptable, z)
     write_hex(out, img)
+
+    # Optional 4th arg = a symbol name -> ALSO emit <out>_blob.S (the same image bytes as a
+    # .byte array) for the DRAM demand-fetch path (run-*-dram gates). JT_OFF is the jump-table
+    # byte offset within the blob; the loader sets jumptable_base = &blob + JT_OFF.
+    if len(sys.argv) > 4:
+        blob_sym  = sys.argv[4]
+        blob_path = (out[:-4] if out.endswith(".hex") else out) + "_blob.S"
+        write_blob(blob_path, blob_sym, img)
+        print(f"JT_OFF    : {jt_off}")
+        print(f"BLOB      : {blob_path} ({blob_sym})")
 
     print(f"mode      : {mode}")
     print(f"banner    : {text!r}")

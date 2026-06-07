@@ -159,7 +159,8 @@ run-dram: loader_dramload.S link.ld
 # code is the per-gate verdict.
 PVM_GATES = run run-ecalli run-banner run-branch run-loop run-djump-halt run-djump-table \
             run-ibranch run-ldij run-csr run-hostcall run-dram run-dram-banner run-user run-user-dram \
-            run-pvmvec run-mret run-priv run-priv-dyn run-priv-return run-storeimm
+            run-pvmvec run-mret run-handoff run-handoff-dram run-djump-dram run-handoff-smode \
+            run-handoff-smode-dram run-handoff-sdyn-dram run-priv run-priv-dyn run-priv-return run-storeimm
 run-all:
 	@pass=0; fail=0; failed=""; \
 	 for t in $(PVM_GATES); do \
@@ -235,6 +236,102 @@ run-mret: loader_mret.S link.ld gen_pvm_img.py
 	 OUT=$$($(HARNESS) +PVM_IMG=$(abspath mret.hex) +tohost_addr=$(TOHOST) +time_out=200000 $(abspath loader_mret.elf) 2>&1); \
 	 echo "$$OUT" | grep -aE 'SUCCESS'; \
 	 { echo "$$OUT" | grep -qa '#' && ! echo "$$OUT" | grep -qa 'X'; } && echo "   mret OK: PVM-pc redirected to mepc" || { echo "   *** mret FAILED ($$(echo "$$OUT" | grep -qa X && echo 'fell through -> X' || echo 'no #')) ***"; exit 1; }
+
+# Stage 1 (M->S handoff via JT-mapped eret): the guest sets mepc to a JT-ENCODED code address
+# (2 = (idx0+1)*2, NOT a PVM-pc) and mret with CSR_PVM_CFG2[36]=1; the HW maps mepc through the
+# jump table (like a djump) -> jumptable[0] = success block ('#'). Without the map the eret would
+# use mepc[31:0]=2 directly -> a mid-instruction pc -> no '#'. Expect '#', never 'X'.
+run-handoff: loader_handoff.S link.ld gen_pvm_img.py
+	@G=$$(python3 gen_pvm_img.py '' handoff.hex handoff); \
+	 CL=$$(echo "$$G" | grep CODE_LEN | grep -oE '[0-9]+'); \
+	 JB=$$(echo "$$G" | grep JT_BASE | grep -oE '[0-9]+'); \
+	 JZ=$$(echo "$$G" | grep JT_Z | grep -oE '[0-9]+'); \
+	 echo ">> Stage 1: M->S handoff via JT-mapped eret, CODE_LEN=$$CL JT_BASE=$$JB JT_Z=$$JZ (expect '#', not 'X'):"; \
+	 $(CC) $(CFLAGS) -DCODE_LEN=$$CL -DJT_BASE=$$JB -DJT_Z=$$JZ -T link.ld -o loader_handoff.elf loader_handoff.S; \
+	 OUT=$$($(HARNESS) +PVM_IMG=$(abspath handoff.hex) +tohost_addr=$(TOHOST) +time_out=200000 $(abspath loader_handoff.elf) 2>&1); \
+	 echo "$$OUT" | grep -aE 'SUCCESS'; \
+	 { echo "$$OUT" | grep -qa '#' && ! echo "$$OUT" | grep -qa 'X'; } && echo "   handoff OK: eret JT-mapped mepc -> success block" || { echo "   *** handoff FAILED ($$(echo "$$OUT" | grep -qa X && echo 'fell through -> X' || echo 'no #')) ***"; exit 1; }
+
+# Stage 1 DRAM-path reproducer (the FPGA/OpenSBI fetch path): the SAME M->S handoff via JT-mapped
+# eret as run-handoff, but the image is demand-fetched from DRAM (CFG1[34]) via the dcache, NOT
+# preloaded into img_bram (+PVM_IMG). The BRAM run-handoff passes; this exercises the eret-via-jt
+# x DRAM-demand-fetch FSM interaction (the FPGA-only wrong-target bug). IDX>0 places the live JT
+# entry far from the code/bitmask lines so the JT read is a COLD cache MISS (the D_WAIT path) --
+# the FPGA condition (idx=0 hot-line reads do NOT reproduce it). Expect '#', never 'X'.
+IDX ?= 62
+run-handoff-dram: loader_handoff_dram.S link.ld gen_pvm_img.py
+	@G=$$(python3 gen_pvm_img.py '$(IDX)' handoff_dram.hex handoff handoff_blob); \
+	 CL=$$(echo "$$G" | grep CODE_LEN | grep -oE '[0-9]+'); \
+	 JO=$$(echo "$$G" | grep JT_OFF  | grep -oE '[0-9]+'); \
+	 JZ=$$(echo "$$G" | grep JT_Z    | grep -oE '[0-9]+'); \
+	 echo ">> Stage 1 DRAM: M->S handoff via JT-mapped eret, demand-fetch (CODE_LEN=$$CL JT_OFF=$$JO JT_Z=$$JZ; expect '#', not 'X'):"; \
+	 $(CC) $(CFLAGS) -DCODE_LEN=$$CL -DJT_OFF=$$JO -DJT_Z=$$JZ -T link.ld -o loader_handoff_dram.elf loader_handoff_dram.S; \
+	 OUT=$$($(HARNESS) +tohost_addr=$(TOHOST) +time_out=300000 $(abspath loader_handoff_dram.elf) 2>&1); \
+	 echo "$$OUT" | grep -aE 'SUCCESS'; \
+	 { echo "$$OUT" | grep -qa '#' && ! echo "$$OUT" | grep -qa 'X'; } && echo "   handoff-dram OK: eret JT-mapped mepc -> success block (DRAM)" || { echo "   *** handoff-dram FAILED ($$(echo "$$OUT" | grep -qa X && echo 'fell through -> X' || echo 'no #')) ***"; exit 1; }
+
+# Stage 1 DRAM-path CONTROL: a plain djump (jump_ind) through the jump table on the SAME DRAM
+# demand-fetch path. The A/B partner of run-handoff-dram: same DRAM JT read, triggered by a DJUMP
+# (br_resolved) not an ERET (eret_via_jt). On the FPGA DJUMP+DRAM works; this proves the DRAM JT
+# read itself is sound in sim, isolating any run-handoff-dram failure to the eret sequencing.
+run-djump-dram: loader_djump_dram.S link.ld gen_pvm_img.py
+	@G=$$(python3 gen_pvm_img.py '$(IDX)' djtab_dram.hex djump_table djtab_blob); \
+	 CL=$$(echo "$$G" | grep CODE_LEN | grep -oE '[0-9]+'); \
+	 JO=$$(echo "$$G" | grep JT_OFF  | grep -oE '[0-9]+'); \
+	 JZ=$$(echo "$$G" | grep JT_Z    | grep -oE '[0-9]+'); \
+	 echo ">> Stage 1 DRAM CONTROL: jump_ind through the jump table, demand-fetch (CODE_LEN=$$CL JT_OFF=$$JO JT_Z=$$JZ; expect 'J'):"; \
+	 $(CC) $(CFLAGS) -DCODE_LEN=$$CL -DJT_OFF=$$JO -DJT_Z=$$JZ -T link.ld -o loader_djump_dram.elf loader_djump_dram.S; \
+	 OUT=$$($(HARNESS) +tohost_addr=$(TOHOST) +time_out=300000 $(abspath loader_djump_dram.elf) 2>&1); \
+	 echo "$$OUT" | grep -aE 'SUCCESS'; \
+	 echo "$$OUT" | grep -qa 'J' && echo "   djump-dram OK: DRAM JT read sound (djump path)" || { echo "   *** djump-dram FAILED (no 'J') ***"; exit 1; }
+
+# Stage 1 OpenSBI-handoff repro (BRAM): a JT-mapped eret that ALSO drops M->S (vs run-handoff's
+# M->M). Isolates [JT-mapped eret] x [M->S priv drop] WITHOUT the DRAM path -- if this passes but
+# run-handoff-smode-dram fails, the bug needs the DRAM demand-fetch; if both fail, it is the priv
+# drop x JT-map itself. Guest: JT-mapped mret -> JT[0]=Ls (S-entry); ecalli@S -> guest mtvec (M)
+# -> host '[#]'. Expect '[#]'; '[S]' = priv stayed M; '' = wrong JT target.
+run-handoff-smode: loader_handoff_smode.S link.ld gen_pvm_img.py
+	@G=$$(python3 gen_pvm_img.py '0' hsmode.hex handoff_smode); \
+	 CL=$$(echo "$$G" | grep CODE_LEN | grep -oE '[0-9]+'); \
+	 JB=$$(echo "$$G" | grep JT_BASE  | grep -oE '[0-9]+'); \
+	 JZ=$$(echo "$$G" | grep JT_Z     | grep -oE '[0-9]+'); \
+	 echo ">> Stage 1 BRAM: M->S handoff via JT-mapped eret (CODE_LEN=$$CL JT_BASE=$$JB JT_Z=$$JZ; expect '[#]'):"; \
+	 $(CC) $(CFLAGS) -DCODE_LEN=$$CL -DJT_BASE=$$JB -DJT_Z=$$JZ -T link.ld -o loader_handoff_smode.elf loader_handoff_smode.S; \
+	 OUT=$$($(HARNESS) +PVM_IMG=$(abspath hsmode.hex) +tohost_addr=$(TOHOST) +time_out=300000 $(abspath loader_handoff_smode.elf) 2>&1); \
+	 echo "$$OUT" | grep -aE 'SUCCESS'; \
+	 EMIT=$$(echo "$$OUT" | grep -aoE '\[.\]' | head -1); echo "   guest emitted = $$EMIT (expect [#])"; \
+	 { [ "$$EMIT" = "[#]" ]; } && echo "   handoff-smode OK: JT-mapped M->S mret round-trip (BRAM)" || { echo "   *** handoff-smode FAILED (got '$$EMIT'; [S]=priv stayed M, ''=wrong JT target/fault) ***"; exit 1; }
+
+# Stage 1 OpenSBI-handoff repro (DRAM demand-fetch) -- the FULL FPGA condition: JT-mapped eret +
+# M->S priv drop + cold-miss DRAM JT read. The exact handoff that prints '!F' on the board.
+# Expect '[#]'. This is the prime reproduction target for the eret-via-jt x DRAM bug.
+run-handoff-smode-dram: loader_handoff_smode_dram.S link.ld gen_pvm_img.py
+	@G=$$(python3 gen_pvm_img.py '$(IDX)' handoff_smode_dram.hex handoff_smode handoff_smode_blob); \
+	 CL=$$(echo "$$G" | grep CODE_LEN | grep -oE '[0-9]+'); \
+	 JO=$$(echo "$$G" | grep JT_OFF  | grep -oE '[0-9]+'); \
+	 JZ=$$(echo "$$G" | grep JT_Z    | grep -oE '[0-9]+'); \
+	 echo ">> Stage 1 DRAM: M->S handoff via JT-mapped eret, demand-fetch (CODE_LEN=$$CL JT_OFF=$$JO JT_Z=$$JZ; expect '[#]'):"; \
+	 $(CC) $(CFLAGS) -DCODE_LEN=$$CL -DJT_OFF=$$JO -DJT_Z=$$JZ -T link.ld -o loader_handoff_smode_dram.elf loader_handoff_smode_dram.S; \
+	 OUT=$$($(HARNESS) +tohost_addr=$(TOHOST) +time_out=300000 $(abspath loader_handoff_smode_dram.elf) 2>&1); \
+	 echo "$$OUT" | grep -aE 'SUCCESS'; \
+	 EMIT=$$(echo "$$OUT" | grep -aoE '\[.\]' | head -1); echo "   guest emitted = $$EMIT (expect [#])"; \
+	 { [ "$$EMIT" = "[#]" ]; } && echo "   handoff-smode-dram OK: JT-mapped M->S mret round-trip (DRAM)" || { echo "   *** handoff-smode-dram FAILED (got '$$EMIT'; [S]=priv stayed M, ''=wrong JT target/fault) ***"; exit 1; }
+
+# Stage 1 OpenSBI-handoff repro (DRAM, GUEST flush-write) -- the MOST faithful: the guest sets
+# mstatus.MPP=S ITSELF (flush-class, B5-fenced) THEN a JT-mapped M->S mret, exactly like
+# sbi_hart_switch_mode (csr_write MSTATUS; mret). Adds the one factor the other handoff repros
+# omit: a guest flush-class CSR write immediately upstream of the JT-mapped eret. Expect '[#]'.
+run-handoff-sdyn-dram: loader_handoff_smode_dyn_dram.S link.ld gen_pvm_img.py
+	@G=$$(python3 gen_pvm_img.py '$(IDX)' handoff_sdyn_dram.hex handoff_smode_dyn handoff_sdyn_blob); \
+	 CL=$$(echo "$$G" | grep CODE_LEN | grep -oE '[0-9]+'); \
+	 JO=$$(echo "$$G" | grep JT_OFF  | grep -oE '[0-9]+'); \
+	 JZ=$$(echo "$$G" | grep JT_Z    | grep -oE '[0-9]+'); \
+	 echo ">> Stage 1 DRAM: guest flush-write mstatus + JT-mapped M->S mret, demand-fetch (CODE_LEN=$$CL JT_OFF=$$JO JT_Z=$$JZ; expect '[#]'):"; \
+	 $(CC) $(CFLAGS) -DCODE_LEN=$$CL -DJT_OFF=$$JO -DJT_Z=$$JZ -T link.ld -o loader_handoff_smode_dyn_dram.elf loader_handoff_smode_dyn_dram.S; \
+	 OUT=$$($(HARNESS) +tohost_addr=$(TOHOST) +time_out=300000 $(abspath loader_handoff_smode_dyn_dram.elf) 2>&1); \
+	 echo "$$OUT" | grep -aE 'SUCCESS'; \
+	 EMIT=$$(echo "$$OUT" | grep -aoE '\[.\]' | head -1); echo "   guest emitted = $$EMIT (expect [#])"; \
+	 { [ "$$EMIT" = "[#]" ]; } && echo "   handoff-sdyn-dram OK: guest-flush + JT-mapped M->S round-trip (DRAM)" || { echo "   *** handoff-sdyn-dram FAILED (got '$$EMIT'; [S]=priv stayed M, ''=wrong JT target/fault) ***"; exit 1; }
 
 # Phase B/C (multi-privilege round-trip = OpenSBI-on-PVM core): the guest drops M->S via
 # mret, then a guest-internal ecalli@S traps to the guest's OWN mtvec while STAYING in PVM
@@ -335,4 +432,4 @@ run-opensbi: loader_opensbi.S link_opensbi.ld opensbi_to_dram.py $(OPENSBI_DTS)
 clean:
 	rm -f loader.elf loader_jump.elf loader_banner.elf loader_ecalli.elf loader_br.elf loader_loop.elf loader_djhalt.elf loader_djtab.elf loader_ibr.elf loader_ldij.elf loader_csr.elf loader_hostcall.elf loader_dramload.elf loader_drambanner.elf loader_hi.elf baseline.elf banner.hex ecalli.hex hi_banner.hex br_taken.hex br_nottaken.hex loop.hex djhalt.hex djtab.hex ibr_t.hex ibr_nt.hex ldij.hex csr.hex hostcall.hex loader_opensbi.elf opensbi.code.bin opensbi.jt.bin opensbi.ro.bin opensbi.rw.bin
 
-.PHONY: all run run-jump run-banner run-ecalli run-branch run-loop run-djump-halt run-djump-table run-ibranch run-ldij run-csr run-hostcall run-dram run-dram-banner run-user run-user-dram run-pvmvec run-mret run-priv run-priv-dyn run-priv-return run-storeimm run-opensbi run-all clean
+.PHONY: all run run-jump run-banner run-ecalli run-branch run-loop run-djump-halt run-djump-table run-ibranch run-ldij run-csr run-hostcall run-dram run-dram-banner run-user run-user-dram run-pvmvec run-mret run-handoff run-handoff-dram run-djump-dram run-handoff-smode run-handoff-smode-dram run-priv run-priv-dyn run-priv-return run-storeimm run-opensbi run-all clean

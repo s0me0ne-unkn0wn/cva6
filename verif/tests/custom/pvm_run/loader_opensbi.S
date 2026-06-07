@@ -102,6 +102,11 @@ _start:
     li   t1, JT_Z
     slli t1, t1, 32
     or   t0, t0, t1
+    li   t1, (1 << 36)                  # Stage 1: CFG2[36] = eret-via-jt. The M->S handoff mret maps
+    or   t0, t0, t1                     # mepc through the jump table (a JT-encoded code address, not a
+                                        # PVM-pc). Sticky: the cold-boot path has NO eret before the
+                                        # handoff (hardcoded features skip the CSR trap-probe), so only
+                                        # the handoff eret is affected.
     csrw CSR_PVM_CFG2, t0
 
     # ---- seed guest entry registers (shared regfile persists through the PVM switch) ----

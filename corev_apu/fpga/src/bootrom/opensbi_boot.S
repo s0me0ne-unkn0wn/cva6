@@ -125,6 +125,11 @@ opensbi_pvm_boot:
     li   t1, JT_Z
     slli t1, t1, 32
     or   t0, t0, t1
+    li   t1, 1
+    slli t1, t1, 36                     # Stage 1: CFG2[36] = eret-via-jt. The M->S handoff mret maps
+    or   t0, t0, t1                     # mepc through the jump table (built in asm; cpp 32-bit-overflows
+                                        # (1<<36)). Sticky: the resume path touches only CFG1 so it
+                                        # persists, and the cold boot has no eret before the handoff.
     csrw CSR_PVM_CFG2, t0
 
     # ---- seed guest entry registers (shared regfile persists through the PVM switch) ----
