@@ -160,7 +160,7 @@ run-dram: loader_dramload.S link.ld
 PVM_GATES = run run-ecalli run-banner run-branch run-loop run-djump-halt run-djump-table \
             run-ibranch run-ldij run-csr run-hostcall run-dram run-dram-banner run-user run-user-dram \
             run-pvmvec run-mret run-handoff run-handoff-dram run-djump-dram run-handoff-smode \
-            run-handoff-smode-dram run-handoff-sdyn-dram run-priv run-priv-dyn run-priv-return run-storeimm
+            run-handoff-smode-dram run-handoff-sdyn-dram run-priv run-priv-dyn run-priv-return run-strap-skip run-handoff-skip run-storeimm
 run-all:
 	@pass=0; fail=0; failed=""; \
 	 for t in $(PVM_GATES); do \
@@ -376,6 +376,39 @@ run-priv-return: loader_priv.S link.ld gen_pvm_img.py
 	 EMIT=$$(echo "$$OUT" | grep -aoE '\[.\]' | head -1); echo "   guest emitted = $$EMIT (expect [#])"; \
 	 { [ "$$EMIT" = "[#]" ]; } && echo "   B6 OK: M-handler mret returned to S; full enter->serve->return cycle" || { echo "   *** B6 FAILED (got '$$EMIT'; ''=handler-return mret fell through / wrong priv/pc) ***"; exit 1; }
 
+# Stage 2 skip-class trap-return: an ecalli@S (SBI call) must return to the instruction AFTER the
+# 2-byte ecalli when the guest M-handler does the STANDARD RISC-V `mepc += 4; mret` (sbi_ecall.c:165).
+# HW biases the guest-ecalli trap-capture by -4 (mepc <- next_pc(ecalli)-4) so the unmodified +4 lands
+# right. The handler does a faithful csrr/add4/csrw mepc (NOT a const write), and the success path's
+# 2nd ecalli sits EXACTLY at the skip-target -- a 2-byte mis-land hits a DECOY trap and emits no '#'.
+# Expect '[#]'; '' = the +4 overshot (bias missing/wrong) -> landed on the decoy.
+run-strap-skip: loader_priv.S link.ld gen_pvm_img.py
+	@CL=$$(python3 gen_pvm_img.py '' strap_skip.hex strap_skip | grep CODE_LEN | grep -oE '[0-9]+'); \
+	 echo ">> Stage 2: ecalli@S skip-return via guest mepc+=4;mret lands after the 2B ecalli (expect '#'):"; \
+	 $(CC) $(CFLAGS) -DCODE_LEN=$$CL -T link.ld -o loader_strap_skip.elf loader_priv.S; \
+	 OUT=$$($(HARNESS) +PVM_IMG=$(abspath strap_skip.hex) +tohost_addr=$(TOHOST) +time_out=200000 $(abspath loader_strap_skip.elf) 2>&1); \
+	 echo "$$OUT" | grep -aE 'SUCCESS'; \
+	 EMIT=$$(echo "$$OUT" | grep -aoE '\[.\]' | head -1); echo "   guest emitted = $$EMIT (expect [#])"; \
+	 { [ "$$EMIT" = "[#]" ]; } && echo "   stage2 OK: guest mepc+=4 landed on the instruction after the ecalli (-4 bias)" || { echo "   *** stage2 FAILED (got '$$EMIT'; ''=mepc+=4 overshot the 2B ecalli -> hit the decoy) ***"; exit 1; }
+
+# Stage 1 + Stage 2 COMBINED (the real OpenSBI config): CFG2[36] is set sticky (like loader_opensbi.S),
+# so the eret-via-JT one-shot MUST JT-map the M->S handoff then SELF-CLEAR, so the subsequent ecalli@S
+# skip-return (raw-pc mepc, +4) takes the DIRECT path instead of being JT-mangled. Reuses
+# loader_handoff_smode.S (MPP=S + CFG2[36]=1 + JT). Expect '[#]'; '' = the skip-return was JT-mapped
+# (one-shot self-clear broken) or the -4 bias is wrong. This is the gate the run-strap-skip gate
+# (CFG2=0) could NOT cover -- it exercises the Stage-1/Stage-2 interaction the architect flagged.
+run-handoff-skip: loader_handoff_smode.S link.ld gen_pvm_img.py
+	@G=$$(python3 gen_pvm_img.py '0' hskip.hex handoff_skip); \
+	 CL=$$(echo "$$G" | grep CODE_LEN | grep -oE '[0-9]+'); \
+	 JB=$$(echo "$$G" | grep JT_BASE  | grep -oE '[0-9]+'); \
+	 JZ=$$(echo "$$G" | grep JT_Z     | grep -oE '[0-9]+'); \
+	 echo ">> Stage 1+2: one-shot CFG2[36] JT-maps the handoff then self-clears -> ecalli@S skip-return is DIRECT (expect '#'):"; \
+	 $(CC) $(CFLAGS) -DCODE_LEN=$$CL -DJT_BASE=$$JB -DJT_Z=$$JZ -T link.ld -o loader_handoff_skip.elf loader_handoff_smode.S; \
+	 OUT=$$($(HARNESS) +PVM_IMG=$(abspath hskip.hex) +tohost_addr=$(TOHOST) +time_out=300000 $(abspath loader_handoff_skip.elf) 2>&1); \
+	 echo "$$OUT" | grep -aE 'SUCCESS'; \
+	 EMIT=$$(echo "$$OUT" | grep -aoE '\[.\]' | head -1); echo "   guest emitted = $$EMIT (expect [#])"; \
+	 { [ "$$EMIT" = "[#]" ]; } && echo "   handoff-skip OK: CFG2[36] one-shot (JT handoff -> self-clear -> DIRECT skip-return)" || { echo "   *** handoff-skip FAILED (got '$$EMIT'; ''=skip-return JT-mangled -> one-shot broken, or -4 bias wrong) ***"; exit 1; }
+
 # store_imm RTL bug gate: a PVM store_imm of a >16-bit immediate (low 16 bits ZERO, e.g.
 # 0x230000) to a NON-ZERO offset must store the FULL value, not just the low 16 bits.
 # Mirrors polkatool folding `li a5,0x10000; sd a5,off(base)` into store_imm_u64. The guest
@@ -432,4 +465,4 @@ run-opensbi: loader_opensbi.S link_opensbi.ld opensbi_to_dram.py $(OPENSBI_DTS)
 clean:
 	rm -f loader.elf loader_jump.elf loader_banner.elf loader_ecalli.elf loader_br.elf loader_loop.elf loader_djhalt.elf loader_djtab.elf loader_ibr.elf loader_ldij.elf loader_csr.elf loader_hostcall.elf loader_dramload.elf loader_drambanner.elf loader_hi.elf baseline.elf banner.hex ecalli.hex hi_banner.hex br_taken.hex br_nottaken.hex loop.hex djhalt.hex djtab.hex ibr_t.hex ibr_nt.hex ldij.hex csr.hex hostcall.hex loader_opensbi.elf opensbi.code.bin opensbi.jt.bin opensbi.ro.bin opensbi.rw.bin
 
-.PHONY: all run run-jump run-banner run-ecalli run-branch run-loop run-djump-halt run-djump-table run-ibranch run-ldij run-csr run-hostcall run-dram run-dram-banner run-user run-user-dram run-pvmvec run-mret run-handoff run-handoff-dram run-djump-dram run-handoff-smode run-handoff-smode-dram run-priv run-priv-dyn run-priv-return run-storeimm run-opensbi run-all clean
+.PHONY: all run run-jump run-banner run-ecalli run-branch run-loop run-djump-halt run-djump-table run-ibranch run-ldij run-csr run-hostcall run-dram run-dram-banner run-user run-user-dram run-pvmvec run-mret run-handoff run-handoff-dram run-djump-dram run-handoff-smode run-handoff-smode-dram run-priv run-priv-dyn run-priv-return run-strap-skip run-handoff-skip run-storeimm run-opensbi run-all clean

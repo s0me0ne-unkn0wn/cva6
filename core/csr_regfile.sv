@@ -188,6 +188,20 @@ module csr_regfile
     output jvt_t jvt_o,
     // B4: route a PVM host-boundary exit (ecalli/panic) to CSR_PVM_VEC instead of mtvec
     input  logic                    pvm_use_vec_i,
+    // PVM Stage 2 (skip-class trap-return): on a committed guest-internal ecalli stay-trap, capture
+    // the POST-ecalli pc (next_pc-4) into mepc/sepc instead of the trapping ecalli pc, so the guest
+    // M-handler's standard RISC-V `mepc += 4; mret` (sbi_ecall.c:165) lands on the instruction AFTER
+    // the 2-byte PVM ecalli (the -4 absorbs the 4-vs-2 length gap). cva6 supplies value + valid,
+    // gated PvmPresent & pvm_active & pvm_stay (= pvm_trap_redirect). Non-stay/non-PVM = unchanged.
+    input  logic [CVA6Cfg.XLEN-1:0] pvm_epc_override_i,
+    input  logic                    pvm_epc_override_valid_i,
+    // PVM eret-via-JT one-shot: pulse when a JT-mapped eret (the Stage-1 M->S handoff) commits.
+    // CFG2[36] (eret-via-JT) self-clears on this pulse so it maps ONLY the one-shot handoff; every
+    // subsequent eret (a trap-return -- skip-class or re-execute -- whose mepc is a RAW PVM-pc, not a
+    // JT token) takes the DIRECT path, even though the OpenSBI launcher leaves CFG2[36]=1 sticky. SW
+    // re-arms by writing CFG2[36]=1 again (a same-cycle SW write wins). Matches the Stage-1 spec
+    // intent ("self-clears after use"); without it the SBI-call return would be JT-mangled.
+    input  logic                    pvm_eret_jt_consume_i,
     output logic [CVA6Cfg.XLEN-1:0] pvm_cfg0_o,
     output logic [CVA6Cfg.XLEN-1:0] pvm_cfg1_o,
     output logic [CVA6Cfg.XLEN-1:0] pvm_cfg2_o,
@@ -862,6 +876,10 @@ module csr_regfile
     pvm_cfg0_d   = pvm_cfg0_q;
     pvm_cfg1_d   = pvm_cfg1_q;
     pvm_cfg2_d   = pvm_cfg2_q;
+    // eret-via-JT one-shot: once the JT-mapped handoff eret consumes it, clear CFG2[36] so later
+    // trap-return erets are DIRECT (raw PVM-pc), not JT-mapped. A same-cycle SW write to CFG2
+    // (the write case below, later in this block) overwrites pvm_cfg2_d -> SW write takes precedence (re-arm).
+    if (CVA6Cfg.PvmPresent && pvm_eret_jt_consume_i) pvm_cfg2_d[36] = 1'b0;
     pvm_vec_d    = pvm_vec_q;
     pvm_ram_d    = pvm_ram_q;
     if (CVA6Cfg.TvalEn) mtval_d = mtval_q;
@@ -1512,8 +1530,10 @@ module csr_regfile
           mstatus_d.spp = priv_lvl_q[0];
           // set cause
           scause_d = ex_i.cause;
-          // set epc
-          sepc_d = {{CVA6Cfg.XLEN - CVA6Cfg.VLEN{pc_i[CVA6Cfg.VLEN-1]}}, pc_i};
+          // set epc (PVM Stage 2: override with the post-ecalli pc on a guest-ecalli stay-trap)
+          sepc_d = (CVA6Cfg.PvmPresent && pvm_epc_override_valid_i)
+                       ? pvm_epc_override_i
+                       : {{CVA6Cfg.XLEN - CVA6Cfg.VLEN{pc_i[CVA6Cfg.VLEN-1]}}, pc_i};
           // set stval
           stval_d        = (ariane_pkg::ZERO_TVAL
                                   && (ex_i.cause inside {
@@ -1531,8 +1551,10 @@ module csr_regfile
         // save the previous privilege mode
         mstatus_d.mpp = priv_lvl_q;
         mcause_d = (break_from_trigger) ? 32'h00000003 : ex_i.cause;
-        // set epc
-        mepc_d = {{CVA6Cfg.XLEN - CVA6Cfg.VLEN{pc_i[CVA6Cfg.VLEN-1]}}, pc_i};
+        // set epc (PVM Stage 2: override with the post-ecalli pc on a guest-ecalli stay-trap)
+        mepc_d = (CVA6Cfg.PvmPresent && pvm_epc_override_valid_i)
+                     ? pvm_epc_override_i
+                     : {{CVA6Cfg.XLEN - CVA6Cfg.VLEN{pc_i[CVA6Cfg.VLEN-1]}}, pc_i};
         // set mtval or stval
         if (CVA6Cfg.TvalEn) begin
           mtval_d        = (ariane_pkg::ZERO_TVAL

@@ -469,6 +469,7 @@ module cva6
   logic pvm_stay;                    // guest-internal trap (ecalli@priv<M): stay in PVM, go to guest tvec
   logic                    pvm_trap_redirect;  // committed stay-trap -> redirect pvm_fetch to the guest tvec
   logic [CVA6Cfg.VLEN-1:0] pvm_trap_pc;        // committed trap_vector_base (guest mtvec/stvec) as a PVM-pc
+  logic [CVA6Cfg.XLEN-1:0] pvm_epc_override;   // Stage 2: post-ecalli pc (next_pc-4) captured into mepc/sepc on a guest-ecalli stay-trap
   logic                    pvm_csr_fence_resolved;  // B5: a flush-class CSR write committed while pvm_active
   logic                    pvm_storeimm_resolved;   // a store_imm macro's store drained while pvm_active
   dcache_req_i_t pvm_dreq;
@@ -569,6 +570,17 @@ module cva6
   // never both assert -- asserted in csr_regfile). PVM-pc is 32-bit (slice + zero-extend).
   assign pvm_trap_redirect = CVA6Cfg.PvmPresent & pvm_active & ex_commit.valid & pvm_stay;
   assign pvm_trap_pc       = {{(CVA6Cfg.VLEN-32){1'b0}}, trap_vector_base_commit_pcgen[31:0]};
+  // Stage 2 (skip-class trap-return): on the SAME committed guest-ecalli stay-trap (pvm_trap_redirect),
+  // capture the POST-ecalli PVM-pc into mepc/sepc instead of the trapping ecalli pc. pvm_pc (= the
+  // front-end pc_q) HOLDS next_pc(ecalli) at the commit cycle: pvm_fetch advanced pc_q<=next_pc on the
+  // ecalli halt (pvm_fetch.sv:272) and SUSPENDS there (running_q=0) until this redirect, so pc_q is the
+  // stable post-ecalli pc right up to the edge that redirects it to the guest tvec. (Reading the live
+  // next_pc_o here would be STALE -- pc_q already advanced; this reads pc_q, not pc_q+1+skip.) The -4
+  // absorbs the guest M-handler's RISC-V `mepc += 4` (sbi_ecall.c:165) over a 2-byte PVM ecalli, so the
+  // eventual mret lands on the instruction AFTER the ecalli (not a re-execute loop). Zero-extend like
+  // pvm_eret_pc (the eret consumes epc[31:0]). Scoped to pvm_stay -> the host ecalli@M path (CFG1[33]
+  // resume, never via mepc) is untouched. Only the SKIP class (ecalli); re-execute traps keep pc_i.
+  assign pvm_epc_override  = {{(CVA6Cfg.XLEN-32){1'b0}}, (pvm_pc[31:0] - 32'd4)};
   // B5: a guest write to a flush-class CSR (mstatus/sstatus/satp/mstatush) raises flush_o in
   // csr_regfile (= flush_csr_ctrl, the top-level i_csr_regfile .flush_o). In PVM mode this flush
   // would discard the YOUNGER in-flight PVM uop (e.g. the mret right after a guest mstatus.MPP
@@ -1567,6 +1579,9 @@ module cva6
       .hcbcfe_o                (hcbcfe),
       .jvt_o                   (jvt),
       .pvm_use_vec_i           (pvm_use_vec),
+      .pvm_epc_override_i       (pvm_epc_override),
+      .pvm_epc_override_valid_i (pvm_trap_redirect),
+      .pvm_eret_jt_consume_i    (pvm_eret_via_jt),
       .pvm_cfg0_o              (pvm_cfg0_csr),
       .pvm_cfg1_o              (pvm_cfg1_csr),
       .pvm_cfg2_o              (pvm_cfg2_csr),

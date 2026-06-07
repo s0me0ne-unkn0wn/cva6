@@ -831,6 +831,126 @@ def emit_priv_return_test():
     return code, starts
 
 
+def emit_strap_skip_test():
+    """Stage 2 skip-class trap-return: prove an ecalli@S (an SBI call) returns to the instruction
+    AFTER the 2-byte ecalli when the guest M-handler does the STANDARD RISC-V `mepc += 4; mret`
+    (exactly OpenSBI sbi_ecall.c:165). Without the HW -4 bias on the guest-ecalli trap-capture, the
+    captured mepc = the ecalli's OWN pc, so `mepc += 4` OVERSHOOTS the 2-byte ecalli by 2 and skips
+    the next instruction; with the bias the capture = next_pc(ecalli)-4, so `mepc += 4` lands exactly
+    on next_pc(ecalli).
+
+    The handler does a FAITHFUL READ-MODIFY-WRITE (csrr mepc; add 4; csrw mepc; mret) -- NOT a
+    `csr_rw mepc,<const>` -- so the result genuinely depends on the CAPTURED value (a const write
+    would pass even WITH the bug, hiding it). Two-vector scheme (no branch needed, mirrors
+    emit_priv_return_test): the 1st ecalli@S -> Lh1 (skip-return; re-points mtvec to Lh2); the
+    success path's 2nd ecalli@S -> Lh2 (host-exit '#'). The 2nd ecalli sits EXACTLY at
+    next_pc(1st ecalli)=Ls+2; a wrong landing (the bug: mepc+4 = Ls+4 = 2 bytes too far) hits the
+    DECOY trap@Ls+4 and exits with NO '#'. So '[#]' appears IFF the -4 bias is correct.
+      @M  csr_rw mtvec=Lh1 ; csr_rw mepc=Ls ; mret        -> S@Ls (priv->S)
+      @15 trap                                            (DECOY: mret-redirect fail)
+      @Ls(S,16): ecalli #0   -> guest-trap to Lh1 ; SKIP-target = @18
+      @18  (S):  ecalli #0   -> guest-trap to Lh2 -> host '#'  (reached IFF skip landed here)
+      @20 trap (+pads)                                    (DECOY: bug lands @Ls+4=20 -> no '#')
+      @Lh1(M,24): csr_rw mtvec=Lh2 ; r5=0 ; r3=mepc ; r3+=4 ; mepc=r3 ; mret  -> S@18
+      @46 trap (+pad)                                     (DECOY: skip-return fail)
+      @Lh2(M,48): load_imm r7,'#' ; ecalli #0 (host '#') ; trap
+    Prints '[#]' iff the -4 bias made the standard `mepc += 4` land on the instruction after the
+    ecalli. HOST pre-sets mstatus.MPP=S (loader_priv.S); the guest writes only mtvec/mepc (flush-free)."""
+    def b1(rd, rs1):
+        return ((rs1 & 0xF) << 4) | (rd & 0xF)   # polkavm2: rd=LOW nibble, csr-src=HIGH
+    mtvec = le(MTVEC, 2)                          # [0x05, 0x03]
+    mepc  = le(MEPC, 2)                           # [0x41, 0x03]
+    Lh1 = 24                                      # skip-return M-handler PVM-pc (4-aligned)
+    Ls  = 16                                      # S-entry / 1st-ecalli PVM-pc (2-aligned)
+    Lh2 = 48                                      # exit M-handler PVM-pc (4-aligned)
+    code = (
+        [LOAD_IMM, 0x01, Lh1]                     # r1 = Lh1                        @0  (3B)
+        + [CSR_RW, b1(2, 1)] + mtvec              # mtvec = Lh1 (guest M tvec)      @3  (4B)
+        + [LOAD_IMM, 0x01, Ls]                    # r1 = Ls                         @7  (3B)
+        + [CSR_RW, b1(2, 1)] + mepc               # mepc = Ls                       @10 (4B)
+        + [MRET]                                  # mret -> Ls, priv->S             @14 (1B)
+        + [TRAP]                                  # DECOY (mret-redirect fail)      @15 (1B)
+        + [ECALLI, 0x00]                          # Ls(16): 1st ecalli@S -> Lh1     @16 (2B)
+        + [ECALLI, 0x00]                          # @18: 2nd ecalli@S -> Lh2 -> '#' @18 (2B)
+        + [TRAP]                                  # DECOY: bug lands @Ls+4=20       @20 (1B)
+        + [TRAP] + [TRAP] + [TRAP]                # pad -> Lh1 4-align              @21,22,23
+        + [LOAD_IMM, 0x01, Lh2]                   # Lh1(24): r1 = Lh2               @24 (3B)
+        + [CSR_RW, b1(2, 1)] + mtvec              # mtvec = Lh2 (RE-POINT vector)   @27 (4B)
+        + [LOAD_IMM, 0x05, 0x00]                  # r5 = 0 (zero reg for csrr)      @31 (3B)
+        + [CSR_RS, b1(3, 5)] + mepc               # r3 = mepc (= next_pc-4); |=0    @34 (4B)
+        + [ADD_IMM_32, (3 << 4) | 3, 0x04]        # r3 += 4  (== RISC-V `mepc += 4`)@38 (3B)
+        + [CSR_RW, b1(4, 3)] + mepc               # mepc = r3 (= next_pc)           @41 (4B)
+        + [MRET]                                  # mret -> S@18 (mpp stays S)      @45 (1B)
+        + [TRAP]                                  # DECOY (skip-return fail)        @46 (1B)
+        + [TRAP]                                  # pad -> Lh2 4-align              @47 (1B)
+        + [LOAD_IMM, 0x07, ord('#')]              # Lh2(48): r7 = '#'               @48 (3B)
+        + [ECALLI, 0x00]                          # ecalli@M -> host putchar '#'    @51 (2B)
+        + [TRAP]                                  # trap -> exit SUCCESS            @53 (1B)
+    )
+    starts = [0, 3, 7, 10, 14, 15, 16, 18, 20, 21, 22, 23,
+              24, 27, 31, 34, 38, 41, 45, 46, 47, 48, 51, 53]
+    assert Lh1 == 24 and Ls == 16 and Lh2 == 48 and len(code) == 54
+    assert Lh1 % 4 == 0 and Lh2 % 4 == 0          # RISC-V WARL: mtvec 4-aligned
+    assert Ls % 2 == 0 and (Ls + 2) % 2 == 0      # RISC-V WARL: mepc 2-aligned (entry + skip-target)
+    return code, starts
+
+
+def emit_handoff_skip(idx=0, z=1):
+    """COMBINED Stage-1 + Stage-2 gate (the real OpenSBI config): the eret-via-JT bit CFG2[36] must
+    JT-map ONLY the one-shot M->S handoff, then SELF-CLEAR so the subsequent ecalli@S skip-return is
+    DIRECT. The host loader (loader_handoff_smode.S) sets CFG2[36]=1 + a JT (sticky, exactly like
+    loader_opensbi.S), so without the one-shot self-clear the skip-return's RAW mepc would be fed to
+    the JT mapper and mangled -> wrong target -> no '#'. Body is emit_strap_skip_test's, EXCEPT the
+    M->S ENTRY mret uses a JT-ENCODED mepc (token (idx+1)*2) so it is JT-mapped (and consumes CFG2[36]).
+      @M  mtvec=Lh1 ; mepc=(idx+1)*2 (JT token) ; mret  -> JT[idx]=Ls (JT-mapped; CONSUMES CFG2[36])
+      @Ls(S,16): ecalli@S -> Lh1 ; SKIP-target=@18  (this skip-return mret MUST now be DIRECT)
+      @18 (S):   ecalli@S -> Lh2 -> host '#'
+      @20 trap (+pads)                                  (DECOY: skip-return JT-mangled/overshot -> no '#')
+      @Lh1(M,24): mtvec=Lh2 ; r5=0 ; r3=mepc ; r3+=4 ; mepc=r3 ; mret  -> S@18 (DIRECT, bit36 consumed)
+      @46 trap (+pad)
+      @Lh2(M,48): load_imm r7,'#' ; ecalli@M (host '#') ; trap
+    Prints '[#]' iff BOTH hold: CFG2[36] one-shot (handoff JT-maps then self-clears) AND the -4 skip
+    bias. A still-sticky CFG2[36] -> the skip-return mret JT-maps a raw PVM-pc -> wrong -> no '#'."""
+    def b1(rd, rs1):
+        return ((rs1 & 0xF) << 4) | (rd & 0xF)   # polkavm2: rd=LOW nibble, csr-src=HIGH
+    mtvec = le(MTVEC, 2)                          # [0x05, 0x03]
+    mepc  = le(MEPC, 2)                           # [0x41, 0x03]
+    Lh1 = 24                                      # skip-return M-handler PVM-pc (4-aligned)
+    Ls  = 16                                      # S-entry / 1st-ecalli PVM-pc (2-aligned) = JT[idx]
+    Lh2 = 48                                      # exit M-handler PVM-pc (4-aligned)
+    token = (idx + 1) * 2                         # JT-encoded handoff target (PolkaVM jump token)
+    code = (
+        [LOAD_IMM, 0x01, Lh1]                     # r1 = Lh1                        @0  (3B)
+        + [CSR_RW, b1(2, 1)] + mtvec              # mtvec = Lh1                     @3  (4B)
+        + [LOAD_IMM, 0x01, token]                 # r1 = JT token (NOT Ls)          @7  (3B)
+        + [CSR_RW, b1(2, 1)] + mepc               # mepc = token                    @10 (4B)
+        + [MRET]                                  # JT-map -> JT[idx]=Ls; CONSUME   @14 (1B)
+        + [TRAP]                                  # DECOY (handoff fail)            @15 (1B)
+        + [ECALLI, 0x00]                          # Ls(16): 1st ecalli@S -> Lh1     @16 (2B)
+        + [ECALLI, 0x00]                          # @18: 2nd ecalli@S -> Lh2 -> '#' @18 (2B)
+        + [TRAP]                                  # DECOY: skip-return mis-land     @20 (1B)
+        + [TRAP] + [TRAP] + [TRAP]                # pad -> Lh1 4-align              @21,22,23
+        + [LOAD_IMM, 0x01, Lh2]                   # Lh1(24): r1 = Lh2               @24 (3B)
+        + [CSR_RW, b1(2, 1)] + mtvec              # mtvec = Lh2 (RE-POINT)          @27 (4B)
+        + [LOAD_IMM, 0x05, 0x00]                  # r5 = 0 (zero reg for csrr)      @31 (3B)
+        + [CSR_RS, b1(3, 5)] + mepc               # r3 = mepc (= next_pc-4); |=0    @34 (4B)
+        + [ADD_IMM_32, (3 << 4) | 3, 0x04]        # r3 += 4  (== RISC-V mepc += 4)  @38 (3B)
+        + [CSR_RW, b1(4, 3)] + mepc               # mepc = r3 (= next_pc)           @41 (4B)
+        + [MRET]                                  # DIRECT eret (bit36 consumed)    @45 (1B)
+        + [TRAP]                                  # DECOY (skip-return fail)        @46 (1B)
+        + [TRAP]                                  # pad -> Lh2 4-align              @47 (1B)
+        + [LOAD_IMM, 0x07, ord('#')]              # Lh2(48): r7 = '#'               @48 (3B)
+        + [ECALLI, 0x00]                          # ecalli@M -> host putchar '#'    @51 (2B)
+        + [TRAP]                                  # trap -> exit SUCCESS            @53 (1B)
+    )
+    starts = [0, 3, 7, 10, 14, 15, 16, 18, 20, 21, 22, 23,
+              24, 27, 31, 34, 38, 41, 45, 46, 47, 48, 51, 53]
+    jumptable = [0] * idx + [Ls]                  # JT[idx] = Ls (handoff target)
+    assert Lh1 == 24 and Ls == 16 and Lh2 == 48 and len(code) == 54
+    assert Lh1 % 4 == 0 and Lh2 % 4 == 0 and Ls % 2 == 0
+    return code, starts, jumptable, z
+
+
 def build_image(code, starts, jumptable=None, z=1):
     """Pad code to align16, append the LSB-first opcode bitmask, then (optionally)
     the dynamic jump table (z bytes/entry, LE). Returns (img, code_len, bm_off, jt_off)."""
@@ -938,12 +1058,16 @@ def main():
         code, starts, jumptable, z = emit_handoff_smode(int(text) if text.strip().isdigit() else 0)
     elif mode == "handoff_smode_dyn":
         code, starts, jumptable, z = emit_handoff_smode_dyn(int(text) if text.strip().isdigit() else 0)
+    elif mode == "handoff_skip":
+        code, starts, jumptable, z = emit_handoff_skip(int(text) if text.strip().isdigit() else 0)
     elif mode == "priv":
         code, starts = emit_priv_test()
     elif mode == "priv_dyn":
         code, starts = emit_priv_dyn_test()
     elif mode == "priv_return":
         code, starts = emit_priv_return_test()
+    elif mode == "strap_skip":
+        code, starts = emit_strap_skip_test()
     elif mode == "hostcall":
         code, starts = emit_hostcall_test()
     elif mode == "storeimm":

@@ -1,17 +1,19 @@
 # Copyright 2026 CVA6-PolkaVM contributors
 # SPDX-License-Identifier: Apache-2.0
 #
-# PolkaVM bootrom entry (FPGA) -- FULL GUEST-PRIVILEGE round-trip (the OpenSBI-on-PVM
-# core, cont.20). Called from main() after the UART is up and the prologue banner printed.
-# A multi-privilege PVM guest (one JAM image) drives the REAL RISC-V privilege CSRs and the
-# HW makes PVM-fetch follow:
-#   @M : csr_rw mtvec,Lh ; csr_rw mepc,Ls ; mret      -> redirect PVM-pc to Ls, priv -> S
-#   @S : ecalli@S -> a GUEST-INTERNAL trap to the guest's own mtvec=Lh while STAYING in PVM
-#        (NOT a host-boundary exit), priv -> M
-#   @M (handler Lh): ecalli@M -> the one door out to THIS host -> framed putchar '[#]'
-# UART shows "[#]" iff: the mret redirected the PVM-pc AND priv became S AND the ecalli@S
-# stayed in PVM and redirected to the guest mtvec AND priv became M there. This is the
-# hardware proof of mret/sret + guest-privilege (sim gate: run-priv).
+# PolkaVM bootrom entry (FPGA) -- STAGE-2 skip-class trap-return, COMBINED with Stage-1 eret-via-JT
+# (cont.23, the real OpenSBI config). Called from main() after the UART is up + prologue banner.
+# One JAM image drives the REAL RISC-V privilege CSRs; the host sets MPP=S + CFG2={bit36|z<<32|jt_base}:
+#   @M : mtvec=Lh1 ; mepc=(idx+1)*2 (a JT TOKEN) ; mret  -> JT-mapped to JT[0]=Ls, priv->S
+#        (this one-shot CONSUMES CFG2[36] -> eret-via-JT self-clears in HW)
+#   @S (Ls): ecalli@S -> GUEST-INTERNAL trap to mtvec=Lh1 (stays in PVM), priv->M; HW captures
+#        mepc = next_pc(ecalli)-4 (the Stage-2 -4 bias)
+#   @M (Lh1): re-point mtvec=Lh2 ; csrr mepc ; +4 ; csrw mepc ; mret -> S@(ecalli+2) MUST be DIRECT
+#        (CFG2[36] already self-cleared -> a raw PVM-pc, NOT JT-mapped); a still-sticky bit would
+#        JT-mangle it -> miss the 2nd ecalli -> hit the decoy trap -> NO '#'
+#   @S: 2nd ecalli@S -> Lh2 ; @M (Lh2): ecalli@M -> the one door out -> framed putchar '[#]'
+# UART shows "[#]" iff the CFG2[36] one-shot self-clear AND the -4 skip-bias BOTH hold on silicon
+# (sim gates: run-handoff-skip + run-strap-skip). Original cont.20 priv bootrom: /tmp/pvm_boot_priv.S.bak.
 #
 # The HOST sets mstatus.MPP = S so the guest's mret drops to S WITHOUT the guest writing
 # mstatus (a guest mstatus write raises a pipeline flush that discards in-flight PVM uops --
@@ -27,8 +29,10 @@
 #define CSR_PVM_CFG2 0xbc2
 #define CSR_PVM_IMG  0xbc3          /* write {addr<<8 | byte} -> img_bram[addr] (M1 load port) */
 #define CSR_PVM_VEC  0xbc4          /* host-boundary exit vector (B4): survives a guest mtvec write */
-#define PVM_IMG_LEN  36             /* priv image: 28 code + 4 pad + 4 bitmask */
-#define PVM_CODE_LEN 28             /* |c| of the round-trip image */
+#define PVM_IMG_LEN  72             /* handoff_skip image: 54 code + 10 pad + 7 bitmask + 1 JT */
+#define PVM_CODE_LEN 54             /* |c| of the handoff_skip image */
+#define PVM_JT_BASE  71             /* jump-table byte offset within img_bram (= JT_BASE) */
+#define PVM_JT_Z     1              /* jump-table entry size z */
 #define MSTATUS_MPP_S 0x800         /* mstatus.MPP = S (bits 12:11 = 0b01) */
 #define UART_BASE    0x10000000     /* ariane_soc::UARTBase (apb_uart THR @ +0) */
 #define UART_LSR_OFF 0x14           /* line status register (reg 5, 4-byte stride) */
@@ -43,7 +47,7 @@ pvm_boot:
     li   t0, MSTATUS_MPP_S
     csrs mstatus, t0                # MPP = S so the guest's mret drops to S-mode
     # --- stage the JAM image into img_bram via CSR_PVM_IMG (M1/M2 byte-load) ---------
-    lla  t0, priv_blob              # ROM source (PC-relative, NOT GOT)
+    lla  t0, skip_blob              # ROM source (PC-relative, NOT GOT)
     li   t2, PVM_IMG_LEN
     li   a3, 0                      # byte index
 1:  add  a2, t0, a3
@@ -55,7 +59,16 @@ pvm_boot:
     blt  a3, t2, 1b
     # --- enter PVM (img_bram fetch, code_base = 0, guest starts at M-mode) ------------
     csrw CSR_PVM_CFG0, x0           # entry_pc = 0, code_base = 0
-    csrw CSR_PVM_CFG2, x0           # no jump table
+    # CFG2 = {1<<36 (eret-via-jt, one-shot) | PVM_JT_Z<<32 | PVM_JT_BASE}. Built in ASM with explicit
+    # shifts -- the C preprocessor would 32-bit-overflow a (1<<36) macro (see cont.22 / opensbi_boot.S).
+    li   t0, PVM_JT_BASE            # CFG2[31:0] = jump-table base (img_bram byte offset)
+    li   t1, PVM_JT_Z
+    slli t1, t1, 32                 # CFG2[35:32] = z
+    or   t0, t0, t1
+    li   t1, 1
+    slli t1, t1, 36                 # CFG2[36] = eret-via-jt (HW self-clears after the handoff eret)
+    or   t0, t0, t1
+    csrw CSR_PVM_CFG2, t0           # JT handoff armed (one-shot)
     fence                           # drain the staging writes before fetch
     csrw CSR_PVM_CFG1, x0           # clear -> clean 0->1 edge on the next write
     li   t0, (1 << 32) | PVM_CODE_LEN
@@ -98,4 +111,4 @@ putc:                               # putchar(x14) with THRE flow control; link 
     lbu  x12, UART_LSR_OFF(x15)     # uncached LSR read drains the store buffer
     jr   x13
 
-    .include "priv_img_data.S"
+    .include "handoff_skip_data.S"
