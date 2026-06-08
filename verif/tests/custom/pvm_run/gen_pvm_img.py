@@ -951,6 +951,82 @@ def emit_handoff_skip(idx=0, z=1):
     return code, starts, jumptable, z
 
 
+def emit_smode_loop(n=5, jt_handoff=False, idx=0, z=1):
+    """Stage 3 (re-scoped): a REAL S-mode payload -- an S-mode LOOP making N SBI-putchar
+    ecalli@S calls, each round-tripping through ONE reusable guest M-handler that does the
+    putchar (direct UART MMIO, exactly like OpenSBI's M-mode console driver) THEN the standard
+    RISC-V skip-return (csrr mepc; +4; csrw mepc; mret). Unlike run-strap-skip / run-handoff-skip
+    (a SINGLE synthetic 2-ecalli round-trip), this exercises the pattern a real S payload actually
+    runs -- repeated SBI calls in a loop with LIVE S-mode state that must survive every trap:
+      * r1 (loop counter), r2 (branch-zero) and r7 (the char) are the live S-state, written in S and
+        used/advanced ACROSS the round-trip. The M-handler WRITES only r3/r4/r5/r6 (r4 = the discarded
+        old-mepc from the csr_rw) and READS r7/r8 -- it never writes r1/r2/r7 -> proves S-register
+        preservation across S->M->S (an exact 'ABCDE' requires both r1 and r7 to survive every trap).
+      * the one handler is reached N times -> repeated skip-returns (and, in the CFG2[36] -jt
+        variant, that the eret-via-JT one-shot stays consumed across many erets).
+      * the handler does REAL work (UART MMIO putchar) when entered via the S-trap path.
+    The handler does NO ecalli@M, so nothing clobbers mepc/mstatus.MPP (gotcha #3): MPP stays S and
+    the mret returns to S directly. Output = the N sequential chars 'A','B',... ('ABCDE' for n=5);
+    a clobbered counter/char -> truncated/garbled string, a mis-landed skip-return -> hang/decoy.
+    HOST pre-sets mstatus.MPP=S (loader_priv.S, CFG2=0); the guest writes only mtvec/mepc (flush-free).
+
+    Layout is computed from instruction lengths (Lh/Ls < 128 -> 1-byte load_imm), then the forward
+    refs (Lh, Ls) and the backward branch offset are back-patched; alignment is asserted."""
+    def b1(rd, rs1):
+        return ((rs1 & 0xF) << 4) | (rd & 0xF)   # polkavm2: rd=LOW nibble, csr-src=HIGH
+    BRANCH_NE = 0xAB                              # 171: branch if rA!=rB; arg=(rB<<4)|rA, then LE off
+    mtvec = le(MTVEC, 2)
+    mepc  = le(MEPC, 2)
+    assert 1 <= n <= 26, "n in 1..26 (1-byte counter imm; 'A'+n-1 stays printable ASCII)"
+    instrs = [
+        # ---- M-prologue (priv M): arm the guest mtvec=Lh, mepc=Ls, hand off to S ----
+        [LOAD_IMM_64, R_BASE & 0x0F] + le(UART_THR, 8),  # r8 = UART base (the handler's putchar dst)
+        [LOAD_IMM, 0x01, 0x00],                          # r1 = Lh           (imm back-patched)
+        [CSR_RW, b1(2, 1)] + mtvec,                      # mtvec = Lh (guest M trap vector)
+        [LOAD_IMM, 0x01, 0x00],                          # r1 = Ls           (imm back-patched)
+        [CSR_RW, b1(2, 1)] + mepc,                       # mepc = Ls (S-entry, raw pc)
+        [MRET],                                          # mret -> S@Ls, priv->S
+        [TRAP],                                          # DECOY (handoff redirect fail -> exit)
+        # ---- S-mode payload (priv S) at Ls: the SBI-putchar loop ----
+        [LOAD_IMM, 0x02, 0x00],                          # r2 = 0 (branch zero reg)
+        [LOAD_IMM, 0x01, n & 0xFF, 0x00],                # r1 = n (4-byte load -> ecalli lands even)
+        [LOAD_IMM, R_CHAR & 0x0F, ord('A')],             # r7 = 'A' (first char)
+        [ECALLI, 0x00],                                  # Lloop: ecalli@S -> Lh; skip-return -> here+2
+        [ADD_IMM_32, (R_CHAR << 4) | R_CHAR, 0x01],      # r7 += 1 (next char) -- MUST survive the trap
+        [ADD_IMM_32, (1 << 4) | 1, 0xFF],                # r1 -= 1 (counter)   -- MUST survive the trap
+        [BRANCH_NE, b1(1, 2), 0x00],                     # branch_ne r1,r2,Lloop (off back-patched)
+        [TRAP],                                          # loop done -> host exit SUCCESS
+        # ---- guest M-handler (priv M) at Lh: putchar(r7) THEN skip-return ----
+        [STORE_IND_U8, ((R_BASE & 0xF) << 4) | (R_CHAR & 0xF)],              # [r8] = r7 (UART THR)
+        [LOAD_IND_U8, ((R_BASE & 0xF) << 4) | (R_SCR & 0xF), UART_LSR_OFF],  # serialize (LSR read)
+        [LOAD_IMM, 0x05, 0x00],                          # r5 = 0 (zero reg for csrr)
+        [CSR_RS, b1(3, 5)] + mepc,                       # r3 = mepc (= next_pc-4 via the -4 bias)
+        [ADD_IMM_32, (3 << 4) | 3, 0x04],                # r3 += 4 (== RISC-V `mepc += 4`)
+        [CSR_RW, b1(4, 3)] + mepc,                       # mepc = r3 (= next_pc)
+        [MRET],                                          # mret -> S@next_pc (MPP stays S; no clobber)
+    ]
+    starts, code = [], []
+    for ins in instrs:
+        starts.append(len(code)); code.extend(ins)
+    Ls    = starts[7]     # first S-payload instr (load_imm r2,0)
+    Lloop = starts[10]    # the ecalli@S
+    Lh    = starts[15]    # store_ind_u8 (handler entry)
+    code[starts[1] + 2] = Lh                  # M-prologue: r1 = Lh
+    # The M->S handoff mepc: a JT-encoded token (real-OpenSBI / CFG2[36]=1 config -> the entry mret
+    # is JT-mapped and CONSUMES the one-shot) or the raw S-entry pc (CFG2=0). The N skip-returns in
+    # the loop are ALWAYS direct (bit36 consumed) -- the -jt variant stress-tests that the one-shot
+    # stays consumed across MANY erets (run-handoff-skip only ever did ONE skip-return after handoff).
+    code[starts[3] + 2] = (idx + 1) * 2 if jt_handoff else Ls   # M-prologue: r1 = handoff target
+    code[starts[13] + 2] = (Lloop - starts[13]) & 0xFF   # backward branch offset (target-branch_start)
+    assert Lh % 4 == 0, f"Lh={Lh} must be 4-aligned (mtvec direct mode WARL)"
+    assert Ls % 2 == 0, f"Ls={Ls} must be 2-aligned (mepc WARL)"
+    assert (Lloop + 2) % 2 == 0, "skip-target (post-ecalli pc) must be 2-aligned (mepc WARL)"
+    if jt_handoff:
+        jumptable = [0] * idx + [Ls]          # JT[idx] = Ls (the JT-mapped M->S handoff target)
+        return code, starts, jumptable, z
+    return code, starts
+
+
 def build_image(code, starts, jumptable=None, z=1):
     """Pad code to align16, append the LSB-first opcode bitmask, then (optionally)
     the dynamic jump table (z bytes/entry, LE). Returns (img, code_len, bm_off, jt_off)."""
@@ -1060,6 +1136,11 @@ def main():
         code, starts, jumptable, z = emit_handoff_smode_dyn(int(text) if text.strip().isdigit() else 0)
     elif mode == "handoff_skip":
         code, starts, jumptable, z = emit_handoff_skip(int(text) if text.strip().isdigit() else 0)
+    elif mode == "smode_loop":
+        code, starts = emit_smode_loop(int(text) if text.strip().isdigit() else 5)
+    elif mode == "smode_loop_jt":
+        _idx, _z = _parse_idx_z(text)
+        code, starts, jumptable, z = emit_smode_loop(5, jt_handoff=True, idx=_idx, z=_z)
     elif mode == "priv":
         code, starts = emit_priv_test()
     elif mode == "priv_dyn":

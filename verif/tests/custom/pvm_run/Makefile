@@ -160,7 +160,7 @@ run-dram: loader_dramload.S link.ld
 PVM_GATES = run run-ecalli run-banner run-branch run-loop run-djump-halt run-djump-table \
             run-ibranch run-ldij run-csr run-hostcall run-dram run-dram-banner run-user run-user-dram \
             run-pvmvec run-mret run-handoff run-handoff-dram run-djump-dram run-handoff-smode \
-            run-handoff-smode-dram run-handoff-sdyn-dram run-priv run-priv-dyn run-priv-return run-strap-skip run-handoff-skip run-storeimm
+            run-handoff-smode-dram run-handoff-sdyn-dram run-priv run-priv-dyn run-priv-return run-strap-skip run-handoff-skip run-smode-loop run-smode-loop-jt run-storeimm
 run-all:
 	@pass=0; fail=0; failed=""; \
 	 for t in $(PVM_GATES); do \
@@ -409,6 +409,48 @@ run-handoff-skip: loader_handoff_smode.S link.ld gen_pvm_img.py
 	 EMIT=$$(echo "$$OUT" | grep -aoE '\[.\]' | head -1); echo "   guest emitted = $$EMIT (expect [#])"; \
 	 { [ "$$EMIT" = "[#]" ]; } && echo "   handoff-skip OK: CFG2[36] one-shot (JT handoff -> self-clear -> DIRECT skip-return)" || { echo "   *** handoff-skip FAILED (got '$$EMIT'; ''=skip-return JT-mangled -> one-shot broken, or -4 bias wrong) ***"; exit 1; }
 
+# Stage 3 (re-scoped): a REAL S-mode payload -- an S-mode LOOP making N SBI-putchar ecalli@S calls,
+# each round-tripping through ONE reusable guest M-handler (putchar via direct UART MMIO, like
+# OpenSBI's M-mode console, THEN the standard skip-return mepc+=4; mret). Unlike run-strap-skip /
+# run-handoff-skip (a SINGLE synthetic round-trip), it keeps LIVE S-state -- the loop counter (r1)
+# and the char (r7) -- across EVERY trap (the handler WRITES only r3/r4/r5/r6, READS r7/r8), so it proves
+# register preservation across S->M->S + repeated skip-returns + guest-M-handler MMIO via the S-trap
+# path. Expect the sequential string 'ABCDE' (n=5); a clobbered counter/char -> truncated/garbled
+# output, a mis-landed skip-return -> hang. HOST pre-sets MPP=S (loader_priv.S, CFG2=0).
+SMODE_LOOP_N ?= 5
+run-smode-loop: loader_priv.S link.ld gen_pvm_img.py
+	@CL=$$(python3 gen_pvm_img.py '$(SMODE_LOOP_N)' smloop.hex smode_loop | grep CODE_LEN | grep -oE '[0-9]+'); \
+	 echo ">> Stage 3: real S-mode payload, $(SMODE_LOOP_N) SBI-putchar round-trips in a loop (expect exactly the first $(SMODE_LOOP_N) letters):"; \
+	 $(CC) $(CFLAGS) -DCODE_LEN=$$CL -T link.ld -o loader_smode_loop.elf loader_priv.S; \
+	 OUT=$$($(HARNESS) +PVM_IMG=$(abspath smloop.hex) +tohost_addr=$(TOHOST) +time_out=300000 $(abspath loader_smode_loop.elf) 2>&1); \
+	 echo "$$OUT" | grep -aE 'SUCCESS'; \
+	 EXP=$$(python3 -c "import sys;n=int(sys.argv[1]);print(''.join(chr(65+i) for i in range(n)))" $(SMODE_LOOP_N)); \
+	 NX=$$(python3 -c "import sys;n=int(sys.argv[1]);print(''.join(chr(65+i) for i in range(n+1)))" $(SMODE_LOOP_N)); \
+	 FLAT=$$(echo "$$OUT" | tr -d '\r\n'); \
+	 EMIT=$$(echo "$$FLAT" | grep -aoF "$$EXP" | head -1); OVER=$$(echo "$$FLAT" | grep -aoF "$$NX" | head -1); \
+	 echo "   guest emitted = '$$EMIT' (expect exactly $$EXP, and NOT the over-run $$NX)"; \
+	 { [ "$$EMIT" = "$$EXP" ] && [ -z "$$OVER" ]; } && echo "   smode-loop OK: $(SMODE_LOOP_N) S->M->S round-trips, counter (r1) + char (r7) survived every trap" || { echo "   *** smode-loop FAILED (EMIT='$$EMIT' OVER='$$OVER'; ''/short=counter|char clobbered or skip-return mis-land; over-run=counter clobbered LONGER) ***"; exit 1; }
+
+# Stage 3 (real-OpenSBI config): the SAME real S-mode loop as run-smode-loop, but the M->S handoff
+# is JT-mapped under a STICKY CFG2[36]=1 (loader_handoff_smode.S, exactly like loader_opensbi.S). The
+# eret-via-JT one-shot must consume CFG2[36] on the handoff mret so all N subsequent skip-return mrets
+# are DIRECT. run-handoff-skip proved ONE skip-return after the handoff; this proves the one-shot
+# stays consumed across N (=5) erets in a loop. Expect 'ABCDE'; ''/truncated = a later skip-return
+# got JT-mangled (one-shot re-armed) or S-state was clobbered.
+run-smode-loop-jt: loader_handoff_smode.S link.ld gen_pvm_img.py
+	@G=$$(python3 gen_pvm_img.py '0' smloopjt.hex smode_loop_jt); \
+	 CL=$$(echo "$$G" | grep CODE_LEN | grep -oE '[0-9]+'); \
+	 JB=$$(echo "$$G" | grep JT_BASE  | grep -oE '[0-9]+'); \
+	 JZ=$$(echo "$$G" | grep JT_Z     | grep -oE '[0-9]+'); \
+	 echo ">> Stage 3 (real-OpenSBI CFG2[36]): JT-mapped handoff -> one-shot self-clear -> 5 DIRECT skip-returns in a loop (expect exactly ABCDE); n is pinned at 5 in the generator:"; \
+	 $(CC) $(CFLAGS) -DCODE_LEN=$$CL -DJT_BASE=$$JB -DJT_Z=$$JZ -T link.ld -o loader_smode_loop_jt.elf loader_handoff_smode.S; \
+	 OUT=$$($(HARNESS) +PVM_IMG=$(abspath smloopjt.hex) +tohost_addr=$(TOHOST) +time_out=300000 $(abspath loader_smode_loop_jt.elf) 2>&1); \
+	 echo "$$OUT" | grep -aE 'SUCCESS'; \
+	 FLAT=$$(echo "$$OUT" | tr -d '\r\n'); \
+	 EMIT=$$(echo "$$FLAT" | grep -aoF 'ABCDE' | head -1); OVER=$$(echo "$$FLAT" | grep -aoF 'ABCDEF' | head -1); \
+	 echo "   guest emitted = '$$EMIT' (expect exactly ABCDE, and NOT the over-run ABCDEF)"; \
+	 { [ "$$EMIT" = "ABCDE" ] && [ -z "$$OVER" ]; } && echo "   smode-loop-jt OK: CFG2[36] one-shot held across 5 erets; counter+char survived" || { echo "   *** smode-loop-jt FAILED (EMIT='$$EMIT' OVER='$$OVER'; a post-handoff skip-return JT-mangled, or S-state clobbered) ***"; exit 1; }
+
 # store_imm RTL bug gate: a PVM store_imm of a >16-bit immediate (low 16 bits ZERO, e.g.
 # 0x230000) to a NON-ZERO offset must store the FULL value, not just the low 16 bits.
 # Mirrors polkatool folding `li a5,0x10000; sd a5,off(base)` into store_imm_u64. The guest
@@ -465,4 +507,4 @@ run-opensbi: loader_opensbi.S link_opensbi.ld opensbi_to_dram.py $(OPENSBI_DTS)
 clean:
 	rm -f loader.elf loader_jump.elf loader_banner.elf loader_ecalli.elf loader_br.elf loader_loop.elf loader_djhalt.elf loader_djtab.elf loader_ibr.elf loader_ldij.elf loader_csr.elf loader_hostcall.elf loader_dramload.elf loader_drambanner.elf loader_hi.elf baseline.elf banner.hex ecalli.hex hi_banner.hex br_taken.hex br_nottaken.hex loop.hex djhalt.hex djtab.hex ibr_t.hex ibr_nt.hex ldij.hex csr.hex hostcall.hex loader_opensbi.elf opensbi.code.bin opensbi.jt.bin opensbi.ro.bin opensbi.rw.bin
 
-.PHONY: all run run-jump run-banner run-ecalli run-branch run-loop run-djump-halt run-djump-table run-ibranch run-ldij run-csr run-hostcall run-dram run-dram-banner run-user run-user-dram run-pvmvec run-mret run-handoff run-handoff-dram run-djump-dram run-handoff-smode run-handoff-smode-dram run-priv run-priv-dyn run-priv-return run-strap-skip run-handoff-skip run-storeimm run-opensbi run-all clean
+.PHONY: all run run-jump run-banner run-ecalli run-branch run-loop run-djump-halt run-djump-table run-ibranch run-ldij run-csr run-hostcall run-dram run-dram-banner run-user run-user-dram run-pvmvec run-mret run-handoff run-handoff-dram run-djump-dram run-handoff-smode run-handoff-smode-dram run-priv run-priv-dyn run-priv-return run-strap-skip run-handoff-skip run-smode-loop run-smode-loop-jt run-storeimm run-opensbi run-all clean
