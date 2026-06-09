@@ -74,6 +74,8 @@ module pvm_front
     // guest-internal trap (ecalli@priv<M committed): stay in PVM, redirect to the guest tvec
     input  logic            trap_redirect_i, // backend committed a stay-in-PVM trap (1-cycle pulse)
     input  logic [VLEN-1:0] trap_pc_i,       // committed guest mtvec/stvec as a PVM instruction-counter
+    input  logic            trap_via_jt_i,   // trap-via-JT: this committed trap's mtvec/stvec is a JT-encoded
+                                             // code address (a JT token), NOT a PVM-pc -> map it via the JT
     // CSR fence (B5): a flush-class CSR write (mstatus/sstatus/satp/mstatush) commit-flushed
     input  logic            csr_fence_resolved_i, // the flush-class CSR write committed (1-cycle pulse)
     // store_imm serialization: the store_imm macro's store has committed/drained (no store pending)
@@ -290,8 +292,18 @@ module pvm_front
         djump_a_q    <= eret_pc_i;
         djump_halt_q <= 1'b0;
         jt_req_q     <= 1'b1;
+      end else if (trap_via_jt_i && !jt_req_q && !jt_valid_q) begin
+        // trap-via-JT (EXACT mirror of the eret_via_jt_i arm): a committed guest-internal trap
+        // whose mtvec/stvec is a JT-encoded code address. Map it through the SAME jump-table read
+        // as a djump/eret (JE = base+((a>>1)-1)*z), never a halt. pvm_fetch enters djump_pending
+        // this same cycle (its trap_redirect arm), so from the NEXT cycle f_djump_pending=1 keeps
+        // the JT FSM alive; the trap_via_jt_i guard below covers THIS cycle (djump_pending not yet
+        // visible), so the reset never clears the jt_req we just set.
+        djump_a_q    <= trap_pc_i;
+        djump_halt_q <= 1'b0;
+        jt_req_q     <= 1'b1;
       end
-      if (!f_djump_pending && !eret_via_jt_i) begin jt_valid_q <= 1'b0; jt_req_q <= 1'b0; end
+      if (!f_djump_pending && !eret_via_jt_i && !trap_via_jt_i) begin jt_valid_q <= 1'b0; jt_req_q <= 1'b0; end
 
       if (!fetch_from_dram_i) begin                      // ===== legacy BRAM fetch =====
       case (fsm_step_q)
@@ -410,6 +422,7 @@ module pvm_front
       .eret_via_jt_i (eret_via_jt_i),
       .trap_redirect_i(trap_redirect_i),  // guest-internal trap: redirect to guest tvec, stay in PVM
       .trap_pc_i     (trap_pc_i),
+      .trap_via_jt_i (trap_via_jt_i),     // trap-via-JT: map the trap target (mtvec) through the JT
       .csr_fence_i        (f_is_csr_fence),       // flush-class CSR write: advance pc, suspend (B5)
       .csr_fence_resolved_i(csr_fence_resolved_i),// resume on the CSR write's commit flush
       .store_imm_i        (f_is_store_imm),       // store_imm macro: advance pc, suspend until drain

@@ -102,8 +102,9 @@ _start:
     li   t1, JT_Z
     slli t1, t1, 32
     or   t0, t0, t1
-    li   t1, (1 << 36)                  # Stage 1: CFG2[36] = eret-via-jt. The M->S handoff mret maps
-    or   t0, t0, t1                     # mepc through the jump table (a JT-encoded code address, not a
+    li   t1, (3 << 36)                  # CFG2[36]=eret-via-jt (Stage 1) + CFG2[37]=trap-via-jt (B7): the
+    or   t0, t0, t1                     # M->S handoff mret AND the guest trap-vector (mtvec=lla _trap_handler,
+                                        # a JT token) both map through the jump table (JT-encoded code addrs,
                                         # PVM-pc). Sticky: the cold-boot path has NO eret before the
                                         # handoff (hardcoded features skip the CSR trap-probe), so only
                                         # the handoff eret is affected.

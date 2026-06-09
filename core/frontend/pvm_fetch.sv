@@ -71,6 +71,8 @@ module pvm_fetch
     // commit pulse it redirects to the guest trap vector (no host involvement).
     input  logic            trap_redirect_i,  // backend committed a stay-in-PVM trap (1-cycle pulse)
     input  logic [VLEN-1:0] trap_pc_i,        // committed guest mtvec/stvec as a PVM instruction-counter
+    input  logic            trap_via_jt_i,    // trap-via-JT: this committed trap's mtvec/stvec is a JT-encoded
+                                              // code address (a JT token), NOT a PVM-pc -> map it via the JT
     // CSR fence (B5): a guest write to a flush-class CSR (mstatus/sstatus/satp/mstatush) raises
     // flush_o in csr_regfile, which would discard the YOUNGER in-flight PVM uop (e.g. a following
     // mret). The CSR write DOES execute, so -- like halt_i -- we advance pc to next_pc and suspend;
@@ -233,12 +235,21 @@ module pvm_fetch
       // (running_q=0, post-ecalli pc held). The backend delivered the trap to the guest
       // mtvec/stvec and STAYED in PVM; redirect fetch there and resume. Exclusive with
       // start_i (a stay-trap involves no host resume) and the branch/djump/eret arms.
-      pc_q             <= trap_pc_i;
-      running_q        <= 1'b1;
       branch_pending_q <= 1'b0;
-      djump_pending_q  <= 1'b0;
       eret_pending_q   <= 1'b0;
       phase_q          <= 1'b0;
+      if (trap_via_jt_i) begin
+        // trap-via-JT (EXACT mirror of the eret_pending_q -> eret_via_jt branch): mtvec/stvec holds
+        // a JT-encoded code address (a JT token), not a PVM-pc. Route it through the jump table like
+        // a djump/eret: enter djump_pending and wait for the JT read (pvm_front captures djump_a =
+        // trap_pc_i on trap_via_jt_i this same cycle), then the djump_pending arm sets pc_q <=
+        // djump_target_i. Stay suspended (running_q stays 0) meanwhile.
+        djump_pending_q  <= 1'b1;
+      end else begin
+        pc_q             <= trap_pc_i;   // default: mtvec/stvec is already a raw PVM-pc (unchanged)
+        running_q        <= 1'b1;
+        djump_pending_q  <= 1'b0;
+      end
     end else if (running_q && next_ready_i && window_valid_i) begin
       // Macro-expansion phase 0 (imm-branch): the load-scratch uop just issued; stay
       // at this pc and present phase 1 (the branch) next cycle.

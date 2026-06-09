@@ -318,6 +318,7 @@ MSCRATCH = 0x340  # an M-mode CSR unused by the loader -> safe to clobber from P
 MTVEC    = 0x305  # M-mode trap vector: the guest clobbers it to prove the B4 PVM-exit decouple
 MEPC     = 0x341  # M-mode exception PC: mret redirects PVM fetch here (writing it sets no flush)
 MSTATUS  = 0x300  # M-mode status (MPP etc.); written by the HOST loader, not the guest (flush)
+MCAUSE   = 0x342  # M-mode trap cause; an ecalli@S presents ENV_CALL_SMODE(9) (cva6.sv:772-775)
 
 
 def emit_csr_test():
@@ -951,6 +952,109 @@ def emit_handoff_skip(idx=0, z=1):
     return code, starts, jumptable, z
 
 
+def emit_trap_jt(idx=0, z=1):
+    """trap-via-JT gate (the EXACT mirror of emit_handoff_smode, which exercises eret-via-JT/CFG2[36]).
+    Real OpenSBI sets mtvec via `lla _trap_handler; csrw mtvec`; in PVM `lla` yields a jump-table
+    TOKEN, NOT a raw PVM-pc, so a guest-internal ecalli@S would trap to the raw token (garbage). With
+    CSR_PVM_CFG2[37]=1 the guest-trap redirect maps mtvec (a JT token) THROUGH the jump table -> the
+    ecalli@S reaches JT[idx]=the real M-handler PVM-pc.
+
+    Here the guest sets mtvec = a JT-ENCODED token ((idx+1)*2, NOT Lh) and mepc = Ls (a RAW S-entry
+    PVM-pc), then mret. The entry mret is a NORMAL raw-pc eret (the loader leaves CFG2[36]=0), so it
+    lands at Ls directly and drops to S (host pre-set MPP=S). At Ls a guest-internal ecalli@S stays in
+    PVM and traps to the guest mtvec=token; the trap-via-JT maps token -> JT[idx]=Lh (the in-image M
+    handler), which putchars '#'. Prints framed '[#]' iff the trap target was JT-mapped to Lh.
+    With CFG2[37]=0 (the negative control) the token is used RAW -> PVM-pc 2 (mid-instruction) -> no '#'.
+    Lh=16 (4-aligned, mtvec target after the JT map), Ls=22 (2-aligned, mepc). Body mirrors
+    emit_handoff_smode with the mtvec/mepc roles swapped (token in mtvec, raw Ls in mepc)."""
+    def b1(rd, rs1):
+        return ((rs1 & 0xF) << 4) | (rd & 0xF)   # polkavm2: rd=LOW nibble, csr-src=HIGH
+    mtvec  = le(MTVEC, 2)
+    mepc   = le(MEPC, 2)
+    token  = (idx + 1) * 2                        # JT-encoded mtvec (PolkaVM jump token), NOT Lh
+    assert 0 <= token <= 127, f"token {token} needs a multi-byte load_imm (use idx<=62)"
+    Lh = 16                                       # M-mode guest trap handler PVM-pc (4-aligned) = JT[idx]
+    Ls = 22                                       # S-mode entry PVM-pc (2-aligned, raw mepc)
+    code = (
+        [LOAD_IMM, 0x01, token]                   # r1 = (idx+1)*2 (JT token for mtvec) @0  (3B)
+        + [CSR_RW, b1(2, 1)] + mtvec              # mtvec = token (JT-encoded tvec)     @3  (4B)
+        + [LOAD_IMM, 0x01, Ls]                    # r1 = Ls (raw S-entry PVM-pc)        @7  (3B)
+        + [CSR_RW, b1(2, 1)] + mepc               # mepc = Ls                           @10 (4B)
+        + [MRET]                                  # mret -> Ls (raw eret), priv->S      @14 (1B)
+        + [TRAP]                                  # DECOY (mret-redirect fail -> exit)  @15 (1B)
+        + [LOAD_IMM, 0x07, ord('#')]              # Lh: r7 = '#' (4-aligned=16)         @16 (3B)
+        + [ECALLI, 0x00]                          # ecalli@M -> host putchar '#'        @19 (2B)
+        + [TRAP]                                  # trap -> exit SUCCESS                @21 (1B)
+        + [ECALLI, 0x00]                          # Ls(22): ecalli@S -> guest-trap (JT-map mtvec->Lh) @22 (2B)
+        + [TRAP]                                  # safety exit                         @24 (1B)
+    )
+    starts = [0, 3, 7, 10, 14, 15, 16, 19, 21, 22, 24]
+    jumptable = [0] * idx + [Lh]                  # JT[idx] = the M-handler PVM-pc (16)
+    assert Lh == 16 and Ls == 22 and len(code) == 25
+    assert Lh % 4 == 0 and Ls % 2 == 0            # RISC-V WARL: mtvec(->Lh) 4-aligned, mepc 2-aligned
+    return code, starts, jumptable, z
+
+
+def emit_handoff_trap_jt(idx_e=0, idx_t=2, z=1):
+    """COMBINED eret-via-JT (CFG2[36]) + trap-via-JT (CFG2[37]) -- the UNTESTED real-OpenSBI SEQUENCE.
+
+    This is the exact composition run-handoff-smode-dram (CFG2[36] only) and run-trap-jt-dram
+    (CFG2[37] only, RAW M->S entry) each covered HALF of, but which neither exercised together:
+      1. The M->S handoff is a JT-MAPPED eret (CFG2[36]=1): mepc = a JT token, mret -> JT[idx_e]=Ls,
+         priv->S, and the eret-via-JT one-shot CONSUMES CFG2[36] (-> 0). [exactly emit_handoff_smode]
+      2. THEN, in S-mode, an ecalli@S whose guest mtvec is a DIFFERENT JT token must trap-via-JT
+         (CFG2[37]=1, still set): the guest-trap redirect JT-maps mtvec -> JT[idx_t]=Lh -> host '[#]'.
+         [exactly emit_trap_jt's S-side]
+    The real OpenSBI launcher sets BOTH bits (`li t1,(3<<36)`, loader_opensbi.S); the handoff
+    consumes [36] while [37] stays 1. So the SECOND JT-map (the trap) runs with the SAME JT-FSM
+    state (djump_a_q/jt_req_q/jt_valid_q/djump_pending/d_state_q) left behind by the FIRST (the
+    consumed eret) -- the precise interaction run-trap-jt-dram (raw entry, CFG2[36]=0) skipped.
+
+    The guest mtvec is a JT TOKEN (token_t), NOT a raw Lh, so reaching Lh proves the trap-via-JT
+    JT-mapped (not a raw-mtvec accident). idx_t != idx_e (and idx_t > idx_e) so the trap's JT read
+    is a SEPARATE jump-table entry from the eret's -> a distinct cold-miss line on the DRAM path.
+      @M  mtvec=token_t (JT) ; mepc=token_e (JT) ; mret  -> JT[idx_e]=Ls, priv->S, CONSUME CFG2[36]
+      @15 trap                                            (DECOY: handoff redirect fail -> exit)
+      @Lh(16,M): r7='#' ; ecalli@M (host '#') ; trap      (reached only via the trap-via-JT JT-map)
+      @Ls(22,S): ecalli@S -> guest-trap, mtvec=token_t JT-mapped (CFG2[37]) -> JT[idx_t]=Lh
+    Prints framed '[#]' iff BOTH JT-maps fired in sequence; 'S'... no -- there is no 'S' decoy here:
+    a failed trap-via-JT (token used raw -> mid-instruction pc) yields garbage/no '#'. Layout is
+    byte-identical to emit_handoff_smode (Lh=16,Ls=22,len=25); only mtvec's value (token_t vs Lh)
+    and the jump table (two live entries) differ -- so CFG2[37]=0 reuses this same image as a
+    negative control (token_t raw -> no '#'), exactly like run-trap-jt[-dram]."""
+    def b1(rd, rs1):
+        return ((rs1 & 0xF) << 4) | (rd & 0xF)   # polkavm2: rd=LOW nibble, csr-src=HIGH
+    mtvec   = le(MTVEC, 2)
+    mepc    = le(MEPC, 2)
+    token_e = (idx_e + 1) * 2                      # eret-via-JT token (mepc) -> JT[idx_e]=Ls
+    token_t = (idx_t + 1) * 2                      # trap-via-JT token (mtvec) -> JT[idx_t]=Lh
+    assert 0 <= token_e <= 127 and 0 <= token_t <= 127, "tokens need a 1-byte load_imm (idx<=62)"
+    assert idx_t != idx_e, "the trap and eret JT entries must differ (separate cold-miss lines)"
+    Lh = 16                                        # M-mode guest trap handler PVM-pc (4-aligned) = JT[idx_t]
+    Ls = 22                                        # S-mode entry PVM-pc (2-aligned) = JT[idx_e]
+    code = (
+        [LOAD_IMM, 0x01, token_t]                  # r1 = token_t (JT token for mtvec)   @0  (3B)
+        + [CSR_RW, b1(2, 1)] + mtvec               # mtvec = token_t (JT-encoded tvec)   @3  (4B)
+        + [LOAD_IMM, 0x01, token_e]                # r1 = token_e (JT token for mepc)    @7  (3B)
+        + [CSR_RW, b1(2, 1)] + mepc                # mepc = token_e                      @10 (4B)
+        + [MRET]                                   # mret JT-map -> JT[idx_e]=Ls, priv->S, CONSUME @14 (1B)
+        + [TRAP]                                   # DECOY (handoff redirect fail -> exit)@15 (1B)
+        + [LOAD_IMM, 0x07, ord('#')]               # Lh: r7 = '#' (4-aligned=16)         @16 (3B)
+        + [ECALLI, 0x00]                           # ecalli@M -> host putchar '#'        @19 (2B)
+        + [TRAP]                                   # trap -> exit SUCCESS                @21 (1B)
+        + [ECALLI, 0x00]                           # Ls(22): ecalli@S -> guest-trap (JT-map mtvec->Lh) @22 (2B)
+        + [TRAP]                                   # safety exit                         @24 (1B)
+    )
+    starts = [0, 3, 7, 10, 14, 15, 16, 19, 21, 22, 24]
+    nj = max(idx_e, idx_t) + 1
+    jumptable = [0] * nj
+    jumptable[idx_e] = Ls                          # JT[idx_e] = S-entry  (eret-via-JT target)
+    jumptable[idx_t] = Lh                          # JT[idx_t] = M-handler (trap-via-JT target)
+    assert Lh == 16 and Ls == 22 and len(code) == 25
+    assert Lh % 4 == 0 and Ls % 2 == 0             # RISC-V WARL: mtvec(->Lh) 4-aligned, mepc 2-aligned
+    return code, starts, jumptable, z
+
+
 def emit_smode_loop(n=5, jt_handoff=False, idx=0, z=1):
     """Stage 3 (re-scoped): a REAL S-mode payload -- an S-mode LOOP making N SBI-putchar
     ecalli@S calls, each round-tripping through ONE reusable guest M-handler that does the
@@ -1024,6 +1128,71 @@ def emit_smode_loop(n=5, jt_handoff=False, idx=0, z=1):
     if jt_handoff:
         jumptable = [0] * idx + [Ls]          # JT[idx] = Ls (the JT-mapped M->S handoff target)
         return code, starts, jumptable, z
+    return code, starts
+
+
+def emit_smode_sbi(n=5):
+    """B7 Phase-A: prove the REAL OpenSBI SBI-dispatch HW path with a fast synthetic proxy. Same
+    S-mode loop as emit_smode_loop, but the guest M-handler does OpenSBI-style CAUSE DISPATCH before
+    servicing: it reads mcause and services (putchar + skip-return) ONLY if mcause==ENV_CALL_SMODE(9),
+    else it falls to a DECOY trap (host-exit, no output). This empirically confirms that an ecalli@S
+    presents mcause=ENV_CALL_SMODE to the guest mtvec handler (cva6.sv:772-775) -- exactly what
+    OpenSBI's real sbi_trap_handler keys on to route a supervisor ecall to sbi_ecall. A pass ('ABCDE')
+    means the HW cause is correct AND the dispatch-on-cause pattern works on real silicon, so the real
+    OpenSBI SBI round-trip is HW-validated WITHOUT the ~30-min full-OpenSBI rebuild/run. If the cause
+    were wrong, every iteration would hit the decoy -> NO output. Live S-state r1/r2/r7 survives; the
+    handler writes r3/r4/r5/r6, reads r7/r8. HOST pre-sets MPP=S (loader_priv.S, CFG2=0)."""
+    def b1(rd, rs1):
+        return ((rs1 & 0xF) << 4) | (rd & 0xF)
+    BRANCH_NE = 0xAB
+    mtvec  = le(MTVEC, 2)
+    mepc   = le(MEPC, 2)
+    mcause = le(MCAUSE, 2)
+    assert 1 <= n <= 26, "n in 1..26 (1-byte counter imm; 'A'+n-1 stays printable ASCII)"
+    instrs = [
+        # ---- M-prologue (priv M): arm guest mtvec=Lh, mepc=Ls, hand off to S ----
+        [LOAD_IMM_64, R_BASE & 0x0F] + le(UART_THR, 8),  # r8 = UART base
+        [LOAD_IMM, 0x01, 0x00],                          # r1 = Lh        (back-patched)
+        [CSR_RW, b1(2, 1)] + mtvec,                      # mtvec = Lh
+        [LOAD_IMM, 0x01, 0x00],                          # r1 = Ls        (back-patched)
+        [CSR_RW, b1(2, 1)] + mepc,                       # mepc = Ls
+        [MRET],                                          # mret -> S@Ls, priv->S
+        [TRAP],                                          # DECOY (handoff fail)
+        # ---- S-mode payload (priv S): the SBI-putchar loop ----
+        [LOAD_IMM, 0x02, 0x00],                          # r2 = 0 (branch zero)
+        [LOAD_IMM, 0x01, n & 0xFF, 0x00],                # r1 = n (4B -> ecalli even)
+        [LOAD_IMM, R_CHAR & 0x0F, ord('A')],             # r7 = 'A'
+        [ECALLI, 0x00],                                  # Lloop: ecalli@S -> Lh (SBI call)
+        [ADD_IMM_32, (R_CHAR << 4) | R_CHAR, 0x01],      # r7 += 1
+        [ADD_IMM_32, (1 << 4) | 1, 0xFF],                # r1 -= 1
+        [BRANCH_NE, b1(1, 2), 0x00],                     # branch_ne r1,r2,Lloop (off patched)
+        [TRAP],                                          # loop done -> host exit SUCCESS
+        # ---- guest M-handler (priv M) at Lh: OpenSBI-style cause dispatch, then service ----
+        [LOAD_IMM, 0x05, 0x00],                          # r5 = 0 (zero source for csrr)
+        [CSR_RS, b1(4, 5)] + mcause,                     # r4 = mcause (expect ENV_CALL_SMODE=9)
+        [LOAD_IMM, 0x03, 0x09],                          # r3 = 9 (ENV_CALL_SMODE)
+        [BRANCH_NE, b1(4, 3), 0x00],                     # if mcause != 9 -> Ldecoy (off patched)
+        [STORE_IND_U8, ((R_BASE & 0xF) << 4) | (R_CHAR & 0xF)],              # [r8]=r7 (serviced putchar)
+        [LOAD_IND_U8, ((R_BASE & 0xF) << 4) | (R_SCR & 0xF), UART_LSR_OFF],  # serialize
+        [CSR_RS, b1(3, 5)] + mepc,                       # r3 = mepc (= next_pc-4)
+        [ADD_IMM_32, (3 << 4) | 3, 0x04],                # r3 += 4 (RISC-V mepc += 4)
+        [CSR_RW, b1(4, 3)] + mepc,                        # mepc = r3 (= next_pc)
+        [MRET],                                          # mret -> S@next_pc (MPP stays S)
+        [TRAP],                                          # Ldecoy: mcause wasn't 9 -> host exit, no output
+    ]
+    starts, code = [], []
+    for ins in instrs:
+        starts.append(len(code)); code.extend(ins)
+    Ls    = starts[7]
+    Lloop = starts[10]
+    Lh    = starts[15]
+    Ldecoy = starts[25]                       # the trailing trap (cause-mismatch landing)
+    code[starts[1] + 2] = Lh                  # M-prologue: r1 = Lh
+    code[starts[3] + 2] = Ls                  # M-prologue: r1 = Ls
+    code[starts[13] + 2] = (Lloop - starts[13]) & 0xFF      # loop backward branch
+    code[starts[18] + 2] = (Ldecoy - starts[18]) & 0xFF     # handler forward decoy branch (mcause!=9)
+    assert Lh % 4 == 0 and Ls % 2 == 0 and (Lloop + 2) % 2 == 0
+    assert Ldecoy > starts[18], "decoy must be forward of its branch"
     return code, starts
 
 
@@ -1136,11 +1305,20 @@ def main():
         code, starts, jumptable, z = emit_handoff_smode_dyn(int(text) if text.strip().isdigit() else 0)
     elif mode == "handoff_skip":
         code, starts, jumptable, z = emit_handoff_skip(int(text) if text.strip().isdigit() else 0)
+    elif mode == "trap_jt":
+        code, starts, jumptable, z = emit_trap_jt(int(text) if text.strip().isdigit() else 0)
+    elif mode == "handoff_trap_jt":
+        # text = "idx_e" or "idx_e,z": the eret JT index (idx_e), optional entry size z (real
+        # OpenSBI emit-image uses z=3). The trap JT index is idx_e+2 (a distinct cold-miss line).
+        _ie, _z = _parse_idx_z(text)
+        code, starts, jumptable, z = emit_handoff_trap_jt(_ie, _ie + 2, _z)
     elif mode == "smode_loop":
         code, starts = emit_smode_loop(int(text) if text.strip().isdigit() else 5)
     elif mode == "smode_loop_jt":
         _idx, _z = _parse_idx_z(text)
         code, starts, jumptable, z = emit_smode_loop(5, jt_handoff=True, idx=_idx, z=_z)
+    elif mode == "smode_sbi":
+        code, starts = emit_smode_sbi(int(text) if text.strip().isdigit() else 5)
     elif mode == "priv":
         code, starts = emit_priv_test()
     elif mode == "priv_dyn":

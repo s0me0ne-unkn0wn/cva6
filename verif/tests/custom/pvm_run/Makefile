@@ -160,7 +160,7 @@ run-dram: loader_dramload.S link.ld
 PVM_GATES = run run-ecalli run-banner run-branch run-loop run-djump-halt run-djump-table \
             run-ibranch run-ldij run-csr run-hostcall run-dram run-dram-banner run-user run-user-dram \
             run-pvmvec run-mret run-handoff run-handoff-dram run-djump-dram run-handoff-smode \
-            run-handoff-smode-dram run-handoff-sdyn-dram run-priv run-priv-dyn run-priv-return run-strap-skip run-handoff-skip run-smode-loop run-smode-loop-jt run-storeimm
+            run-handoff-smode-dram run-handoff-sdyn-dram run-priv run-priv-dyn run-priv-return run-strap-skip run-handoff-skip run-trap-jt run-trap-jt-dram run-handoff-trap-jt-dram run-smode-loop run-smode-loop-jt run-smode-sbi run-storeimm
 run-all:
 	@pass=0; fail=0; failed=""; \
 	 for t in $(PVM_GATES); do \
@@ -409,6 +409,92 @@ run-handoff-skip: loader_handoff_smode.S link.ld gen_pvm_img.py
 	 EMIT=$$(echo "$$OUT" | grep -aoE '\[.\]' | head -1); echo "   guest emitted = $$EMIT (expect [#])"; \
 	 { [ "$$EMIT" = "[#]" ]; } && echo "   handoff-skip OK: CFG2[36] one-shot (JT handoff -> self-clear -> DIRECT skip-return)" || { echo "   *** handoff-skip FAILED (got '$$EMIT'; ''=skip-return JT-mangled -> one-shot broken, or -4 bias wrong) ***"; exit 1; }
 
+# trap-via-JT (CSR_PVM_CFG2[37]): the EXACT mirror of run-handoff (eret-via-JT/CFG2[36]) for the TRAP
+# vector. Real OpenSBI sets mtvec via `lla _trap_handler; csrw mtvec`; in PVM `lla` yields a jump-table
+# TOKEN, so a guest-internal ecalli@S would trap to the raw token (garbage). With CFG2[37]=1 the
+# guest-trap redirect maps mtvec (a JT token) THROUGH the jump table -> JT[idx]=the M-handler PVM-pc.
+# Guest (emit_trap_jt): host pre-sets MPP=S; a NORMAL raw-pc entry mret (CFG2[36]=0) drops M->S at Ls;
+# at Ls an ecalli@S traps to mtvec=token, JT-mapped -> JT[0]=Lh -> host putchars '[#]'. The POSITIVE
+# build sets CFG2[37]=1 (-DCFG2_TRAP_JT) -> expect '[#]'. The NEGATIVE control clears it (-UCFG2_TRAP_JT)
+# -> the token is used RAW -> a mid-instruction pc -> NO '[#]' (proves the gate discriminates: '[#]' can
+# come ONLY via the JT map). Reuses loader_trap_jt.S (CFG2[37] gated by the define).
+run-trap-jt: loader_trap_jt.S link.ld gen_pvm_img.py
+	@G=$$(python3 gen_pvm_img.py '0' trapjt.hex trap_jt); \
+	 CL=$$(echo "$$G" | grep CODE_LEN | grep -oE '[0-9]+'); \
+	 JB=$$(echo "$$G" | grep JT_BASE  | grep -oE '[0-9]+'); \
+	 JZ=$$(echo "$$G" | grep JT_Z     | grep -oE '[0-9]+'); \
+	 echo ">> trap-via-JT (CFG2[37]): ecalli@S traps to a JT-token mtvec, JT-mapped to the handler (CODE_LEN=$$CL JT_BASE=$$JB JT_Z=$$JZ; expect '[#]'):"; \
+	 $(CC) $(CFLAGS) -DCFG2_TRAP_JT -DCODE_LEN=$$CL -DJT_BASE=$$JB -DJT_Z=$$JZ -T link.ld -o loader_trap_jt.elf loader_trap_jt.S; \
+	 OUT=$$($(HARNESS) +PVM_IMG=$(abspath trapjt.hex) +tohost_addr=$(TOHOST) +time_out=300000 $(abspath loader_trap_jt.elf) 2>&1); \
+	 echo "$$OUT" | grep -aE 'SUCCESS'; \
+	 EMIT=$$(echo "$$OUT" | grep -aoE '\[.\]' | head -1); echo "   guest emitted (CFG2[37]=1) = $$EMIT (expect [#])"; \
+	 echo "   -- negative control (CFG2[37]=0): the JT-token mtvec is used RAW -> expect NO [#] --"; \
+	 $(CC) $(CFLAGS) -UCFG2_TRAP_JT -DCODE_LEN=$$CL -DJT_BASE=$$JB -DJT_Z=$$JZ -T link.ld -o loader_trap_jt_neg.elf loader_trap_jt.S; \
+	 OUTN=$$($(HARNESS) +PVM_IMG=$(abspath trapjt.hex) +tohost_addr=$(TOHOST) +time_out=300000 $(abspath loader_trap_jt_neg.elf) 2>&1); \
+	 EMITN=$$(echo "$$OUTN" | grep -aoE '\[.\]' | head -1); echo "   negative-control emitted (CFG2[37]=0) = '$$EMITN' (expect NOT [#])"; \
+	 { [ "$$EMIT" = "[#]" ] && [ "$$EMITN" != "[#]" ]; } && echo "   trap-jt OK: CFG2[37] JT-maps the trap vector (pos=[#]); raw-mtvec control did NOT reach the handler" || { echo "   *** trap-jt FAILED (pos='$$EMIT' expect [#]; neg='$$EMITN' must NOT be [#]) ***"; exit 1; }
+
+# trap-via-JT DRAM-path reproducer (the FPGA/OpenSBI fetch path) -- the EXACT mirror of
+# run-handoff-smode-dram (which tests eret-via-JT/CFG2[36] on the DRAM demand-fetch path) but for
+# the TRAP vector (CFG2[37]). The SAME trap-via-JT scenario as run-trap-jt, but the image is
+# demand-fetched from DRAM (CFG1[34]) via the dcache, NOT preloaded into img_bram (+PVM_IMG). The
+# BRAM run-trap-jt passes; this exercises the trap-via-jt x DRAM-demand-fetch M3 FSM interaction
+# (the FPGA-only failure where the ecalli@S trap never reaches the JT-mapped handler). IDX>0 places
+# the live JT entry far from the code/bitmask lines so the trap's JT read is a COLD cache MISS (the
+# D_WAIT path) -- the FPGA condition (idx=0 hot-line reads do NOT reproduce it). The POSITIVE build
+# sets CFG2[37]=1 (-DCFG2_TRAP_JT) -> expect '[#]'. The NEGATIVE control clears it -> the token is
+# used RAW -> a mid-instruction pc -> NO '[#]'. Reuses loader_trap_jt_dram.S (CFG2[37] gated).
+run-trap-jt-dram: loader_trap_jt_dram.S link.ld gen_pvm_img.py
+	@G=$$(python3 gen_pvm_img.py '$(IDX)' trapjt_dram.hex trap_jt trap_jt_blob); \
+	 CL=$$(echo "$$G" | grep CODE_LEN | grep -oE '[0-9]+'); \
+	 JO=$$(echo "$$G" | grep JT_OFF  | grep -oE '[0-9]+'); \
+	 JZ=$$(echo "$$G" | grep JT_Z    | grep -oE '[0-9]+'); \
+	 echo ">> trap-via-JT DRAM: ecalli@S traps to a JT-token mtvec, JT-mapped (cold-miss) to the handler (CODE_LEN=$$CL JT_OFF=$$JO JT_Z=$$JZ; expect '[#]'):"; \
+	 $(CC) $(CFLAGS) -DCFG2_TRAP_JT -DCODE_LEN=$$CL -DJT_OFF=$$JO -DJT_Z=$$JZ -T link.ld -o loader_trap_jt_dram.elf loader_trap_jt_dram.S; \
+	 OUT=$$($(HARNESS) +tohost_addr=$(TOHOST) +time_out=300000 $(abspath loader_trap_jt_dram.elf) 2>&1); \
+	 echo "$$OUT" | grep -aE 'SUCCESS'; \
+	 EMIT=$$(echo "$$OUT" | grep -aoE '\[.\]' | head -1); echo "   guest emitted (CFG2[37]=1) = $$EMIT (expect [#])"; \
+	 echo "   -- negative control (CFG2[37]=0): the JT-token mtvec is used RAW -> expect NO [#] --"; \
+	 $(CC) $(CFLAGS) -UCFG2_TRAP_JT -DCODE_LEN=$$CL -DJT_OFF=$$JO -DJT_Z=$$JZ -T link.ld -o loader_trap_jt_dram_neg.elf loader_trap_jt_dram.S; \
+	 OUTN=$$($(HARNESS) +tohost_addr=$(TOHOST) +time_out=300000 $(abspath loader_trap_jt_dram_neg.elf) 2>&1); \
+	 EMITN=$$(echo "$$OUTN" | grep -aoE '\[.\]' | head -1); echo "   negative-control emitted (CFG2[37]=0) = '$$EMITN' (expect NOT [#])"; \
+	 { [ "$$EMIT" = "[#]" ] && [ "$$EMITN" != "[#]" ]; } && echo "   trap-jt-dram OK: CFG2[37] JT-maps the trap vector on the DRAM cold-miss path (pos=[#]); raw-mtvec control did NOT reach the handler" || { echo "   *** trap-jt-dram FAILED (pos='$$EMIT' expect [#]; neg='$$EMITN' must NOT be [#]) ***"; exit 1; }
+
+# COMBINED eret-via-JT + trap-via-JT, DRAM demand-fetch -- the UNTESTED real-OpenSBI SEQUENCE.
+# run-handoff-smode-dram tests eret-via-JT (CFG2[36]) alone; run-trap-jt-dram tests trap-via-JT
+# (CFG2[37]) alone but from a RAW M->S entry (CFG2[36]=0 from the start). NEITHER ran the actual
+# OpenSBI order: a JT-mapped M->S handoff eret that CONSUMES CFG2[36] (the one-shot), THEN an
+# ecalli@S that must still trap-via-JT (CFG2[37] stays 1). The loader sets BOTH bits ((3<<36),
+# exactly loader_opensbi.S `li t1,(3<<36)`); the handoff consumes [36], [37] persists, so the
+# SECOND JT-map (the trap) runs with the shared JT-FSM state (djump_a_q/jt_req_q/jt_valid_q/
+# djump_pending/d_state_q) the FIRST (the consumed eret) left behind -- the precise interaction
+# run-trap-jt-dram skipped. HTJ_IDX places BOTH live JT entries deep in DRAM (cold-miss); the trap
+# entry is HTJ_IDX+2 (a DIFFERENT cold-miss line than the eret entry). Both tokens must be <=127
+# (1-byte load_imm), so HTJ_IDX<=60. POSITIVE (-DCFG2_TRAP_JT): expect '[#]' (both maps fired in
+# sequence). NEGATIVE control (-UCFG2_TRAP_JT): the handoff eret-via-JT still drops to S, but the
+# ecalli@S's JT-token mtvec is used RAW -> mid-instruction pc -> NO '#' (proves the [37] gate atop
+# the full handoff). '' / non-[#] in the POSITIVE build = the trap-via-JT did NOT engage / mis-mapped
+# after the eret-via-JT consume (the FPGA failure). Reuses loader_handoff_trap_jt_dram.S.
+# HTJ_IDX=eret JT index (trap entry is +2); HTJ_Z=JT entry size. Default Z=3 == the real OpenSBI
+# emit-image (loader_opensbi.S JT_Z=3); idx=60 -> both entries deep in DRAM (cold-miss), distinct lines.
+HTJ_IDX ?= 60
+HTJ_Z   ?= 3
+run-handoff-trap-jt-dram: loader_handoff_trap_jt_dram.S link.ld gen_pvm_img.py
+	@G=$$(python3 gen_pvm_img.py '$(HTJ_IDX),$(HTJ_Z)' handoff_trap_jt_dram.hex handoff_trap_jt handoff_trap_jt_blob); \
+	 CL=$$(echo "$$G" | grep CODE_LEN | grep -oE '[0-9]+'); \
+	 JO=$$(echo "$$G" | grep JT_OFF  | grep -oE '[0-9]+'); \
+	 JZ=$$(echo "$$G" | grep JT_Z    | grep -oE '[0-9]+'); \
+	 echo ">> COMBINED eret-via-JT(CFG2[36],consumed) THEN trap-via-JT(CFG2[37]) on DRAM cold-miss (CODE_LEN=$$CL JT_OFF=$$JO JT_Z=$$JZ HTJ_IDX=$(HTJ_IDX); expect '[#]'):"; \
+	 $(CC) $(CFLAGS) -DCFG2_TRAP_JT -DCODE_LEN=$$CL -DJT_OFF=$$JO -DJT_Z=$$JZ -T link.ld -o loader_handoff_trap_jt_dram.elf loader_handoff_trap_jt_dram.S; \
+	 OUT=$$($(HARNESS) +tohost_addr=$(TOHOST) +time_out=300000 $(abspath loader_handoff_trap_jt_dram.elf) 2>&1); \
+	 echo "$$OUT" | grep -aE 'SUCCESS'; \
+	 EMIT=$$(echo "$$OUT" | grep -aoE '\[.\]' | head -1); echo "   guest emitted (CFG2[36+37]=1) = $$EMIT (expect [#])"; \
+	 echo "   -- negative control (CFG2[37]=0, CFG2[36]=1): handoff still JT-maps to S, but the ecalli@S JT-token mtvec is RAW -> expect NO [#] --"; \
+	 $(CC) $(CFLAGS) -UCFG2_TRAP_JT -DCODE_LEN=$$CL -DJT_OFF=$$JO -DJT_Z=$$JZ -T link.ld -o loader_handoff_trap_jt_dram_neg.elf loader_handoff_trap_jt_dram.S; \
+	 OUTN=$$($(HARNESS) +tohost_addr=$(TOHOST) +time_out=300000 $(abspath loader_handoff_trap_jt_dram_neg.elf) 2>&1); \
+	 EMITN=$$(echo "$$OUTN" | grep -aoE '\[.\]' | head -1); echo "   negative-control emitted (CFG2[37]=0) = '$$EMITN' (expect NOT [#])"; \
+	 { [ "$$EMIT" = "[#]" ] && [ "$$EMITN" != "[#]" ]; } && echo "   handoff-trap-jt-dram OK: eret-via-JT consume THEN trap-via-JT both fired in sequence (pos=[#]); raw-mtvec control did NOT reach the handler" || { echo "   *** handoff-trap-jt-dram FAILED (pos='$$EMIT' expect [#] -> trap-via-JT did NOT engage after the eret-via-JT consume; neg='$$EMITN' must NOT be [#]) ***"; exit 1; }
+
 # Stage 3 (re-scoped): a REAL S-mode payload -- an S-mode LOOP making N SBI-putchar ecalli@S calls,
 # each round-tripping through ONE reusable guest M-handler (putchar via direct UART MMIO, like
 # OpenSBI's M-mode console, THEN the standard skip-return mepc+=4; mret). Unlike run-strap-skip /
@@ -450,6 +536,26 @@ run-smode-loop-jt: loader_handoff_smode.S link.ld gen_pvm_img.py
 	 EMIT=$$(echo "$$FLAT" | grep -aoF 'ABCDE' | head -1); OVER=$$(echo "$$FLAT" | grep -aoF 'ABCDEF' | head -1); \
 	 echo "   guest emitted = '$$EMIT' (expect exactly ABCDE, and NOT the over-run ABCDEF)"; \
 	 { [ "$$EMIT" = "ABCDE" ] && [ -z "$$OVER" ]; } && echo "   smode-loop-jt OK: CFG2[36] one-shot held across 5 erets; counter+char survived" || { echo "   *** smode-loop-jt FAILED (EMIT='$$EMIT' OVER='$$OVER'; a post-handoff skip-return JT-mangled, or S-state clobbered) ***"; exit 1; }
+
+# B7 Phase-A: prove the REAL OpenSBI SBI-dispatch HW path cheaply (no ~30-min full-OpenSBI run). Same
+# S-mode SBI-putchar loop as run-smode-loop, but the guest M-handler does OpenSBI-style CAUSE DISPATCH --
+# it services (putchar + skip-return) ONLY if mcause==ENV_CALL_SMODE(9), else a DECOY trap (no output).
+# A pass ('ABCDE') empirically confirms an ecalli@S presents mcause=ENV_CALL_SMODE to the guest mtvec
+# (cva6.sv:772-775) -- exactly what OpenSBI's sbi_trap_handler keys on to route an SBI call to sbi_ecall.
+# '' = the cause was wrong (every iteration hit the decoy).
+SMODE_SBI_N ?= 5
+run-smode-sbi: loader_priv.S link.ld gen_pvm_img.py
+	@CL=$$(python3 gen_pvm_img.py '$(SMODE_SBI_N)' smsbi.hex smode_sbi | grep CODE_LEN | grep -oE '[0-9]+'); \
+	 echo ">> B7 Phase-A: ecalli@S dispatched as ENV_CALL_SMODE by an OpenSBI-style handler (expect first $(SMODE_SBI_N) letters):"; \
+	 $(CC) $(CFLAGS) -DCODE_LEN=$$CL -T link.ld -o loader_smode_sbi.elf loader_priv.S; \
+	 OUT=$$($(HARNESS) +PVM_IMG=$(abspath smsbi.hex) +tohost_addr=$(TOHOST) +time_out=300000 $(abspath loader_smode_sbi.elf) 2>&1); \
+	 echo "$$OUT" | grep -aE 'SUCCESS'; \
+	 EXP=$$(python3 -c "import sys;n=int(sys.argv[1]);print(''.join(chr(65+i) for i in range(n)))" $(SMODE_SBI_N)); \
+	 NX=$$(python3 -c "import sys;n=int(sys.argv[1]);print(''.join(chr(65+i) for i in range(n+1)))" $(SMODE_SBI_N)); \
+	 FLAT=$$(echo "$$OUT" | tr -d '\r\n'); \
+	 EMIT=$$(echo "$$FLAT" | grep -aoF "$$EXP" | head -1); OVER=$$(echo "$$FLAT" | grep -aoF "$$NX" | head -1); \
+	 echo "   guest emitted = '$$EMIT' (expect exactly $$EXP, and NOT $$NX)"; \
+	 { [ "$$EMIT" = "$$EXP" ] && [ -z "$$OVER" ]; } && echo "   smode-sbi OK: ecalli@S -> mcause=ENV_CALL_SMODE dispatched, serviced, skip-returned x$(SMODE_SBI_N)" || { echo "   *** smode-sbi FAILED (EMIT='$$EMIT' OVER='$$OVER'; ''=mcause!=9 -> decoy every iter => HW cause wrong for the OpenSBI SBI dispatch) ***"; exit 1; }
 
 # store_imm RTL bug gate: a PVM store_imm of a >16-bit immediate (low 16 bits ZERO, e.g.
 # 0x230000) to a NON-ZERO offset must store the FULL value, not just the low 16 bits.
@@ -507,4 +613,4 @@ run-opensbi: loader_opensbi.S link_opensbi.ld opensbi_to_dram.py $(OPENSBI_DTS)
 clean:
 	rm -f loader.elf loader_jump.elf loader_banner.elf loader_ecalli.elf loader_br.elf loader_loop.elf loader_djhalt.elf loader_djtab.elf loader_ibr.elf loader_ldij.elf loader_csr.elf loader_hostcall.elf loader_dramload.elf loader_drambanner.elf loader_hi.elf baseline.elf banner.hex ecalli.hex hi_banner.hex br_taken.hex br_nottaken.hex loop.hex djhalt.hex djtab.hex ibr_t.hex ibr_nt.hex ldij.hex csr.hex hostcall.hex loader_opensbi.elf opensbi.code.bin opensbi.jt.bin opensbi.ro.bin opensbi.rw.bin
 
-.PHONY: all run run-jump run-banner run-ecalli run-branch run-loop run-djump-halt run-djump-table run-ibranch run-ldij run-csr run-hostcall run-dram run-dram-banner run-user run-user-dram run-pvmvec run-mret run-handoff run-handoff-dram run-djump-dram run-handoff-smode run-handoff-smode-dram run-priv run-priv-dyn run-priv-return run-strap-skip run-handoff-skip run-smode-loop run-smode-loop-jt run-storeimm run-opensbi run-all clean
+.PHONY: all run run-jump run-banner run-ecalli run-branch run-loop run-djump-halt run-djump-table run-ibranch run-ldij run-csr run-hostcall run-dram run-dram-banner run-user run-user-dram run-pvmvec run-mret run-handoff run-handoff-dram run-djump-dram run-handoff-smode run-handoff-smode-dram run-priv run-priv-dyn run-priv-return run-strap-skip run-handoff-skip run-trap-jt run-trap-jt-dram run-handoff-trap-jt-dram run-smode-loop run-smode-loop-jt run-smode-sbi run-storeimm run-opensbi run-all clean

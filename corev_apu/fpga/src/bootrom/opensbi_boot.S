@@ -125,11 +125,12 @@ opensbi_pvm_boot:
     li   t1, JT_Z
     slli t1, t1, 32
     or   t0, t0, t1
-    li   t1, 1
-    slli t1, t1, 36                     # Stage 1: CFG2[36] = eret-via-jt. The M->S handoff mret maps
-    or   t0, t0, t1                     # mepc through the jump table (built in asm; cpp 32-bit-overflows
-                                        # (1<<36)). Sticky: the resume path touches only CFG1 so it
-                                        # persists, and the cold boot has no eret before the handoff.
+    li   t1, 3
+    slli t1, t1, 36                     # CFG2[36]=eret-via-jt + CFG2[37]=trap-via-jt (B7). (3<<36) sets BOTH
+    or   t0, t0, t1                     # bits: the M->S handoff mret maps mepc through the JT (bit36), AND a
+                                        # guest-internal trap maps mtvec (a JT token from `lla _trap_handler`)
+                                        # through the JT (bit37). Built in asm; cpp 32-bit-overflows (3<<36).
+                                        # Sticky: the resume path touches only CFG1 so both bits persist.
     csrw CSR_PVM_CFG2, t0
 
     # ---- seed guest entry registers (shared regfile persists through the PVM switch) ----

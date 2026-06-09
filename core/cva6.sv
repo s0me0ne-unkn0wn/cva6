@@ -469,6 +469,7 @@ module cva6
   logic pvm_stay;                    // guest-internal trap (ecalli@priv<M): stay in PVM, go to guest tvec
   logic                    pvm_trap_redirect;  // committed stay-trap -> redirect pvm_fetch to the guest tvec
   logic [CVA6Cfg.VLEN-1:0] pvm_trap_pc;        // committed trap_vector_base (guest mtvec/stvec) as a PVM-pc
+  logic                    pvm_trap_via_jt;    // trap-via-JT: committed stay-trap's mtvec is a JT-encoded code addr
   logic [CVA6Cfg.XLEN-1:0] pvm_epc_override;   // Stage 2: post-ecalli pc (next_pc-4) captured into mepc/sepc on a guest-ecalli stay-trap
   logic                    pvm_csr_fence_resolved;  // B5: a flush-class CSR write committed while pvm_active
   logic                    pvm_storeimm_resolved;   // a store_imm macro's store drained while pvm_active
@@ -570,6 +571,13 @@ module cva6
   // never both assert -- asserted in csr_regfile). PVM-pc is 32-bit (slice + zero-extend).
   assign pvm_trap_redirect = CVA6Cfg.PvmPresent & pvm_active & ex_commit.valid & pvm_stay;
   assign pvm_trap_pc       = {{(CVA6Cfg.VLEN-32){1'b0}}, trap_vector_base_commit_pcgen[31:0]};
+  // trap-via-JT (mirror of pvm_eret_via_jt @ CFG2[36]): CSR_PVM_CFG2[37]=1 means a guest-internal
+  // trap's mtvec/stvec holds a JT-encoded code address (a PolkaVM jump target (idx+1)*2), NOT a raw
+  // PVM-pc -> the frontend maps the trap target through the jump table (like a djump/eret) instead
+  // of redirecting to trap_pc[31:0] directly. Real OpenSBI sets mtvec via `lla _trap_handler;csrw`,
+  // which in PVM yields a JT token, so an ecalli@S would otherwise mis-trap to a raw token pc.
+  // Default 0 -> the guest-trap redirect is byte-identical to today (raw mtvec/stvec).
+  assign pvm_trap_via_jt   = pvm_trap_redirect & pvm_cfg2_csr[37];
   // Stage 2 (skip-class trap-return): on the SAME committed guest-ecalli stay-trap (pvm_trap_redirect),
   // capture the POST-ecalli PVM-pc into mepc/sepc instead of the trapping ecalli pc. pvm_pc (= the
   // front-end pc_q) HOLDS next_pc(ecalli) at the commit cycle: pvm_fetch advanced pc_q<=next_pc on the
@@ -638,6 +646,7 @@ module cva6
         .eret_via_jt_i  (pvm_eret_via_jt),
         .trap_redirect_i(pvm_trap_redirect),
         .trap_pc_i      (pvm_trap_pc),
+        .trap_via_jt_i  (pvm_trap_via_jt),
         .csr_fence_resolved_i(pvm_csr_fence_resolved),
         .storeimm_resolved_i(pvm_storeimm_resolved),
         .jumptable_base_i({{(CVA6Cfg.VLEN-32){1'b0}}, pvm_cfg2_csr[31:0]}),
