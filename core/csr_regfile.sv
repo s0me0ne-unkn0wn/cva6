@@ -504,6 +504,16 @@ module csr_regfile
         riscv::CSR_CYCLE:
         if (CVA6Cfg.RVZicntr) csr_rdata = cycle_q[CVA6Cfg.XLEN-1:0];
         else read_access_exception = 1'b1;
+        // PVM rdtime: the guest IS the firmware, so there is no underlying M-mode to
+        // trap-and-emulate `time`, and CVA6 has no in-core time CSR. Expose the
+        // free-running cycle counter as `time` so guest rdtime ADVANCES -- U-Boot
+        // get_timer/udelay/autoboot and the Linux clocksource all poll CSR_TIME.
+        // Compile-time gated to PVM builds (PvmPresent); non-PVM keeps csr_rdata='0
+        // exactly as before (real systems emulate rdtime in M-mode). Counteren/priv is
+        // already handled: CSR_TIME(0xC01) is in the [CSR_CYCLE:CSR_INSTRET] range.
+        // NOTE: cycle_q ticks at the CPU clock -> set the DTB timebase-frequency to it.
+        riscv::CSR_TIME:
+        if (CVA6Cfg.PvmPresent && CVA6Cfg.RVZicntr) csr_rdata = cycle_q[CVA6Cfg.XLEN-1:0];
         riscv::CSR_CYCLEH:
         if (CVA6Cfg.RVZicntr)
           if (CVA6Cfg.XLEN == 32) csr_rdata = cycle_q[63:32];
