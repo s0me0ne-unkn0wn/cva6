@@ -176,6 +176,27 @@ run-dram: loader_dramload.S link.ld
 	 echo "$$OUT" | grep -aE 'SUCCESS'; \
 	 echo "$$OUT" | grep -qa '#' && echo "   M1 OK: '#' from a runtime-loaded img_mem" || { echo "   *** M1 FAILED (no '#') ***"; exit 1; }
 
+# B2 FOUNDATION: dynamic code-append. The PVM guest (M3 DRAM demand-fetch) WRITES new bytecode
+# AND a rebuilt opcode bitmask into its own code-region at runtime, then host-calls (ecalli #2)
+# for the host to grow code_len (bitmask_base moves 48->64) and re-enter at the appended code,
+# which host-calls putchar('B') and traps. 'B' == the dynamically-written code was fetched and
+# executed -- the go/no-go for pure-SW userspace code loading. (The guest cannot csr_rw CFG1
+# itself: CFG1 is not is_csr_fence-flagged so its un-fenced flush -> ILLEGAL_INSTR; the host,
+# running as RISC-V, does the grow. See gen_pvm_img.py:emit_codeappend / loader_codeappend.S.)
+run-codeappend: loader_codeappend.S link_codeappend.ld gen_pvm_img.py
+	@G=$$(python3 gen_pvm_img.py '' codeappend.hex codeappend codeappend_blob); \
+	 IL=$$(echo "$$G" | grep 'INIT_CODE_LEN'  | grep -oE '[0-9]+'); \
+	 GL=$$(echo "$$G" | grep 'GROWN_CODE_LEN' | grep -oE '[0-9]+'); \
+	 NS=$$(echo "$$G" | grep 'NC_START'       | grep -oE '[0-9]+'); \
+	 echo ">> B2 code-append: guest writes NC+bitmask, host grows code_len $$IL->$$GL, re-enters @ pc $$NS (expect 'B'):"; \
+	 $(CC) $(CFLAGS) -DINIT_CODE_LEN=$$IL -DGROWN_CODE_LEN=$$GL -DNC_START=$$NS -T link_codeappend.ld -o loader_codeappend.elf loader_codeappend.S; \
+	 rm -f trace_rvfi_hart_00.dasm; \
+	 OUT=$$($(HARNESS) +tohost_addr=$(TOHOST) +time_out=200000 $(abspath loader_codeappend.elf) 2>&1); \
+	 echo "$$OUT" | grep -aE 'SUCCESS'; \
+	 { echo "$$OUT" | grep -av 'Bitbang' | grep -qa 'B' || grep -qaE 'mem 0x0000000010000000 0x0000000000000042' trace_rvfi_hart_00.dasm; } \
+	   && echo "   codeappend OK: dynamically-appended code executed ('B' emitted)" \
+	   || { echo "   *** codeappend FAILED (no 'B') ***"; exit 1; }
+
 # Run the whole PVM gate suite and tally PASS/FAIL (prereq: the testharness is built,
 # `make verilate target=cv64a6_emac_polkavm RISCV=/usr` from the repo root). Each gate
 # returns non-zero on failure (the SUCCESS grep / the hardened '#' asserts), so the exit
@@ -183,7 +204,7 @@ run-dram: loader_dramload.S link.ld
 PVM_GATES = run run-ecalli run-banner run-branch run-loop run-djump-halt run-djump-table \
             run-ibranch run-ldij run-csr run-csri run-irq run-hostcall run-dram run-dram-banner run-user run-user-dram \
             run-pvmvec run-mret run-handoff run-handoff-dram run-djump-dram run-handoff-smode \
-            run-handoff-smode-dram run-handoff-sdyn-dram run-priv run-priv-dyn run-priv-return run-strap-skip run-handoff-skip run-trap-jt run-trap-jt-dram run-handoff-trap-jt-dram run-smode-loop run-smode-loop-jt run-smode-sbi run-storeimm
+            run-handoff-smode-dram run-handoff-sdyn-dram run-priv run-priv-dyn run-priv-return run-strap-skip run-handoff-skip run-trap-jt run-trap-jt-dram run-handoff-trap-jt-dram run-smode-loop run-smode-loop-jt run-smode-sbi run-storeimm run-codeappend
 run-all:
 	@pass=0; fail=0; failed=""; \
 	 for t in $(PVM_GATES); do \
@@ -710,4 +731,4 @@ run-kernel: loader_kernel.S link_kernel.ld opensbi_to_dram.py
 clean:
 	rm -f loader.elf loader_jump.elf loader_banner.elf loader_ecalli.elf loader_br.elf loader_loop.elf loader_djhalt.elf loader_djtab.elf loader_ibr.elf loader_ldij.elf loader_csr.elf loader_hostcall.elf loader_dramload.elf loader_drambanner.elf loader_hi.elf baseline.elf banner.hex ecalli.hex hi_banner.hex br_taken.hex br_nottaken.hex loop.hex djhalt.hex djtab.hex ibr_t.hex ibr_nt.hex ldij.hex csr.hex hostcall.hex loader_opensbi.elf opensbi.code.bin opensbi.jt.bin opensbi.ro.bin opensbi.rw.bin
 
-.PHONY: all run run-jump run-banner run-ecalli run-branch run-loop run-djump-halt run-djump-table run-ibranch run-ldij run-csr run-csri run-irq run-hostcall run-dram run-dram-banner run-user run-user-dram run-pvmvec run-mret run-handoff run-handoff-dram run-djump-dram run-handoff-smode run-handoff-smode-dram run-priv run-priv-dyn run-priv-return run-strap-skip run-handoff-skip run-trap-jt run-trap-jt-dram run-handoff-trap-jt-dram run-smode-loop run-smode-loop-jt run-smode-sbi run-storeimm run-opensbi run-uboot run-kernel run-all clean
+.PHONY: all run run-jump run-banner run-ecalli run-branch run-loop run-djump-halt run-djump-table run-ibranch run-ldij run-csr run-csri run-irq run-hostcall run-dram run-dram-banner run-user run-user-dram run-pvmvec run-mret run-handoff run-handoff-dram run-djump-dram run-handoff-smode run-handoff-smode-dram run-priv run-priv-dyn run-priv-return run-strap-skip run-handoff-skip run-trap-jt run-trap-jt-dram run-handoff-trap-jt-dram run-smode-loop run-smode-loop-jt run-smode-sbi run-storeimm run-codeappend run-opensbi run-uboot run-kernel run-all clean

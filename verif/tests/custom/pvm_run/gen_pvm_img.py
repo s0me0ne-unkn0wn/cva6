@@ -32,6 +32,7 @@ LOAD_IMM_64  = 0x14
 LOAD_IMM     = 0x33
 STORE_IND_U8 = 0x78
 STORE_IND_U32 = 0x7a   # 122: [rbase+off] = rval (word); byte1=(rbase<<4)|rval, then off
+STORE_IND_U64 = 0x7b   # 123: [rbase+off] = rval (dword); byte1=(rbase<<4)|rval, then off
 LOAD_IND_U8  = 0x7c   # 124: rd = [rbase + off]; nibble lo=rd, hi=rbase
 ECALLI       = 0x0a   # 10: host-call; imm = host-call id (read from offset 1)
 MRET         = 0xed   # 237: return-from-handler (PVM-pc redirect to mepc)
@@ -1307,6 +1308,129 @@ def emit_smode_sbi(n=5):
     return code, starts
 
 
+CODE_APPEND_BASE = 0x80100000   # fixed DRAM code_base for run-codeappend (link_codeappend.ld)
+
+
+def emit_codeappend(code_base=CODE_APPEND_BASE):
+    """B2 foundation micro-test: prove a PVM guest can, at RUNTIME, write new bytecode + a rebuilt
+    opcode bitmask into its own DRAM code-region, have code_len grown so the new code becomes
+    fetchable, and execute it.
+
+    ONE code-region at `code_base` (M3 DRAM demand-fetch, CFG1[34]=1 -> code stays in DRAM, so a
+    guest LSU store to it is a physical-address pass-through == writable):
+      APPENDER [pc 0..L0)      : the initial code (initial code_len = L0).
+      (gap + initial bitmask)  : align16(L0) holds the LSB-first bitmask that decodes the appender.
+      NC       [pc NC..NC+6)   : new code, WRITTEN by the appender at runtime into FRESH space past
+                                 the initial bitmask; ABSENT until the grow, and it never overlaps
+                                 the live initial bitmask (so the appender's own decode is safe).
+      new bitmask [align16(L1))]: the FULL rebuilt bitmask (appender + NC starts), written by the
+                                 appender; a DIFFERENT base from the initial one (bitmask_base moves
+                                 with code_len: cva6.sv code_base+align16(code_len)) -- so this
+                                 exercises the bitmask-base MOVE, the core B2 hardware fact.
+
+    APPENDER (in order):
+      1. r2 = code_base + NC                  base for BOTH stores (NC@+0, bitmask@+BM_OFF)
+      2. r3 = NC bytes packed as one u64
+      3. store_ind_u64 [r2+0]      = r3       write NC (u64 store => NC 8-aligned by construction)
+      4. r5 = full rebuilt bitmask u64
+      5. store_ind_u64 [r2+BM_OFF] = r5       write the rebuilt bitmask at code_base+align16(L1)
+      6. ecalli #2                            ask the HOST to grow code_len to L1 and enter at pc NC
+
+    Why the host grows code_len (not the guest): a guest `csr_rw CFG1` is NOT flagged is_csr_fence
+    in pvm_decoder (only mstatus/sstatus/satp/mstatush are), yet a CFG1 write raises flush_o in
+    csr_regfile. Un-fenced, that commit-flush redirect is NOT absorbed by a pvm_fetch suspend, so
+    the front-end momentarily fetches the PVM-pc as a RISC-V address -> ILLEGAL_INSTR (RVFI-confirmed:
+    the guest's csrw CFG1 at pc 0x34 raised ILLEGAL_INSTR after both stores committed correctly).
+    So the guest asks the host (RISC-V, where csrw CFG1 flushes cleanly) to grow + re-enter. The
+    CFG registers are the host<->guest control interface, so a guest requesting a code-region grow
+    via a host-call is the faithful model. The re-entry is a fresh start (rising edge -> start_pulse
+    kills+reloads the demand-fetch window) at CFG0.entry_pc = NC, so NC is fetched with the grown
+    code_len and the rebuilt bitmask.
+
+    NC = putchar('B') via a host-call, then trap: load_imm r7,'B' ; ecalli #0 ; trap.
+    SUCCESS == the host prints 'B' (the dynamically-written code executed).
+
+    Returns (appender_code, appender_starts) -> build_image builds the initial blob at code_len L0;
+    prints INIT_CODE_LEN / GROWN_CODE_LEN / NC_START for the loader defines. `code_base` is fixed by
+    link_codeappend.ld so the appender can hard-encode absolute store addresses (no guest `lla`)."""
+    def align16(n):
+        return (n + 15) & ~15
+    def align8(n):
+        return (n + 7) & ~7
+
+    # ---- NC: the code the appender writes at runtime; ecalli #0 = host putchar('B') ----
+    nc = [LOAD_IMM, R_CHAR & 0xF, ord('B')] + [ECALLI, 0x00] + [TRAP]   # 3 + 2 + 1 = 6 bytes
+    nc_rel_starts = [0, 3, 5]
+    nc_len = len(nc)
+
+    # ---- APPENDER: placeholder immediates, patched once its length L0 is known. load_imm64 is a
+    #      fixed 10 bytes regardless of value, so L0 is independent of the addresses we patch in.
+    #      Ends with ecalli #2 (grow request) -- no guest CFG1 write (see docstring). ----
+    P8 = [0] * 8
+    instrs = [
+        [LOAD_IMM_64, 0x02] + P8,                    # r2 = code_base + NC   (base for both stores)
+        [LOAD_IMM_64, 0x03] + P8,                    # r3 = NC packed u64
+        [STORE_IND_U64, (0x2 << 4) | 0x3, 0x00],     # [r2+0]      = r3  (write NC)
+        [LOAD_IMM_64, 0x05] + P8,                    # r5 = rebuilt bitmask u64
+        [STORE_IND_U64, (0x2 << 4) | 0x5, 0x00],     # [r2+BM_OFF] = r5  (off patched below)
+        [ECALLI, 0x02],                              # ecalli #2 -> host: grow code_len + enter @ NC
+    ]
+    code, starts = [], []
+    for ins in instrs:
+        starts.append(len(code)); code.extend(ins)
+    L0 = len(code)                                    # appender length == initial code_len
+
+    # NC lives in FRESH 8-aligned space just past the initial bitmask (align16(L0)+ceil(L0/8)), so a
+    # runtime store never touches the live initial bitmask, and NC_BASE is 8-aligned for the u64 store.
+    init_bm_end = align16(L0) + (L0 + 7) // 8
+    nc_start = align8(init_bm_end)
+    nc_base  = code_base + nc_start
+    assert nc_base % 8 == 0, f"NC_BASE 0x{nc_base:x} not 8-aligned"
+    L1 = nc_start + nc_len
+
+    bm_dest = code_base + align16(L1)                 # rebuilt-bitmask base (moves with code_len)
+    bm_off  = align16(L1) - nc_start                  # store offset from nc_base to the bitmask
+    assert 0 <= bm_off < 128, f"bm_off {bm_off} needs a multi-byte store offset"
+    assert align16(L1) >= nc_start + 8, f"rebuilt bitmask 0x{bm_dest:x} overlaps the NC store"
+
+    nc_u64 = 0
+    for i, b in enumerate(nc):                        # 6 NC bytes + 2 zero -> one u64 store
+        nc_u64 |= b << (8 * i)
+
+    all_starts = list(starts) + [nc_start + s for s in nc_rel_starts]
+    assert (L1 + 7) // 8 <= 8, "rebuilt bitmask exceeds one u64 store"
+    bm_bytes = [0] * 8
+    for s in all_starts:
+        bm_bytes[s // 8] |= 1 << (s % 8)
+    bm_u64 = 0
+    for i, b in enumerate(bm_bytes):
+        bm_u64 |= b << (8 * i)
+
+    reserve_end = align16(L1) + 8                     # last byte the bitmask u64 store touches
+
+    def put_u64(instr_idx, value):
+        base = starts[instr_idx] + 2                  # opcode + reg byte, then 8 LE imm bytes
+        for i in range(8):
+            code[base + i] = (value >> (8 * i)) & 0xFF
+    put_u64(0, nc_base)                               # instr 1: r2 = NC/bitmask base
+    put_u64(1, nc_u64)                               # instr 2: r3 = NC u64
+    put_u64(3, bm_u64)                               # instr 4: r5 = bitmask u64
+    code[starts[4] + 2] = bm_off & 0xFF              # instr 5 (BM store): patch the BM_OFF byte
+
+    print(f"CODE_BASE     : 0x{code_base:x}")
+    print(f"INIT_CODE_LEN : {L0}")
+    print(f"GROWN_CODE_LEN: {L1}")
+    print(f"NC_START      : {nc_start}")
+    print(f"NC_BASE       : 0x{nc_base:x}")
+    print(f"BM_DEST       : 0x{bm_dest:x}  (off {bm_off} from NC_BASE)")
+    print(f"RESERVE_END   : {reserve_end}")
+    print(f"NC_U64        : 0x{nc_u64:016x}")
+    print(f"BM_U64        : 0x{bm_u64:016x}  bytes={[f'0x{b:02x}' for b in bm_bytes]}")
+    print(f"appender starts : {starts}")
+    print(f"all starts (L1) : {all_starts}")
+    return code, starts
+
+
 def build_image(code, starts, jumptable=None, z=1):
     """Pad code to align16, append the LSB-first opcode bitmask, then (optionally)
     the dynamic jump table (z bytes/entry, LE). Returns (img, code_len, bm_off, jt_off)."""
@@ -1448,6 +1572,8 @@ def main():
         code, starts = emit_storeimm_test()
     elif mode == "ebreak_probe":
         code, starts = emit_ebreak_probe()
+    elif mode == "codeappend":
+        code, starts = emit_codeappend()
     else:
         code, starts = emit_banner(text)
     img, code_len, bm_off, jt_off = build_image(code, starts, jumptable, z)
