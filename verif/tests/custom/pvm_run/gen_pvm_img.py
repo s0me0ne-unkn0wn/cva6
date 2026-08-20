@@ -31,6 +31,7 @@ TRAP         = 0x00
 LOAD_IMM_64  = 0x14
 LOAD_IMM     = 0x33
 STORE_IND_U8 = 0x78
+STORE_IND_U32 = 0x7a   # 122: [rbase+off] = rval (word); byte1=(rbase<<4)|rval, then off
 LOAD_IND_U8  = 0x7c   # 124: rd = [rbase + off]; nibble lo=rd, hi=rbase
 ECALLI       = 0x0a   # 10: host-call; imm = host-call id (read from offset 1)
 MRET         = 0xed   # 237: return-from-handler (PVM-pc redirect to mepc)
@@ -341,6 +342,54 @@ MTVEC    = 0x305  # M-mode trap vector: the guest clobbers it to prove the B4 PV
 MEPC     = 0x341  # M-mode exception PC: mret redirects PVM fetch here (writing it sets no flush)
 MSTATUS  = 0x300  # M-mode status (MPP etc.); written by the HOST loader, not the guest (flush)
 MCAUSE   = 0x342  # M-mode trap cause; an ecalli@S presents ENV_CALL_SMODE(9) (cva6.sv:772-775)
+MIE      = 0x304  # M-mode interrupt-enable (MSIE bit3 / MTIE bit7)
+
+
+def emit_irq_test():
+    """Async-IRQ-to-guest gate (CFG2[38]): a pending machine interrupt must be delivered
+    to a PVM guest that spins with interrupts enabled -- WITHOUT the inject the guest loops
+    forever (timeout = FAIL); WITH it, control reaches the guest's own mtvec handler.
+
+    The guest (M-mode) raises its OWN machine software interrupt via the CLINT MSIP
+    register (phys 0x2000000, a pass-through store), then enables mie.MSIE + mstatus.MIE
+    and spins. cva6.sv's pvm_irq_take then replaces the next whole spin uop with an
+    M_SW interrupt exception -> redirect to mtvec (raw PVM-pc here; CFG2[37] off in the
+    micro-loader). The handler writes '@' straight to the UART THR and traps -- a DIRECT
+    MMIO store, not an ecalli, so the gate proves inject+redirect+handler-execution
+    without a nested host-call. '@' iff the interrupt was delivered to the guest tvec.
+
+      r1=HANDLER ; csr_rw mtvec,r1                 ; mtvec = handler (raw pc)
+      r2=0x2000000 ; r3=1 ; sw [r2]=r3             ; CLINT MSIP=1 -> mip.MSIP
+      r4=8 ; csr_rs mie,r4                          ; mie.MSIE
+      r5=8 ; csr_rs mstatus,r5                      ; mstatus.MIE -> global_enable => INJECT
+      spin: branch_eq r1,r1,0                       ; loop until the interrupt fires
+      @HANDLER: r8=UART ; r7='@' ; sb [r8]=r7 ; trap
+    """
+    def b1(rd, rs1):
+        return ((rs1 & 0xF) << 4) | (rd & 0xF)   # polkavm2: rd=LOW nibble, csr-src=HIGH
+    HANDLER = 40                                  # 4B/2B-aligned raw PVM-pc (mtvec zeroes bit0)
+    mtv = le(MTVEC, 2)
+    mie = le(MIE, 2)
+    mst = le(MSTATUS, 2)
+    code = (
+        [LOAD_IMM, 0x01, HANDLER]                 # r1 = HANDLER                  @0  (3B)
+        + [CSR_RW, b1(6, 1)] + mtv                # mtvec = r1                    @3  (4B)
+        + [LOAD_IMM_64, 0x02] + le(0x2000000, 8)  # r2 = CLINT MSIP base          @7  (10B)
+        + [LOAD_IMM, 0x03, 0x01]                  # r3 = 1                        @17 (3B)
+        + [STORE_IND_U32, b1(3, 2), 0x00]         # [r2+0] = r3 -> MSIP=1         @20 (3B)
+        + [LOAD_IMM, 0x04, 0x08]                  # r4 = 8 (MSIE bit3)            @23 (3B)
+        + [CSR_RS, b1(6, 4)] + mie                # mie |= 8                      @26 (4B)
+        + [LOAD_IMM, 0x05, 0x08]                  # r5 = 8 (MIE bit3)             @30 (3B)
+        + [CSR_RS, b1(6, 5)] + mst                # mstatus |= 8 -> enable        @33 (4B)
+        + [BRANCH_EQ, b1(1, 1), 0x00]             # spin: branch_eq r1,r1,0       @37 (3B)
+        + [LOAD_IMM_64, 0x08] + le(UART_THR, 8)   # HANDLER r8 = UART THR         @40 (10B)
+        + [LOAD_IMM, 0x07, ord('@')]              # r7 = '@'                      @50 (3B)
+        + [STORE_IND_U8, b1(7, 8), 0x00]          # sb [r8+0] = r7 -> putchar '@' @53 (3B)
+        + [TRAP]                                  # trap                          @56 (1B)
+    )
+    starts = [0, 3, 7, 17, 20, 23, 26, 30, 33, 37, 40, 50, 53, 56]
+    assert HANDLER == 40 and len(code) == 57
+    return code, starts
 
 
 def emit_csr_test():
@@ -1346,6 +1395,8 @@ def main():
         code, starts = emit_csr_test()
     elif mode == "csri":
         code, starts = emit_csri_test()
+    elif mode == "irq":
+        code, starts = emit_irq_test()
     elif mode == "mtvec":
         code, starts = emit_mtvec_test()
     elif mode == "mret":

@@ -42,6 +42,14 @@ _start:
     # pipeline (csr_regfile.sv, the same idiom as mstatus/satp), fencing every PVM mode
     # transition -- so the dodge is removed and every program exercises CFG2.
     li   t0, ((JT_Z) << 32) | (JT_BASE)
+#ifdef PVM_IRQ
+    # async-IRQ-to-guest (CFG2[38]): the run-irq gate needs pending machine interrupts
+    # delivered to the PVM guest. Opt-in per gate so the other micro-tests (which never
+    # enable mstatus.MIE) are byte-identical.
+    li   t1, 1
+    slli t1, t1, 38
+    or   t0, t0, t1
+#endif
     csrw CSR_PVM_CFG2, t0
 
     # PVMCFG1 = (pvm_active<<32) | code_len ; active=bit32, code_len=4

@@ -140,6 +140,18 @@ run-csri: loader.S link.ld gen_pvm_img.py
 	 echo "$$OUT" | grep -aE 'SUCCESS'; \
 	 echo "$$OUT" | grep -qa '#' && echo "   CSR-immediate OK ('#' returned)" || { echo "   *** CSR-immediate FAILED (no '#') ***"; exit 1; }
 
+# Async-IRQ-to-guest (CFG2[38]). The guest raises its own CLINT MSIP, enables mie.MSIE +
+# mstatus.MIE and spins; the HW must inject the machine software interrupt at a uop
+# boundary and redirect to the guest mtvec handler, which prints '@'. Without the inject
+# the guest spins to the timeout (FAIL). -DPVM_IRQ turns on CFG2[38] in the loader.
+run-irq: loader.S link.ld gen_pvm_img.py
+	@CL=$$(python3 gen_pvm_img.py '' irq.hex irq | grep CODE_LEN | grep -oE '[0-9]+'); \
+	 $(CC) $(CFLAGS) -DPVM_IRQ -DCODE_LEN=$$CL -T link.ld -o loader_irq.elf loader.S; \
+	 echo ">> async-IRQ inject (expect '@'; no '@' = interrupt never delivered):"; \
+	 OUT=$$($(HARNESS) +PVM_IMG=$(abspath irq.hex) +tohost_addr=$(TOHOST) +time_out=200000 $(abspath loader_irq.elf) 2>&1); \
+	 echo "$$OUT" | grep -aE 'SUCCESS'; \
+	 echo "$$OUT" | grep -qa '@' && echo "   async-IRQ OK ('@' returned)" || { echo "   *** async-IRQ FAILED (no '@') ***"; exit 1; }
+
 # Stage B3: host-call ABI. The host-call number (ecalli imm) is delivered in mtval; the
 # handler dispatches -- #0 = putchar(a0), #1 = sum (a0 = a0 + a1). ABI a0..a5 = PVM
 # r7..r12. Program: a0=0x22, a1=0x01, ecalli #1 (a0->0x23), ecalli #0 -> putchar '#'.
@@ -169,7 +181,7 @@ run-dram: loader_dramload.S link.ld
 # returns non-zero on failure (the SUCCESS grep / the hardened '#' asserts), so the exit
 # code is the per-gate verdict.
 PVM_GATES = run run-ecalli run-banner run-branch run-loop run-djump-halt run-djump-table \
-            run-ibranch run-ldij run-csr run-hostcall run-dram run-dram-banner run-user run-user-dram \
+            run-ibranch run-ldij run-csr run-csri run-irq run-hostcall run-dram run-dram-banner run-user run-user-dram \
             run-pvmvec run-mret run-handoff run-handoff-dram run-djump-dram run-handoff-smode \
             run-handoff-smode-dram run-handoff-sdyn-dram run-priv run-priv-dyn run-priv-return run-strap-skip run-handoff-skip run-trap-jt run-trap-jt-dram run-handoff-trap-jt-dram run-smode-loop run-smode-loop-jt run-smode-sbi run-storeimm
 run-all:
@@ -698,4 +710,4 @@ run-kernel: loader_kernel.S link_kernel.ld opensbi_to_dram.py
 clean:
 	rm -f loader.elf loader_jump.elf loader_banner.elf loader_ecalli.elf loader_br.elf loader_loop.elf loader_djhalt.elf loader_djtab.elf loader_ibr.elf loader_ldij.elf loader_csr.elf loader_hostcall.elf loader_dramload.elf loader_drambanner.elf loader_hi.elf baseline.elf banner.hex ecalli.hex hi_banner.hex br_taken.hex br_nottaken.hex loop.hex djhalt.hex djtab.hex ibr_t.hex ibr_nt.hex ldij.hex csr.hex hostcall.hex loader_opensbi.elf opensbi.code.bin opensbi.jt.bin opensbi.ro.bin opensbi.rw.bin
 
-.PHONY: all run run-jump run-banner run-ecalli run-branch run-loop run-djump-halt run-djump-table run-ibranch run-ldij run-csr run-hostcall run-dram run-dram-banner run-user run-user-dram run-pvmvec run-mret run-handoff run-handoff-dram run-djump-dram run-handoff-smode run-handoff-smode-dram run-priv run-priv-dyn run-priv-return run-strap-skip run-handoff-skip run-trap-jt run-trap-jt-dram run-handoff-trap-jt-dram run-smode-loop run-smode-loop-jt run-smode-sbi run-storeimm run-opensbi run-uboot run-kernel run-all clean
+.PHONY: all run run-jump run-banner run-ecalli run-branch run-loop run-djump-halt run-djump-table run-ibranch run-ldij run-csr run-csri run-irq run-hostcall run-dram run-dram-banner run-user run-user-dram run-pvmvec run-mret run-handoff run-handoff-dram run-djump-dram run-handoff-smode run-handoff-smode-dram run-priv run-priv-dyn run-priv-return run-strap-skip run-handoff-skip run-trap-jt run-trap-jt-dram run-handoff-trap-jt-dram run-smode-loop run-smode-loop-jt run-smode-sbi run-storeimm run-opensbi run-uboot run-kernel run-all clean
