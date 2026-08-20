@@ -91,6 +91,7 @@ module pvm_front
     output logic [63:0]     imm_o,
     output logic            use_imm_o,
     output logic            use_zimm_o,
+    output logic            phase_o,        // 1 = phase-1 of a 2-uop macro (mid-instruction)
     output logic            is_branch_o,
     output logic            is_jump_o,
     output logic [VLEN-1:0] branch_target_o,
@@ -414,6 +415,7 @@ module pvm_front
       .djump_pending_o(f_djump_pending),
       .two_uop_i     (f_two_uop),
       .phase_o       (f_phase),
+      // (f_phase is also exported as phase_o for the async-IRQ inject uop-boundary gate)
       .done_o        (f_done),
       .redirect_valid_i(is_jump_o),       // unconditional jump -> front redirect
       .redirect_pc_i   (branch_target_o),
@@ -477,5 +479,8 @@ module pvm_front
   assign valid_o  = pvm_active_i & (f_valid | f_done);
   assign done_o   = pvm_active_i & f_done;
   assign halted_o = pvm_active_i & ~f_valid & ~f_done;
+  // Exported for the async-IRQ inject gate (cva6.sv): an interrupt may only replace a
+  // WHOLE not-yet-issued instruction, never the phase-1 half of a 2-uop macro.
+  assign phase_o  = f_phase;
 
 endmodule

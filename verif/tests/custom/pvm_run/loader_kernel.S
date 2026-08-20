@@ -143,6 +143,13 @@ _start:
     li   t1, 1
     slli t1, t1, 37                     # trap-via-JT: guest sync traps -> mtvec token mapped via JT
     or   t0, t0, t1
+    # bit38 (async-IRQ-to-guest): deliver pending machine interrupts (CLINT MTIP first of
+    # all) to the guest at uop boundaries -- the guest kernel owns the machine, so its
+    # timer ticks/jiffies must fire (and the no-IRQ 8250 tty TX ring must drain). The
+    # injected interrupt rides the same stay-trap/mtvec-via-JT path as bit37 sync faults.
+    li   t1, 1
+    slli t1, t1, 38
+    or   t0, t0, t1
     csrw CSR_PVM_CFG2, t0
 
     # ---- seed guest entry registers: RISC-V Linux boot protocol a0=hartid, a1=dtb ----

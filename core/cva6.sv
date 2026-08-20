@@ -448,6 +448,10 @@ module cva6
   logic                    pvm_valid, pvm_is_branch, pvm_is_jump, pvm_is_hostcall;
   logic                    pvm_is_trap, pvm_illegal, pvm_unsupported, pvm_halted, pvm_use_imm;
   logic                    pvm_use_zimm;  // CSR-immediate (csrr[swc]i): operand A = zimm
+  logic                    pvm_phase;     // 1 = phase-1 of a 2-uop macro (mid-instruction)
+  logic                    pvm_irq_valid; // an M-level interrupt is pending+enabled (mip&mie)
+  logic [CVA6Cfg.XLEN-1:0] pvm_irq_cause; // its cause (MSB set), decoder.sv priority
+  logic                    pvm_irq_take;  // inject it into the next whole PVM uop (CFG2[38])
   logic [CVA6Cfg.VLEN-1:0] pvm_pc, pvm_btgt;
   logic                    pvm_resume;
   logic                    pvm_br_resolved, pvm_br_taken, pvm_done;
@@ -587,8 +591,34 @@ module cva6
                         & ~ex_commit.cause[CVA6Cfg.XLEN-1]   // synchronous (not an interrupt)
                         & ~pvm_use_vec                       // not a host-boundary exit
                         & ~pvm_is_hostcall;                  // not a guest ecalli (pvm_stay_ecalli)
+  // Async-IRQ-to-guest (CFG2[38]): the RISC-V decode-stage interrupt attach (decoder.sv:962)
+  // is BYPASSED while pvm_active (the issue mux substitutes pvm_sbe), so pending machine
+  // interrupts were never delivered to a PVM guest -- mip.MTIP just accumulated (guest
+  // jiffies frozen; a no-IRQ 8250 console never drained its tty TX ring). Mirror the
+  // decoder's attach at the PVM uop boundary instead: when the guest opted in (CFG2[38])
+  // and an M-level interrupt is pending+enabled, REPLACE the next not-yet-issued uop
+  // (phase 0 only -- never split a 2-uop macro; see the pvm_sbe adapter) with an interrupt
+  // exception. mepc = that uop's pc (re-execute semantics, like pvm_fu_fault); the guest
+  // handler runs at its own mtvec (via the JT when CFG2[37]) and srets back onto the
+  // replaced uop. Younger speculatively issued uops are squashed by the commit-exception
+  // flush exactly as in the FU-fault case. irq_ctrl.global_enable already folds the
+  // privilege rule (mstatus.MIE at M / always below M) and the debug-mode gating.
+  // Priority mirrors decoder.sv (M_EXT over M_SW over M_TIMER); S-delegation is not
+  // modelled -- a PVM guest runs with mideleg=0. (The mip/mie mux + the take gate live
+  // next to the irq_ctrl_csr_id declaration further down.)
+  // The committed injected interrupt is a guest-internal stay-trap like the FU-fault:
+  // redirect to the guest tvec, standard mepc, no -4 override, no pvm_active exit. Only
+  // pvm_irq_take ever produces an interrupt-cause commit while pvm_active, so cause[MSB]
+  // is the discriminator (it also masks the held-to-commit pvm_use_vec of whatever uop
+  // the front has meanwhile decoded -- see the csr_regfile port below).
+  logic pvm_async_irq;
+  // Gated on CFG2[38] too: only an opted-in guest can ever produce an interrupt-cause
+  // commit while pvm_active (pvm_irq_take is the sole source, and it requires CFG2[38]).
+  // Without this gate a non-opted-in guest (OpenSBI/U-Boot, CFG2[38]=0) is NOT byte-identical.
+  assign pvm_async_irq = CVA6Cfg.PvmPresent & pvm_active & pvm_cfg2_csr[38] & ex_commit.valid
+                         & ex_commit.cause[CVA6Cfg.XLEN-1];
   // pvm_stay (the union) drives both the no-exit of pvm_active and the trap-redirect/JT path below.
-  assign pvm_stay = pvm_stay_ecalli | pvm_fu_fault;
+  assign pvm_stay = pvm_stay_ecalli | pvm_fu_fault | pvm_async_irq;
   // On the committed stay-trap, redirect PVM fetch to the guest tvec (mtvec/stvec) that
   // csr_regfile computed for this trap (pvm_use_vec=0 here, so it is the guest vector, not
   // CSR_PVM_VEC). Mutually exclusive with pvm_eret_resolved (eret vs ex_commit.valid can
@@ -686,6 +716,7 @@ module cva6
         .imm_o          (pvm_imm),
         .use_imm_o      (pvm_use_imm),
         .use_zimm_o     (pvm_use_zimm),
+        .phase_o        (pvm_phase),
         .is_branch_o    (pvm_is_branch),
         .is_jump_o      (pvm_is_jump),
         .branch_target_o(pvm_btgt),
@@ -707,6 +738,7 @@ module cva6
     assign pvm_imm = '0;
     assign pvm_use_imm = 1'b0;
     assign pvm_use_zimm = 1'b0;
+    assign pvm_phase = 1'b0;
     assign pvm_is_branch = 1'b0;
     assign pvm_is_jump = 1'b0;
     assign pvm_btgt = '0;
@@ -818,6 +850,21 @@ module cva6
     // sim and FPGA builds keep ZERO_TVAL=0, so mtval = this tval. Non-host-call
     // exceptions (trap/illegal) carry tval=0.
     pvm_sbe.ex.tval  = pvm_is_hostcall ? pvm_hcid[CVA6Cfg.XLEN-1:0] : '0;
+    // Async-IRQ injection (CFG2[38]): replace this whole uop with the pending machine
+    // interrupt. It rides the pvm_done mechanics (fu=NONE, valid+ex at issue) so no FU
+    // executes anything; sbe.pc is this uop's pc -> mepc, and the uop itself re-executes
+    // after the guest handler srets back. The take gate excludes phase-1 halves and
+    // exception uops (see pvm_irq_take next to irq_ctrl_csr_id).
+    if (CVA6Cfg.PvmPresent && pvm_irq_take) begin
+      pvm_sbe.fu       = NONE;
+      pvm_sbe.rd       = '0;
+      pvm_sbe.use_imm  = 1'b0;
+      pvm_sbe.use_zimm = 1'b0;
+      pvm_sbe.valid    = 1'b1;
+      pvm_sbe.ex.valid = 1'b1;
+      pvm_sbe.ex.cause = pvm_irq_cause;
+      pvm_sbe.ex.tval  = '0;
+    end
   end
 
   // Mux PVM vs RISC-V into the issue stage (port 0 carries PVM uops).
@@ -993,6 +1040,30 @@ module cva6
   logic tsr_csr_id;
   logic hu;
   irq_ctrl_t irq_ctrl_csr_id;
+
+  // Async-IRQ-to-guest, part 2 (see the pvm_stay block above for the full story): the
+  // pending+enabled M-level interrupt mux (decoder.sv:962 priority) and the inject gate.
+  always_comb begin
+    pvm_irq_valid = 1'b0;
+    pvm_irq_cause = '0;
+    if (irq_ctrl_csr_id.mip[riscv::IRQ_M_TIMER] && irq_ctrl_csr_id.mie[riscv::IRQ_M_TIMER]) begin
+      pvm_irq_valid = 1'b1;
+      pvm_irq_cause = INTERRUPTS.M_TIMER;
+    end
+    if (CVA6Cfg.SoftwareInterruptEn && irq_ctrl_csr_id.mip[riscv::IRQ_M_SOFT] && irq_ctrl_csr_id.mie[riscv::IRQ_M_SOFT]) begin
+      pvm_irq_valid = 1'b1;
+      pvm_irq_cause = INTERRUPTS.M_SW;
+    end
+    if (irq_ctrl_csr_id.mip[riscv::IRQ_M_EXT] && irq_ctrl_csr_id.mie[riscv::IRQ_M_EXT]) begin
+      pvm_irq_valid = 1'b1;
+      pvm_irq_cause = INTERRUPTS.M_EXT;
+    end
+  end
+  assign pvm_irq_take = CVA6Cfg.PvmPresent & pvm_active & pvm_cfg2_csr[38]
+                        & pvm_valid & ~pvm_phase   // a whole, not-yet-issued instruction
+                        & pvm_irq_valid & irq_ctrl_csr_id.global_enable
+                        // an exception uop keeps its own cause (the irq lands on a later uop)
+                        & ~(pvm_is_trap | pvm_illegal | pvm_unsupported | pvm_is_hostcall | pvm_done);
   logic dcache_en_csr_nbdcache;
   logic csr_write_fflags_commit_cs;
   logic icache_en_csr;
@@ -1616,7 +1687,12 @@ module cva6
       .scbcfe_o                (scbcfe),
       .hcbcfe_o                (hcbcfe),
       .jvt_o                   (jvt),
-      .pvm_use_vec_i           (pvm_use_vec),
+      // pvm_use_vec is a held-to-commit function of the front's CURRENT decode; an
+      // injected async interrupt does not suspend the front, so by its commit the front
+      // may sit on an unrelated trap/illegal uop. Mask by the commit cause: an
+      // interrupt-cause commit is always the guest-internal injection -> guest mtvec,
+      // never the host CSR_PVM_VEC exit.
+      .pvm_use_vec_i           (pvm_use_vec & ~(pvm_active & pvm_cfg2_csr[38] & ex_commit.valid & ex_commit.cause[CVA6Cfg.XLEN-1])),
       .pvm_epc_override_i       (pvm_epc_override),
       // The skip-class -4 mepc override applies ONLY to the guest ecalli stay-trap (the guest
       // M-handler does mepc+=4 over a 2-byte PVM ecalli). A guest FU-fault (pvm_fu_fault) must
