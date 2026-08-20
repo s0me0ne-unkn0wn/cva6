@@ -1053,7 +1053,9 @@ module csr_regfile
         if (CVA6Cfg.RVS) sscratch_d = csr_wdata;
         else update_access_exception = 1'b1;
         riscv::CSR_SEPC:
-        if (CVA6Cfg.RVS) sepc_d = {csr_wdata[CVA6Cfg.XLEN-1:1], 1'b0};
+        // PVM: keep bit 0 -- byte-granular PVM-pc (see the CSR_MEPC comment below).
+        if (CVA6Cfg.RVS)
+          sepc_d = CVA6Cfg.PvmPresent ? csr_wdata : {csr_wdata[CVA6Cfg.XLEN-1:1], 1'b0};
         else update_access_exception = 1'b1;
         riscv::CSR_SCAUSE:
         if (CVA6Cfg.RVS) scause_d = csr_wdata;
@@ -1229,7 +1231,14 @@ module csr_regfile
         riscv::CSR_PVM_VEC:  pvm_vec_d = csr_wdata;
         riscv::CSR_PVM_RAM:  pvm_ram_d = csr_wdata;
         riscv::CSR_PVM_IMG:  pvm_img_we_o = 1'b1;  // 1-cycle img_mem write pulse (data in pvm_img_w_o)
-        riscv::CSR_MEPC: mepc_d = {csr_wdata[CVA6Cfg.XLEN-1:1], 1'b0};
+        // The RISC-V WARL IALIGN mask (mepc[0]=0) breaks PVM guests: a PVM-pc is a BYTE
+        // address (variable-length bytecode), and polkatool freely places entry points at
+        // odd pc (e.g. the B1 userspace export @0x1939). The guest kernel's start_thread->
+        // sret path writes epc via this csrw (unlike HW-written guest-trap epcs, which keep
+        // all bits), so masking bit 0 sent the first U-mode process to entry-1 -> ILLEGAL.
+        // Plain RISC-V code only ever writes even epcs, so keeping bit 0 is a no-op there.
+        riscv::CSR_MEPC:
+        mepc_d = CVA6Cfg.PvmPresent ? csr_wdata : {csr_wdata[CVA6Cfg.XLEN-1:1], 1'b0};
         riscv::CSR_MCAUSE: mcause_d = csr_wdata;
         riscv::CSR_MTVAL: begin
           if (CVA6Cfg.TvalEn) mtval_d = csr_wdata;
