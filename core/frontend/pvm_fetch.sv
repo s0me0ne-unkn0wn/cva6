@@ -231,23 +231,33 @@ module pvm_fetch
         phase_q            <= 1'b0;
       end
     end else if (trap_redirect_i) begin
-      // Guest-internal trap (ecalli@priv<M): pvm_fetch was halt-suspended at the ecalli
-      // (running_q=0, post-ecalli pc held). The backend delivered the trap to the guest
-      // mtvec/stvec and STAYED in PVM; redirect fetch there and resume. Exclusive with
-      // start_i (a stay-trap involves no host resume) and the branch/djump/eret arms.
+      // A committed guest stay-trap that STAYS in PVM and redirects fetch to the guest tvec.
+      // TWO sub-classes (cva6.sv pvm_stay = pvm_stay_ecalli | pvm_fu_fault):
+      //  (a) ecalli@priv<M: pvm_fetch was halt-suspended at the ecalli (running_q=0, post-ecalli pc
+      //      held) BEFORE this pulse -- the classic case.
+      //  (b) a guest synchronous FU-exception (misaligned load/store, access/page fault, breakpoint):
+      //      the faulting uop did NOT suspend pvm_fetch, so running_q may still be 1 and pc_q has
+      //      drifted PAST the faulting instruction (younger uops were speculatively issued). That is
+      //      fine: in-order commit guarantees nothing younger committed before the faulting uop, the
+      //      commit-exception flush squashes those younger uops, and THIS redirect pulse sets pc_q
+      //      authoritatively. We force running_q here (set 0 then re-arm) so the prior drift/running
+      //      state cannot leak a spurious fetch -- correct for BOTH sub-classes.
+      // The trap_vector_base the backend computed is the guest mtvec/stvec (pvm_use_vec=0 for both),
+      // and the FU/decoder set mcause. Exclusive with start_i (no host resume) and the pending arms.
       branch_pending_q <= 1'b0;
       eret_pending_q   <= 1'b0;
       phase_q          <= 1'b0;
+      running_q        <= 1'b0;          // drop any in-flight fetch (FU-fault case); re-armed below/by the JT
       if (trap_via_jt_i) begin
         // trap-via-JT (EXACT mirror of the eret_pending_q -> eret_via_jt branch): mtvec/stvec holds
         // a JT-encoded code address (a JT token), not a PVM-pc. Route it through the jump table like
         // a djump/eret: enter djump_pending and wait for the JT read (pvm_front captures djump_a =
         // trap_pc_i on trap_via_jt_i this same cycle), then the djump_pending arm sets pc_q <=
-        // djump_target_i. Stay suspended (running_q stays 0) meanwhile.
+        // djump_target_i and resumes. Stay suspended (running_q=0, set above) meanwhile.
         djump_pending_q  <= 1'b1;
       end else begin
         pc_q             <= trap_pc_i;   // default: mtvec/stvec is already a raw PVM-pc (unchanged)
-        running_q        <= 1'b1;
+        running_q        <= 1'b1;        // raw target known now -> resume immediately
         djump_pending_q  <= 1'b0;
       end
     end else if (running_q && next_ready_i && window_valid_i) begin

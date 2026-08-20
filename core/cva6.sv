@@ -467,7 +467,9 @@ module cva6
   logic pvm_fetch_from_dram;
   logic pvm_use_vec;                 // B4: this PVM exit is a host-boundary one -> CSR_PVM_VEC
   logic pvm_ecalli_at_m;             // ecalli executed at M-mode = a host-boundary exit (vs @<M = guest trap)
-  logic pvm_stay;                    // guest-internal trap (ecalli@priv<M): stay in PVM, go to guest tvec
+  logic pvm_stay;                    // a guest-internal trap (ecalli@priv<M OR a guest FU-fault): stay in PVM, go to guest tvec
+  logic pvm_stay_ecalli;             // sub-class: the guest-internal ecalli (skip-class mepc = pc-4 override)
+  logic pvm_fu_fault;                // sub-class: a guest synchronous FU-exception (misaligned/access/page-fault/breakpoint) the guest kernel services at its own mtvec (mepc = faulting pc, NO override)
   logic                    pvm_trap_redirect;  // committed stay-trap -> redirect pvm_fetch to the guest tvec
   logic [CVA6Cfg.VLEN-1:0] pvm_trap_pc;        // committed trap_vector_base (guest mtvec/stvec) as a PVM-pc
   logic                    pvm_trap_via_jt;    // trap-via-JT: committed stay-trap's mtvec is a JT-encoded code addr
@@ -561,11 +563,32 @@ module cva6
   assign pvm_ecalli_at_m = pvm_is_hostcall & (priv_lvl == riscv::PRIV_LVL_M);
   assign pvm_use_vec = CVA6Cfg.PvmPresent & pvm_active &
                        (pvm_ecalli_at_m | pvm_is_trap | pvm_illegal | pvm_unsupported | pvm_done);
-  // pvm_stay = a guest-internal trap (ecalli@priv<M): suppress the pvm_active exit and
-  // redirect pvm_fetch to the guest trap vector. Held-to-commit, same coherence as
+  // pvm_stay_ecalli = a guest-internal supervisor call (ecalli@priv<M): suppress the pvm_active
+  // exit and redirect pvm_fetch to the guest trap vector. Held-to-commit, same coherence as
   // pvm_use_vec (B4: pvm_front holds the exception uop's decode stable through commit, and
   // priv_lvl_q still holds the from-priv at the trap's commit cycle).
-  assign pvm_stay = CVA6Cfg.PvmPresent & pvm_active & pvm_is_hostcall & ~pvm_ecalli_at_m;
+  assign pvm_stay_ecalli = CVA6Cfg.PvmPresent & pvm_active & pvm_is_hostcall & ~pvm_ecalli_at_m;
+  // pvm_fu_fault = a guest SYNCHRONOUS FU-exception (misaligned load/store, instr/load/store access
+  // fault, page fault, breakpoint) raised by a functional unit (LSU/etc.) at commit while pvm_active.
+  // The guest OS (NOMMU M-mode Linux) services these at its OWN mtvec=handle_exception (e.g. CONFIG_
+  // RISCV_MISALIGNED's do_trap_load_misaligned -> handle_misaligned_load software-emulates the access
+  // and advances mepc), so -- exactly like the ecalli stay-trap -- it must STAY in PVM and redirect
+  // fetch to the guest tvec via the JT (CFG2[37]); the trap_vector_base csr_regfile computes here is
+  // already mtvec (pvm_use_vec=0 for these), and the FU set mcause. WITHOUT this, pvm_active would
+  // exit on the FU exception (line ~512) and the frontend would try to fetch the JT-token mtvec as
+  // raw RISC-V -> INSTR_ACCESS_FAULT forever (the kernel-as-PVM boot wall at the first misaligned
+  // access, after calibrate_delay). Conditions: a committed exception that is SYNCHRONOUS (not an
+  // interrupt -- async IRQ-to-guest is a separate, currently-unimplemented injection path, so the
+  // ~cause[MSB] guard is belt-and-suspenders), NOT a PVM host-boundary exit (pvm_use_vec: ecalli@M /
+  // pvm_is_trap / illegal / unsupported / clean-halt all go to CSR_PVM_VEC and EXIT), and NOT a guest
+  // ecalli (covered by pvm_stay_ecalli, whose mepc gets the -4 skip override). mepc for an FU-fault is
+  // the standard faulting pc_i (re-execute/emulate semantics) -- NO -4 override (see pvm_epc_override).
+  assign pvm_fu_fault = CVA6Cfg.PvmPresent & pvm_active & ex_commit.valid
+                        & ~ex_commit.cause[CVA6Cfg.XLEN-1]   // synchronous (not an interrupt)
+                        & ~pvm_use_vec                       // not a host-boundary exit
+                        & ~pvm_is_hostcall;                  // not a guest ecalli (pvm_stay_ecalli)
+  // pvm_stay (the union) drives both the no-exit of pvm_active and the trap-redirect/JT path below.
+  assign pvm_stay = pvm_stay_ecalli | pvm_fu_fault;
   // On the committed stay-trap, redirect PVM fetch to the guest tvec (mtvec/stvec) that
   // csr_regfile computed for this trap (pvm_use_vec=0 here, so it is the guest vector, not
   // CSR_PVM_VEC). Mutually exclusive with pvm_eret_resolved (eret vs ex_commit.valid can
@@ -1595,7 +1618,11 @@ module cva6
       .jvt_o                   (jvt),
       .pvm_use_vec_i           (pvm_use_vec),
       .pvm_epc_override_i       (pvm_epc_override),
-      .pvm_epc_override_valid_i (pvm_trap_redirect),
+      // The skip-class -4 mepc override applies ONLY to the guest ecalli stay-trap (the guest
+      // M-handler does mepc+=4 over a 2-byte PVM ecalli). A guest FU-fault (pvm_fu_fault) must
+      // save the standard faulting pc_i to mepc (the misalign emulator advances it itself), so
+      // gate the override on the ecalli sub-class, NOT the union pvm_trap_redirect.
+      .pvm_epc_override_valid_i (CVA6Cfg.PvmPresent & pvm_active & ex_commit.valid & pvm_stay_ecalli),
       .pvm_eret_jt_consume_i    (pvm_eret_via_jt),
       .pvm_cfg0_o              (pvm_cfg0_csr),
       .pvm_cfg1_o              (pvm_cfg1_csr),
