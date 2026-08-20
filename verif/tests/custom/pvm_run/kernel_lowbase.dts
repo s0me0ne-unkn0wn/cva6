@@ -1,0 +1,75 @@
+/dts-v1/;
+
+/ {
+	#address-cells = <0x02>;
+	#size-cells = <0x02>;
+	compatible = "eth,cva6-bare-dev";
+	model = "eth,cva6-bare";
+
+	chosen {
+		stdout-path = "/soc/uart@10000000:115200";
+		bootargs = "earlycon console=ttyS0,115200n8";
+	};
+
+	cpus {
+		#address-cells = <0x01>;
+		#size-cells = <0x00>;
+		timebase-frequency = <0x17d7840>;
+
+		cpu@0 {
+			clock-frequency = <0x2faf080>;
+			device_type = "cpu";
+			reg = <0x00>;
+			status = "okay";
+			compatible = "eth, cva6", "riscv";
+			riscv,isa = "rv64emac_zicsr_zifencei_zbb_xtheadcondmov";
+			riscv,isa-base = "rv64i";
+			riscv,isa-extensions = "e", "m", "a", "c", "zifencei", "zicsr", "zicntr", "zihpm", "zbb", "xtheadcondmov";
+			mmu-type = "riscv,none";
+
+			interrupt-controller {
+				#interrupt-cells = <0x01>;
+				interrupt-controller;
+				compatible = "riscv,cpu-intc";
+				phandle = <0x02>;
+			};
+		};
+	};
+
+	/* PVM unified-low-base RAM: the kernel's static data (polkatool RO@0x10000, RW@0x100000,
+	 * bss to ~0x1ec090) and ALL dynamic RAM live in ONE low guest range, backed by DRAM through
+	 * the CSR_PVM_RAM aperture (loader_kernel.S: guest [0x10000,0x810000) -> DRAM [0x80010000,
+	 * 0x80810000), base 0x80000000). memblock_start_of_DRAM()=0x10000 -> phys_ram_base = 0x10000
+	 * & PMD_MASK = 0 -> ARCH_PFN_OFFSET=0 -> the FLATMEM mem_map covers the LOW pfns where the
+	 * kernel's static symbols actually live (NOMMU virt==phys), so __pa_symbol(__start_rodata=
+	 * 0x10300) and virt_to_page(static) index INSIDE mem_map (the high-base 0x80000000 node made
+	 * ARCH_PFN_OFFSET=0x80000 -> static pfn 0x10 indexed mem_map[-0x7fff0] -> SLAB page-struct
+	 * garbage -> kmem_cache size=192 -EINVAL panic). 8 MiB is ample for the early SLAB/mm_init. */
+	memory@10000 {
+		device_type = "memory";
+		reg = <0x00 0x10000 0x00 0x800000>;
+	};
+
+	soc {
+		#address-cells = <0x02>;
+		#size-cells = <0x02>;
+		compatible = "eth,cva6-bare-soc", "simple-bus";
+		ranges;
+
+		clint@2000000 {
+			compatible = "riscv,clint0";
+			interrupts-extended = <0x02 0x03 0x02 0x07>;
+			reg = <0x00 0x2000000 0x00 0xc0000>;
+			reg-names = "control";
+		};
+
+		uart@10000000 {
+			compatible = "ns16750", "ns16550";
+			reg = <0x00 0x10000000 0x00 0x1000>;
+			clock-frequency = <0x2faf080>;
+			current-speed = <0x1c200>;
+			reg-shift = <0x02>;
+			reg-io-width = <0x04>;
+		};
+	};
+};
