@@ -107,6 +107,28 @@ def emit_ecalli_banner(text):
     return code, starts
 
 
+def emit_ebreak_probe():
+    """MICRO-TEST: where does a guest PVM `trap` (== polkatool's lowering of a RISC-V
+    `ebreak`/`c.ebreak`, riscv.rs:1316/909 -> Inst::Unimplemented -> Instruction::trap)
+    go -- the host (CSR_PVM_VEC) or the guest's own mtvec?
+
+    Program: `load_imm r7,'E'` ; `ecalli #0` (host prints 'E' + resumes -- proves the
+    round-trip works) ; `trap` (the ebreak-equivalent).  With the current RTL pvm_is_trap
+    is in pvm_use_vec -> the `trap` is a HOST-boundary exit (mcause=ILLEGAL_INSTR=2 != 11)
+    -> loader_ebreak.S host_trap prints '!F'.  Observable: 'E' then '!F' (NOT the guest
+    handler's 'G').  Confirms a guest `trap` is NOT delivered to the guest tvec today."""
+    instrs = []
+    instrs.append([LOAD_IMM, R_CHAR & 0x0F, ord('E')])   # r7 = 'E'
+    instrs.append([ECALLI, 0x00])                         # ecalli #0 (host putchar 'E')
+    instrs.append([TRAP])                                 # the ebreak-equivalent
+    code = []
+    starts = []
+    for ins in instrs:
+        starts.append(len(code))
+        code.extend(ins)
+    return code, starts
+
+
 BRANCH_EQ = 0xAA   # 170: branch if rA==rB; arg = (rB<<4)|rA, then signed LE offset
 ADD_IMM_32 = 0x83  # 131: rd = rs + imm (arg = (rs<<4)|rd? see decoder); used by loop test
 
@@ -354,6 +376,46 @@ def emit_csr_test():
         + [TRAP]                             # trap                     @33 (1B)
     )
     starts = [0, 3, 7, 10, 14, 17, 21, 24, 27, 31, 33]
+    return code, starts
+
+
+# CSR-IMMEDIATE opcodes (234-236): reg_reg_imm shape, byte1 = (zimm<<4)|rd. The HIGH
+# nibble is the 5-bit zimm VALUE (0..15), NOT a register index (polkatool packs
+# `(imm)&0xF` into the source nibble). Regression for the silicon post-PTP `!F` derail:
+# the decoder read a GPR there instead of the zimm, so Linux's `csrrsi mstatus,zimm`
+# set mstatus.MBE (the read GPR had bit 37) -> big-endian -> every ld/sd byte-reversed.
+CSR_RWI = 0xEA   # 234
+CSR_RSI = 0xEB   # 235
+CSR_RCI = 0xEC   # 236
+
+def emit_csri_test():
+    """CSR-immediate (csrrsi/csrrwi) operand-source gate. csrrsi mscratch,zimm must use
+    the 4-bit zimm as the set-mask, NOT a GPR.  Poison the GPR the BUGGY decoder would
+    read (csrrsi mscratch,3 -> byte1 hi-nibble 3 -> old decode g_hi = x(3+1) = PVM r3) with
+    0x40, then:
+      r3 = 0x40                       (poison: the mis-read source)
+      csrrwi mscratch, 0              -> mscratch = 0     (csrrwi always writes the zimm)
+      csrrsi mscratch, 3              -> mscratch |= 3     correct=3 ; buggy=|=r3(0x40)=0x40
+      r7 = csrrs mscratch, x0         -> read mscratch back (register form, side-effect free)
+      add_imm32 r7, r7, 0x20          -> correct: 0x23 '#' ; buggy: 0x60 '`'
+      ecalli #0 (putchar r7) ; trap.
+    '#' iff the zimm (=3) reached csr_buffer as operand_a; '`' (0x60) iff the GPR did.
+    (Also implicitly proves no MBE flip, since a flip would corrupt the ecalli path too.)"""
+    csr = le(MSCRATCH, 2)                        # [0x40, 0x03]
+    def b1_reg(rd, rs1):                          # register form nibbles: lo=rd, hi=rs1
+        return ((rs1 & 0xF) << 4) | (rd & 0xF)
+    def b1_imm(rd, zimm):                          # immediate form nibbles: lo=rd, hi=zimm
+        return ((zimm & 0xF) << 4) | (rd & 0xF)
+    code = (
+        [LOAD_IMM, 0x03, 0x40]                   # r3 = 0x40 (poison)        @0  (3B)
+        + [CSR_RWI, b1_imm(1, 0)] + csr          # mscratch = zimm 0         @3  (4B)
+        + [CSR_RSI, b1_imm(1, 3)] + csr          # mscratch |= zimm 3        @7  (4B)
+        + [CSR_RS,  b1_reg(7, 0)] + csr          # r7 = mscratch (read)      @11 (4B)
+        + [ADD_IMM_32, (7 << 4) | 7, 0x20]       # r7 = r7 + 0x20            @15 (3B)
+        + [ECALLI, 0x00]                         # putchar(r7)               @18 (2B)
+        + [TRAP]                                 # trap                      @20 (1B)
+    )
+    starts = [0, 3, 7, 11, 15, 18, 20]
     return code, starts
 
 
@@ -1282,6 +1344,8 @@ def main():
         code, starts, jumptable, z = emit_ldij_test()
     elif mode == "csr":
         code, starts = emit_csr_test()
+    elif mode == "csri":
+        code, starts = emit_csri_test()
     elif mode == "mtvec":
         code, starts = emit_mtvec_test()
     elif mode == "mret":
@@ -1331,6 +1395,8 @@ def main():
         code, starts = emit_hostcall_test()
     elif mode == "storeimm":
         code, starts = emit_storeimm_test()
+    elif mode == "ebreak_probe":
+        code, starts = emit_ebreak_probe()
     else:
         code, starts = emit_banner(text)
     img, code_len, bm_off, jt_off = build_image(code, starts, jumptable, z)

@@ -129,6 +129,17 @@ run-csr: loader.S link.ld gen_pvm_img.py
 	 echo "$$OUT" | grep -aE 'SUCCESS'; \
 	 echo "$$OUT" | grep -qa '#' && echo "   CSR rw/rs/rc OK ('#' returned)" || { echo "   *** CSR FAILED (no '#') ***"; exit 1; }
 
+# CSR-immediate operand-source regression (silicon post-PTP byte-reversal derail). csrrsi
+# mscratch,zimm must use the 4-bit zimm as operand, NOT a poisoned GPR. '#'(0x23)=zimm path
+# correct; '`'(0x60)=GPR mis-read (the old bug that set mstatus.MBE -> ld/sd byte-reversal).
+run-csri: loader.S link.ld gen_pvm_img.py
+	@CL=$$(python3 gen_pvm_img.py '' csri.hex csri | grep CODE_LEN | grep -oE '[0-9]+'); \
+	 $(CC) $(CFLAGS) -DCODE_LEN=$$CL -T link.ld -o loader_csri.elf loader.S; \
+	 echo ">> CSR-immediate zimm-operand (expect '#', bug='\`'):"; \
+	 OUT=$$($(HARNESS) +PVM_IMG=$(abspath csri.hex) +tohost_addr=$(TOHOST) +time_out=200000 $(abspath loader_csri.elf) 2>&1); \
+	 echo "$$OUT" | grep -aE 'SUCCESS'; \
+	 echo "$$OUT" | grep -qa '#' && echo "   CSR-immediate OK ('#' returned)" || { echo "   *** CSR-immediate FAILED (no '#') ***"; exit 1; }
+
 # Stage B3: host-call ABI. The host-call number (ecalli imm) is delivered in mtval; the
 # handler dispatches -- #0 = putchar(a0), #1 = sum (a0 = a0 + a1). ABI a0..a5 = PVM
 # r7..r12. Program: a0=0x22, a1=0x01, ecalli #1 (a0->0x23), ecalli #0 -> putchar '#'.
@@ -645,7 +656,46 @@ run-uboot: loader_uboot.S link_uboot.ld opensbi_to_dram.py
 	 echo "=== UART MMIO accesses (phys 0x10000000; >0 => console driver reached): ==="; \
 	 grep -cE 'mem 0x0000000010000[0-9a-f]+' trace_rvfi_hart_00.dasm || true
 
+# NOMMU-Linux-kernel-on-PVM standalone run: boot the real vmlinux.polkavm (polkatool link
+# --opt-level 0) as a PVM/JAM guest from DRAM (M3 demand-fetch) at M-mode (the kernel is NOMMU
+# CONFIG_RISCV_M_MODE), to surface its FIRST runtime wall via the commit trace. Mirror of run-uboot.
+# Kernel data: ro@guest 0x10000, rw@guest 0xF0000 (aperture [0x10000,0x200000)=2MB); code@0x80200000
+# jt@0x80700000 (ABOVE the aperture so the kernel's ~2MB data never collides with the 4.6MB code).
+# First probe: 2M-instr cap finds an early wall fast with a compact trace; raise KERNEL_TIMEOUT to
+# chase a deeper frontier once the first walls clear.
+KERNEL_POLKAVM   ?= /tmp/vmlinux_k.polkavm
+KERNEL_TIMEOUT   ?= 2000000
+KERNEL_WALLCLOCK ?= 900
+# Unified-low-base DTB (memory@10000, size 8 MiB): makes phys_ram_base/ARCH_PFN_OFFSET match the
+# LOW guest addresses where polkatool actually places the kernel's static data (NOMMU virt==phys),
+# which the FLATMEM mem_map then covers -> fixes the kmem_cache size=192 -EINVAL SLAB panic. Must be
+# paired with loader_kernel.S's 8 MiB aperture [0x10000,0x810000) + blobs relocated to 0x80820000+.
+KERNEL_DTB       ?= kernel_lowbase.dtb
+run-kernel: loader_kernel.S link_kernel.ld opensbi_to_dram.py
+	@$(POLKATOOL) emit-image -o kernel.bin $(KERNEL_POLKAVM) >/dev/null 2>&1; \
+	 G=$$(python3 opensbi_to_dram.py kernel.bin kernel); \
+	 CL=$$(echo "$$G" | grep '^CODE_LEN' | grep -oE '[0-9]+'); \
+	 JZ=$$(echo "$$G" | grep '^JT_Z' | grep -oE '[0-9]+'); \
+	 RWI=$$(echo "$$G" | grep '^RW_IMG' | grep -oE '[0-9]+'); \
+	 RWT=$$(echo "$$G" | grep '^RW_TOTAL' | grep -oE '[0-9]+'); \
+	 RWB=$$(echo "$$G" | grep '^RW_BASE' | grep -oE '[0-9]+'); \
+	 RWV=$$(echo "$$G" | grep '^RW_VMA' | grep -oE '0x[0-9a-f]+'); \
+	 EP=$$(echo "$$G" | grep '^ENTRY_PC' | grep -oE '[0-9]+'); \
+	 echo ">> NOMMU Linux kernel as a PVM guest from DRAM (CODE_LEN=$$CL JT_Z=$$JZ RW_IMG=$$RWI RW_TOTAL=$$RWT RW_BASE=$$RWB ENTRY_PC=$$EP):"; \
+	 $(CC) $(CFLAGS) -DCODE_LEN=$$CL -DJT_Z=$$JZ -DRW_IMG=$$RWI -DRW_TOTAL=$$RWT -DRW_GUEST=$$RWB -Wl,--defsym,RW_VMA=$$RWV -DDTB_PATH='"$(KERNEL_DTB)"' -T link_kernel.ld -o loader_kernel.elf loader_kernel.S; \
+	 OUT=$$(timeout $(KERNEL_WALLCLOCK) $(HARNESS) +tohost_addr=$(TOHOST) +time_out=$(KERNEL_TIMEOUT) $(abspath loader_kernel.elf) 2>&1); \
+	 PVMPC=$$(grep -E '^core   0: 0x0000000000[0-9a-f]+ ' trace_rvfi_hart_00.dasm | grep -oE '0x0000000000[0-9a-f]+' | sort -u | tail -1); \
+	 NC=$$(grep -cE '^core   0: 0x0000000000[0-9a-f]+ ' trace_rvfi_hart_00.dasm); \
+	 echo "=== PVM guest committed $$NC instructions; max PVM-pc = $$PVMPC ==="; \
+	 echo "=== first PVM fault (non-breakpoint exception) after PVM entry: ==="; \
+	 C1=$$(grep -n 'bc129073' trace_rvfi_hart_00.dasm | head -1 | cut -d: -f1); \
+	 awk -v s="$$C1" 'NR>s && /exception/ && !/BREAKPOINT/ {print; exit}' trace_rvfi_hart_00.dasm; \
+	 echo "=== guest UART output ('!F' = loader trap-fault marker; any kernel text = console reached): ==="; \
+	 echo "$$OUT" | grep -avE 'FAILED|JTAG|Listening|CPU time|Wall clock|emulator' | grep -aiE 'Linux|Kernel|console|earlycon|!F|panic|Oops|Booting' | head -20 || true; \
+	 echo "=== UART MMIO accesses (phys 0x10000000; >0 => console driver reached): ==="; \
+	 grep -cE 'mem 0x0000000010000[0-9a-f]+' trace_rvfi_hart_00.dasm || true
+
 clean:
 	rm -f loader.elf loader_jump.elf loader_banner.elf loader_ecalli.elf loader_br.elf loader_loop.elf loader_djhalt.elf loader_djtab.elf loader_ibr.elf loader_ldij.elf loader_csr.elf loader_hostcall.elf loader_dramload.elf loader_drambanner.elf loader_hi.elf baseline.elf banner.hex ecalli.hex hi_banner.hex br_taken.hex br_nottaken.hex loop.hex djhalt.hex djtab.hex ibr_t.hex ibr_nt.hex ldij.hex csr.hex hostcall.hex loader_opensbi.elf opensbi.code.bin opensbi.jt.bin opensbi.ro.bin opensbi.rw.bin
 
-.PHONY: all run run-jump run-banner run-ecalli run-branch run-loop run-djump-halt run-djump-table run-ibranch run-ldij run-csr run-hostcall run-dram run-dram-banner run-user run-user-dram run-pvmvec run-mret run-handoff run-handoff-dram run-djump-dram run-handoff-smode run-handoff-smode-dram run-priv run-priv-dyn run-priv-return run-strap-skip run-handoff-skip run-trap-jt run-trap-jt-dram run-handoff-trap-jt-dram run-smode-loop run-smode-loop-jt run-smode-sbi run-storeimm run-opensbi run-uboot run-all clean
+.PHONY: all run run-jump run-banner run-ecalli run-branch run-loop run-djump-halt run-djump-table run-ibranch run-ldij run-csr run-hostcall run-dram run-dram-banner run-user run-user-dram run-pvmvec run-mret run-handoff run-handoff-dram run-djump-dram run-handoff-smode run-handoff-smode-dram run-priv run-priv-dyn run-priv-return run-strap-skip run-handoff-skip run-trap-jt run-trap-jt-dram run-handoff-trap-jt-dram run-smode-loop run-smode-loop-jt run-smode-sbi run-storeimm run-opensbi run-uboot run-kernel run-all clean

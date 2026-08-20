@@ -61,7 +61,18 @@ def main():
 
     bss = rw_tot - rw_img
 
+    # Guest RW base, exactly as polkavm-common abi.rs MemoryMapBuilder lays it out:
+    # ro@0x10000, then align the RO span up to VM_MAX_PAGE_SIZE (64K) plus one guard
+    # page. HARD-CODING this in a loader goes stale the moment RO crosses a 64K
+    # boundary (bit us twice: -Os growth 0xF0000->0x100000, minimal-config shrink
+    # 0x100000->0xC0000 -> every static kernel pointer read zeros) -- consumers must
+    # take RW_BASE/RW_VMA from here instead.
+    VM_PAGE = 0x10000
+    rw_base = VM_PAGE + ((ro_tot + VM_PAGE - 1) & ~(VM_PAGE - 1)) + VM_PAGE
+
     print(f"CODE_LEN  : {code_size}")
+    print(f"RW_BASE   : {rw_base}")
+    print(f"RW_VMA    : 0x{0x80000000 + rw_base:x}")
     print(f"BM_OFF    : {bm_off}")
     print(f"CODE_REGION_BYTES : {len(code_region)}")
     print(f"JT_SIZE   : {jt_size}")
