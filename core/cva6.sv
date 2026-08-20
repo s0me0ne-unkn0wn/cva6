@@ -447,6 +447,7 @@ module cva6
   // PVM front raw decoded micro-op
   logic                    pvm_valid, pvm_is_branch, pvm_is_jump, pvm_is_hostcall;
   logic                    pvm_is_trap, pvm_illegal, pvm_unsupported, pvm_halted, pvm_use_imm;
+  logic                    pvm_use_zimm;  // CSR-immediate (csrr[swc]i): operand A = zimm
   logic [CVA6Cfg.VLEN-1:0] pvm_pc, pvm_btgt;
   logic                    pvm_resume;
   logic                    pvm_br_resolved, pvm_br_taken, pvm_done;
@@ -661,6 +662,7 @@ module cva6
         .rs2_o          (pvm_rs2),
         .imm_o          (pvm_imm),
         .use_imm_o      (pvm_use_imm),
+        .use_zimm_o     (pvm_use_zimm),
         .is_branch_o    (pvm_is_branch),
         .is_jump_o      (pvm_is_jump),
         .branch_target_o(pvm_btgt),
@@ -681,6 +683,7 @@ module cva6
     assign pvm_rs2 = '0;
     assign pvm_imm = '0;
     assign pvm_use_imm = 1'b0;
+    assign pvm_use_zimm = 1'b0;
     assign pvm_is_branch = 1'b0;
     assign pvm_is_jump = 1'b0;
     assign pvm_btgt = '0;
@@ -769,6 +772,9 @@ module cva6
     pvm_sbe.rd       = pvm_rd[REG_ADDR_SIZE-1:0];
     pvm_sbe.result   = pvm_imm[CVA6Cfg.XLEN-1:0];
     pvm_sbe.use_imm  = pvm_use_imm;
+    // CSR-immediate (csrr[swc]i): operand A = zero-extended 5-bit zimm carried in rs1
+    // (issue_read_operands honours use_zimm). Mirrors decoder.sv for the RISC-V path.
+    pvm_sbe.use_zimm = pvm_use_zimm;
     // result is "valid"(done) at issue ONLY for exceptions (trap/ecalli/illegal/done);
     // normal ALU/LOAD/STORE uops are marked done by their FU writeback (matches
     // decoder: instruction_o.valid = ex.valid). Setting this 1 unconditionally made

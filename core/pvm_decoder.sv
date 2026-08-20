@@ -43,6 +43,7 @@ module pvm_decoder
     output logic [4:0]      rs2_o,
     output logic [63:0]     imm_o,           // immediate / store data / target imm
     output logic            use_imm_o,       // operand B is the immediate
+    output logic            use_zimm_o,      // operand A is the 5-bit CSR zimm (csrr[swc]i)
     output logic            is_branch_o,     // conditional branch (cond in op_o)
     output logic            is_jump_o,       // unconditional jump (target known at decode)
     output logic            is_djump_o,      // dynamic indirect jump (jump_ind): djump(reg+imm)
@@ -75,6 +76,19 @@ module pvm_decoder
   // read-only CSRs like mhartid) and a write supplies 0. Data-reg slots keep g_hi (+1).
   logic [4:0] g_hi_csr;
   assign g_hi_csr = (pvm_reg_hi(b1) == 4'd0) ? 5'd0 : g_hi;
+
+  // CSR destination register with the "no GPR writeback" sentinel.  The linker lowers a
+  // RISC-V `csr*` whose rd=x0 (e.g. `csrs mstatus,rs1` == `csrrs x0,mstatus,rs1`, an
+  // interrupt-enable RMW that discards the read value) to a PVM csr_* with the RAW rd
+  // nibble = 15 (RawReg::from_raw_u4(15); polkavm-linker program_from_elf.rs:8849-8850).
+  // pvm_reg_lo CLAMPS 15->12 (-> g_lo = x13 = a5), so using g_lo here would WRITE the CSR
+  // read result into a5 and clobber a live register (e.g. ___slab_alloc keeps the slab
+  // pointer in a5 across its local_irq_restore `csrs mstatus,a4`, derailing the NOMMU-Linux
+  // SLUB allocator -> kmem_cache size=192 -EINVAL panic).  Honor the sentinel: raw rd
+  // nibble 15 => rd_o = x0 (writeback discarded), matching the documented ADR-1.1 design
+  // (CSR side effect preserved, no GPR write).  Only CSR ops carry this sentinel.
+  logic [4:0] g_lo_csr;
+  assign g_lo_csr = (b1[3:0] == 4'd15) ? 5'd0 : g_lo;
 
   // immediate lengths (graypaper): reg+imm / 2reg+imm / 2reg+off use
   // lX = min(4, max(0, skip-1)), immediate at byte offset 2. ecalli uses
@@ -134,6 +148,7 @@ module pvm_decoder
     rs2_o           = 5'd0;
     imm_o           = 64'd0;
     use_imm_o       = 1'b0;
+    use_zimm_o      = 1'b0;
     is_branch_o     = 1'b0;
     is_jump_o       = 1'b0;
     is_djump_o      = 1'b0;
@@ -399,7 +414,7 @@ module pvm_decoder
       //   SHLO_L_IMM_ALT_{32,64} (144/155), SHLO_R_IMM_ALT_64 (156): d = imm <</>> reg
       //     -- the polkavm2 "alt" visitor signature is (d, s2:reg, s1:imm) with s1 <</>> s2,
       //        i.e. the IMMEDIATE is shifted by the REGISTER -> SLL/SRL scratch by reg.
-      PVM_OP_NEG_ADD_IMM_32, PVM_OP_NEG_ADD_IMM_64, PVM_OP_SET_GT_U_IMM,
+      PVM_OP_NEG_ADD_IMM_32, PVM_OP_NEG_ADD_IMM_64, PVM_OP_SET_GT_U_IMM, PVM_OP_SET_GT_S_IMM,
       PVM_OP_SHLO_L_IMM_ALT_32, PVM_OP_SHLO_L_IMM_ALT_64, PVM_OP_SHLO_R_IMM_ALT_64: begin
         two_uop_o = 1'b1;
         if (!phase_i) begin
@@ -411,6 +426,7 @@ module pvm_decoder
             PVM_OP_NEG_ADD_IMM_32:    op_o = SUBW;
             PVM_OP_NEG_ADD_IMM_64:    op_o = SUB;
             PVM_OP_SET_GT_U_IMM:      op_o = SLTU;
+            PVM_OP_SET_GT_S_IMM:      op_o = SLTS;  // 143: (reg>imm)signed == SLTS(scratch=imm, reg)
             PVM_OP_SHLO_L_IMM_ALT_32: op_o = SLLW;
             PVM_OP_SHLO_L_IMM_ALT_64: op_o = SLL;
             default:                  op_o = SRL;  // SHLO_R_IMM_ALT_64
@@ -508,7 +524,27 @@ module pvm_decoder
         // mis-decoded real compiled code: e.g. OpenSBI's `_reset_regs` `csrrw mscratch, ra`
         // (preserve ra) was decoded as writing ra, corrupting the return address -> `ret` to 0
         // -> _start re-ran -> boot-lottery spin. gen_pvm_img's b1() is flipped to match. B7.
-        fu_o = CSR; rd_o = g_lo; rs1_o = g_hi_csr; imm_o = imm_ri; use_imm_o = 1'b1;
+        fu_o = CSR; rd_o = g_lo_csr; rs1_o = g_hi_csr; imm_o = imm_ri; use_imm_o = 1'b1;
+        // CSR-IMMEDIATE forms (csrrwi/rsi/rci, opcodes 234-236): the polkavm
+        // privileged encoding packs the 5-bit zimm into the SAME byte1 high-nibble slot
+        // that the register forms use for the CSR-source register (polkatool
+        // program_from_elf.rs:8824-8836 -> `let zimm=(imm)&0xF; RawReg::from(zimm)`; the
+        // linker masks zimm to 4 bits). So the high nibble here is a literal VALUE 0..15,
+        // NOT a GPR index -- it must reach csr_buffer (csr_wdata_i = operand_a) as the
+        // immediate, exactly like the stock decoder.sv (301-321) sets use_zimm. Without
+        // this the HW read a GPR (g_hi_csr) as the CSR operand: NOMMU-Linux's
+        // local_irq RMW `csrrsi mstatus,zimm` read register a1 (=0xffff..dfff) instead of
+        // the small zimm -> set mstatus.MBE (bit 37) -> big-endian -> every ld/sd
+        // byte-reversed -> a save/restore'd ra read back rev8'd -> ret to garbage ->
+        // 0xca11ab (the post-PTP silicon `!F` derail). Carry the RAW nibble b1[7:4]
+        // (0..15, the un-clamped zimm) in rs1_o; issue_read_operands zero-extends it to
+        // operand_a when use_zimm. The SET/CLEAR-vs-READ pick below stays correct: zimm=0
+        // (high nibble 0) -> CSR_READ, mirroring "write 0 bits" == a pure read.
+        if (opcode_i == PVM_OP_CSR_RWI || opcode_i == PVM_OP_CSR_RSI ||
+            opcode_i == PVM_OP_CSR_RCI) begin
+          use_zimm_o = 1'b1;
+          rs1_o      = {1'b0, b1[7:4]};  // raw zimm[3:0], zero-extended (operand A)
+        end
         // A csrrs/csrrc whose source is x0 (high nibble 0 -- the linker's x0/zimm=0 stand-in for
         // `csrr csr` reads, e.g. `csrr mhartid`) must NOT request a CSR write: CVA6's csr_regfile
         // sets csr_we=1 for any CSR_SET/CSR_CLEAR (it does not re-derive rs1==x0), so a SET/CLEAR
