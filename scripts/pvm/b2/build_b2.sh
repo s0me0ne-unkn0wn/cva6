@@ -13,7 +13,9 @@ OUT=/home/claude/pvm/artifacts/b2
 OC=riscv64-buildroot-linux-gnu-objcopy
 cd "$K" || exit 9
 echo "[$(ts)] pin the B2 initramfs (/init = user_hello.pvmi) + olddefconfig + make vmlinux"
-./scripts/config --set-str CONFIG_INITRAMFS_SOURCE /home/claude/pvm/cva6/scripts/pvm/b2/initramfs_spec.txt
+SPEC=${1:-/home/claude/pvm/cva6/scripts/pvm/b2/initramfs_spec.txt}   # arg 1: initramfs spec (B2.1 default; B2.2 = initramfs_spec_b22.txt)
+echo "[$(ts)] initramfs spec = $SPEC"
+./scripts/config --set-str CONFIG_INITRAMFS_SOURCE "$SPEC"
 make olddefconfig >/dev/null
 make -j"$(nproc)" vmlinux 2>&1 | grep -E "error|Error|warning: .*binfmt_pvm|LD .*vmlinux|CC .*binfmt_pvm" | head -20
 RC=${PIPESTATUS[0]}; echo "[$(ts)] BUILD_RC=$RC"; [ "$RC" = 0 ] || exit 10

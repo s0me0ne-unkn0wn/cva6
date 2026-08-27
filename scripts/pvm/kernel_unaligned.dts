@@ -50,6 +50,22 @@
 		reg = <0x00 0x10000 0x00 0x800000>;
 	};
 
+	/* B2.2: the user-data window. Standalone userspace .pvm programs are linked by polkatool
+	 * with `--memory-base 0x700000` (their ro/rw data are ABSOLUTE guest addresses -- PolkaVM
+	 * code has no pc-relative data addressing), so binfmt_pvm copies their ro/rw images here.
+	 * Reserved so the kernel never hands these pages to anyone else (one data-carrying
+	 * process at a time in B2.2). Inside the CSR_PVM_RAM aperture -> DRAM 0x80700000. */
+	reserved-memory {
+		#address-cells = <0x02>;
+		#size-cells = <0x02>;
+		ranges;
+
+		pvm_user_data@700000 {
+			reg = <0x00 0x700000 0x00 0x100000>;
+			no-map;
+		};
+	};
+
 	soc {
 		#address-cells = <0x02>;
 		#size-cells = <0x02>;
