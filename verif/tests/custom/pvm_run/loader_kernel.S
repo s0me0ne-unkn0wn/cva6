@@ -39,6 +39,7 @@
 #define CSR_PVM_CFG2 0xbc2
 #define CSR_PVM_VEC  0xbc4
 #define CSR_PVM_RAM  0xbc5
+#define PVM_HC_GROW  2     /* ecalli id: guest kernel asks the host to grow CFG1.code_len (B2) */
 
 #ifndef CODE_LEN
 #define CODE_LEN 4095920
@@ -190,17 +191,42 @@ host_trap:
     csrr x14, mcause
     li   x15, 11                        # ENV_CALL_M
     bne  x14, x15, trap_fault
-    # ecalli host-call: resume the guest (CFG1 = (1<<34)|(1<<33)|(1<<32)|CODE_LEN)
-    csrw CSR_PVM_CFG1, x0
-    li   x15, CODE_LEN
+    # ecalli host-call from the GUEST KERNEL (M-mode). The host-call id is in mtval (B3 ABI).
+    # B2 GROW (id PVM_HC_GROW): the kernel's binfmt_pvm appended a userspace program to the
+    # code region + rebuilt the bitmask, and asks the host to grow CFG1.code_len to a0 (PVM r7
+    # = HW x8, the sole ecalli-surviving register). The guest CANNOT csrw CFG1 itself (0xBC1 is not in
+    # the pvm_decoder csr_fence set, so its commit-flush derails fetch -> ILLEGAL). The host
+    # keeps the live code_len in CFG1[31:0] itself (re-read via csrr on a plain resume).
+    # Any other id: plain resume with the current code_len.
+    # NO LOADS ON THIS PATH (B2 deadlock lesson, 2026-08-27): a host-boundary exit can leave the
+    # PVM M3 demand-fetch port (dcache port 0, top priority) waiting for a tag it never gets
+    # (pre-fix RTL), which starves every load in the core until the resume start_pulse kills it.
+    # So the current code_len is re-read from CFG1[31:0] (a CSR, not memory) and the GROW value
+    # arrives in a register -- the path below is CSR/ALU/store only, and the resume itself is
+    # what releases the port. (Stores still drain, so the 'G' marker is safe.)
+    csrr x14, mtval
+    li   x15, PVM_HC_GROW
+    bne  x14, x15, 1f
+    # REGISTER MAP GOTCHA: pvm_decoder maps PVM rN -> RISC-V x(N+1) (r0=ra must not alias
+    # x0). So the guest's PVM a0 (r7) lives in HW x8, NOT x10 (x10 = PVM a2). Same rule as the
+    # boot seeding above (x8=a0, x9=a1) and loader_codeappend.S (putchar(r7==x8)).
+    mv   x15, x8                        # x15 = new code_len = PVM a0 (HW x8)
+    li   x14, 0x10000000                # DIAG 'G' = GROW arrived (plain sb: touches only x14/x15,
+    li   x8, 0x47                       # which are not PVM registers -> nothing of the guest is
+    sb   x8, 0(x14)                     # clobbered; x8 = PVM a0 is a declared ecalli clobber)
+    j    2f
+1:  csrr x15, CSR_PVM_CFG1              # plain resume: keep the live code_len = CFG1[31:0]
+    slli x15, x15, 32
+    srli x15, x15, 32
+2:  csrw CSR_PVM_CFG1, x0               # falling edge, then the rising edge below = start_pulse
     li   x14, 1
     slli x14, x14, 34                   # FETCH_DRAM
     or   x15, x15, x14
     li   x14, 1
-    slli x14, x14, 33                   # PVM_RESUME
+    slli x14, x14, 33                   # RESUME
     or   x15, x15, x14
     li   x14, 1
-    slli x14, x14, 32                   # PVM_ACTIVE
+    slli x14, x14, 32                   # ACTIVE
     or   x15, x15, x14
     csrw CSR_PVM_CFG1, x15
     j    wait_pvm
