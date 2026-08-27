@@ -44,6 +44,10 @@
 #ifndef CODE_LEN
 #define CODE_LEN 4095920
 #endif
+#ifndef JT_ENTRIES
+#define JT_ENTRIES 0       /* B2.3: kernel jump-table entry count K -> CFG2[63:40] (HW ignores bits >= 39;
+                              the guest binfmt_pvm appends userspace JT entries after the kernel's K) */
+#endif
 #ifndef JT_Z
 #define JT_Z 3
 #endif
@@ -150,6 +154,13 @@ _start:
     # injected interrupt rides the same stay-trap/mtvec-via-JT path as bit37 sync faults.
     li   t1, 1
     slli t1, t1, 38
+    or   t0, t0, t1
+    # B2.3: CFG2[63:40] = K = the kernel's jump-table entry count (jt_size / jt_z). Pure software
+    # side-band (the HW decodes only [38:0]): the guest kernel reads it back with csrr to know
+    # where a userspace program's jump-table entries go (jt_base + K*z) and to check that the
+    # program was linked with `polkatool --jt-index-base K`.
+    li   t1, JT_ENTRIES
+    slli t1, t1, 40
     or   t0, t0, t1
     csrw CSR_PVM_CFG2, t0
 
