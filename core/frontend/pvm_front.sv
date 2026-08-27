@@ -267,7 +267,18 @@ module pvm_front
   assign d_req_o        = (d_state_q == D_REQ) & d_en;
   assign d_addr_index_o = d_byte_addr[DC_IDX-1:0];
   assign d_addr_tag_o   = d_phys[DC_PLEN-1:DC_IDX];
-  assign d_tag_valid_o  = (d_state_q == D_TAG) & d_en;
+  // PROTOCOL OBLIGATION (found while chasing the B2 host-resume deadlock, 2026-08-27; closes a
+  // real hole but does NOT fully explain that hang -- A/B: the hanging image still hangs on the
+  // fixed bitstream; the SW rule "no loads between a host-boundary exit and the CFG1 resume"
+  // (loader_kernel.S host_trap) is what avoids it in practice): once a beat was granted, the
+  // tag phase MUST follow -- wt_dcache_ctrl sits in READ holding rd_req_o=1 to the memory
+  // arbiter until tag_valid or kill_req arrives. Gating tag_valid on d_en (= pvm_active) lost
+  // the tag when a host-boundary exit (ecalli@M) dropped pvm_active_q in the very cycle this
+  // FSM was in D_TAG (it prefetches the post-ecalli window as soon as pvm_fetch halts): port 0
+  // (PTW, top priority) then starved every load in the core -- stores still drained, the host's
+  // first load hung, and even the debug halt request could not get through. Only the resume
+  // start_pulse (kill_req) would have released it, but the host needs a load before that.
+  assign d_tag_valid_o  = (d_state_q == D_TAG) & fetch_from_dram_i;
   assign d_kill_o       = start_pulse;                   // fence any in-flight beat on (re)entry
 
   always_ff @(posedge clk_i or negedge rst_ni) begin : p_fetch_read
