@@ -95,6 +95,9 @@ module load_unit
     WAIT_SPEC_LOAD
   }
       state_d, state_q;
+  // ILA (PVM_ILA=1): the load-unit FSM (WAIT_GNT = a load that the dcache never grants)
+  (* mark_debug = "true" *) logic [3:0] dbg_lu_state;
+  assign dbg_lu_state = 4'(state_q);
 
   // in order to decouple the response interface from the request interface,
   // we need a a buffer which can hold all inflight memory load requests

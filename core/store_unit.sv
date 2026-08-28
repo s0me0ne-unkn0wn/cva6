@@ -126,6 +126,8 @@ module store_unit
     WAIT_STORE_READY
   }
       state_d, state_q;
+  (* mark_debug = "true" *) logic [2:0] dbg_su_state;   // ILA (PVM_ILA=1): store-unit FSM
+  assign dbg_su_state = 3'(state_q);
 
   // store buffer control signals
   logic st_ready;

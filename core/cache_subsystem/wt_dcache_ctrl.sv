@@ -68,7 +68,10 @@ module wt_dcache_ctrl
     REPLAY_REQ,
     REPLAY_READ
   } state_e;
-  state_e state_d, state_q;
+  state_e state_d;
+  // ILA (PVM_ILA=1 builds): the per-port read-controller state -- READ holds rd_req_o=1 to the
+  // memory arbiter until tag_valid/kill_req, i.e. the state that can starve the other ports.
+  (* mark_debug = "true" *) state_e state_q;
 
   logic [CVA6Cfg.DCACHE_TAG_WIDTH-1:0] address_tag_d, address_tag_q;
   logic [DCACHE_CL_IDX_WIDTH-1:0] address_idx_d, address_idx_q;

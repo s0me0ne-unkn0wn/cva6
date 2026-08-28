@@ -33,8 +33,9 @@ if {$::argc >= 1} { set phase [lindex $::argv 0] }
 
 # The probe map (.ltx) lives next to the .bit (relative to the cva6/ root).
 set ltx_file  "corev_apu/fpga/work-fpga/ariane_xilinx.ltx"
-set out_csv   "/tmp/pvm_ila_capture.csv"
-set out_txt   "/tmp/pvm_ila_capture.txt"
+file mkdir /home/claude/pvm/artifacts/ila
+set out_csv   "/home/claude/pvm/artifacts/ila/pvm_ila_capture.csv"     ;# NOT /tmp (tmp-cleaner)
+set out_txt   "/home/claude/pvm/artifacts/ila/pvm_ila_capture.txt"
 
 # ---- connect (same target-finding path as program_bit.tcl) -----------------
 open_hw_manager
@@ -75,14 +76,30 @@ proc list_probe_names {ila} {
     return $names
 }
 
-if {$phase eq "arm" || $phase eq "armstall"} {
+if {$phase eq "arm" || $phase eq "armstall" || $phase eq "armexit"} {
     # -------- PHASE 1: arm a free-running (or stall-triggered) capture -------
     # Keep the most recent <depth> cycles ending at the trigger (position 0 =
     # trigger at the start; for a persistent stall the whole window is the stall).
     set_property CONTROL.TRIGGER_POSITION 0 [get_hw_ilas $ila]
     set_property CONTROL.WINDOW_COUNT     1 [get_hw_ilas $ila]
 
-    if {$phase eq "arm"} {
+    if {$phase eq "armexit"} {
+        # armexit (B2 host-resume deadlock, 2026-08-28): trigger on the FIRST host-boundary
+        # exit -- dbg_pvm_active is 1 for the whole kernel boot until the GROW ecalli, so a
+        # plain ==0 compare fires exactly there. Trigger at 1/4 of the window: 2048 cycles of
+        # guest before the exit + 6144 cycles of host code (a dozen instructions) and the wedge.
+        set_property CONTROL.CAPTURE_MODE  ALWAYS     [get_hw_ilas $ila]
+        set_property CONTROL.TRIGGER_MODE  BASIC_ONLY [get_hw_ilas $ila]
+        set_property CONTROL.TRIGGER_POSITION 2048    [get_hw_ilas $ila]
+        set aprobe [get_hw_probes -quiet "*dbg_pvm_active*" -of_objects [get_hw_ilas $ila]]
+        if {[llength $aprobe] == 0} { puts "\[ila\] ERROR: dbg_pvm_active probe not found"; catch {disconnect_hw_server}; exit 1 }
+        foreach p [get_hw_probes -quiet -of_objects [get_hw_ilas $ila]] {
+            set w [get_property WIDTH $p]
+            set_property TRIGGER_COMPARE_VALUE "eq${w}'hX" $p
+        }
+        set_property TRIGGER_COMPARE_VALUE "eq1'b0" [lindex $aprobe 0]
+        puts "\[ila\] armed EXIT trigger (dbg_pvm_active==0, position 2048)."
+    } elseif {$phase eq "arm"} {
         # Trigger = ALWAYS (free-running): every probe compares to "don't care".
         set_property CONTROL.CAPTURE_MODE  ALWAYS     [get_hw_ilas $ila]
         set_property CONTROL.TRIGGER_MODE  BASIC_ONLY [get_hw_ilas $ila]

@@ -116,7 +116,8 @@ module wt_dcache_missunit
     LOAD_WAIT,
     AMO_WAIT
   } state_e;
-  state_e state_d, state_q;
+  state_e state_d;
+  (* mark_debug = "true" *) state_e state_q;   // ILA (PVM_ILA=1): miss-unit / memory-side state
 
   // MSHR for reads
   typedef struct packed {

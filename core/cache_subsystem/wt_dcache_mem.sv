@@ -165,6 +165,12 @@ module wt_dcache_mem
   // disable low prio requests when any of the high prio reqs is present
   assign rd_req_prio   = rd_req_i & rd_prio_i;
   assign rd_req_masked = (|rd_req_prio) ? rd_req_prio : rd_req_i;
+  // ILA (PVM_ILA=1): who asks / who is masked / who is granted on the read arbiter.
+  (* mark_debug = "true" *) logic [NumPorts-1:0] dbg_rd_req, dbg_rd_prio, dbg_rd_masked, dbg_rd_ack;
+  assign dbg_rd_req    = rd_req_i;
+  assign dbg_rd_prio   = rd_prio_i;
+  assign dbg_rd_masked = rd_req_masked;
+  assign dbg_rd_ack    = rd_ack_o;
 
   logic rd_req;
   rr_arb_tree #(
