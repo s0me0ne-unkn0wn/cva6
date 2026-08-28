@@ -1,7 +1,8 @@
 /* B2.4 probe: exec chaining. /init prints a line, then execve("/prog2") -- a second data+JT
  * program (user_calls) that replaces it in the same thread group, so binfmt_pvm must let the
  * owner of the data window / JT range exec again. Expected UART:
- *   "B2.4 chain -> \n" followed by prog2's "B2.3 calls: fib(10)=55 cnt=8\n" */
+ *   "B2.4 chain -> \n" followed by prog2's line (user_calls: "B2.3 calls: fib(10)=55 cnt=8",
+ *   user_args (B2.5): "B2.5 argv: argc=2 argv1=hello-argv env0=B25=yes") */
 extern const char u_sc_md[];
 
 static inline long sys3(long nr, long a, long b, long c)
@@ -19,8 +20,8 @@ static inline long sys3(long nr, long a, long b, long c)
 
 static const char msg[] = "B2.4 chain -> \n";		/* .rodata */
 static const char path[] = "/prog2";
-static const char *argv[] = { "/prog2", 0 };		/* .data (pointers relocated by polkatool) */
-static const char *envp[] = { 0 };
+static const char *argv[] = { "/prog2", "hello-argv", 0 };	/* .data (pointers relocated by polkatool) */
+static const char *envp[] = { "B25=yes", 0 };
 
 __attribute__((noinline)) static void write_all(const char *s, int len)
 {

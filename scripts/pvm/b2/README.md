@@ -9,11 +9,15 @@ initramfs, the toolchain recipe and the silicon-proven probes.
 | B2.1  | execve() of a code-only program: code appended behind the live kernel bitmask, bitmask rebuilt behind it, host grows `CFG1.code_len` (ecalli #2 `pvm_grow`, a0 = HW x8), `start_thread` | `user_hello.S` | `B2!` |
 | B2.2  | + `.rodata/.data/.bss`: linked at the reserved user-data window `0x700000` (`polkatool --memory-base`, DTS `reserved-memory`), PVMI v2 header carries ro/rw bases | `user_data.S` | `B2.2 ro+rw: 37` |
 | B2.3  | + function calls: the program's jump-table entries are appended after the kernel's K entries (`polkatool --jt-index-base K`, K passed by the host in `CFG2[63:40]`), PVMI v3 | `user_calls.c` | `B2.3 calls: fib(10)=55 cnt=8` |
+| B2.4  | + exec chaining: the data window / JT range belong to a thread group (re-exec by the owner, reclaim from a dead owner, -EBUSY otherwise) | `user_chain.c` -> `/prog2` | `B2.4 chain -> ` + prog2's line |
+| B2.5  | + argc/argv/envp: the Linux initial stack (binfmt_flat layout), `start_user.S` passes argc/argv to `main` | `user_chain.c` -> `user_args.c` | `B2.5 argv: argc=2 argv1=hello-argv env0=B25=yes` |
 
 ## Build
 
 ```
 ./build_b23.sh user_calls            # kernel -> K -> program(K) -> kernel(initramfs) -> verify K
+./build_b23.sh user_chain user_args  # /init = user_chain, /prog2 = user_args (exec chaining)
+./b2_regress.sh [bit]                # all stages on the board, ~7 min each (4/4 PASS 2026-08-28)
 ../fpga_run.sh ~/pvm/artifacts/b2/vmlinux_b2.polkavm <tag>   # Genesys2: program bit, JTAG load, UART capture
 ```
 `build_user.sh <name> [memory_base] [K]` builds one program (`<name>.S`, or `<name>.c` + `start_user.S`);
@@ -29,11 +33,11 @@ Toolchain rules (all learned the hard way):
 * K depends on the kernel CODE only (not on the initramfs), but any kernel code change moves it ->
   rebuild the programs (`build_b23.sh` does the loop and checks).
 
-## Limits (as of B2.3)
-* one data/JT-carrying program at a time (window `[0x700000,0x800000)`, JT range `[K, K+n)`);
+## Limits (as of B2.5)
+* one data/JT-carrying program at a time (window `[0x700000,0x800000)`, JT range `[K, K+n)` -- owned
+  by a thread group; sequential exec is fine, concurrent data programs are not);
 * the code region is append-only (Harvard; each exec re-copies the kernel bitmask: ~230 KB, ~1 s);
-* no heap/sbrk, no argv/envp/auxv (sp = top of an anonymous stack), no `polkatool` interpreter run
-  of these images (hardware-only memory map).
+* no heap/sbrk, no auxv, no `polkatool` interpreter run of these images (hardware-only memory map).
 
 Host side: `verif/tests/custom/pvm_run/loader_kernel.S` (`host_trap`: GROW, K side-band; the resume
 path is CSR/ALU/store only -- see the deadlock note in its comments and in `core/frontend/pvm_front.sv`).

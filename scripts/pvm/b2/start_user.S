@@ -1,6 +1,7 @@
 /* Common startup for C userspace .pvm programs (B2.3): the PVM ecalli metadata for the
  * Linux syscall (RV64E: nr in t0, args a0..a5), the `_start` export, and _start itself:
- * call main (a REAL call -> the return goes through the jump table), then exit(main()).
+ * a0 = argc, a1 = argv (B2.5 initial stack), call main (a REAL call -> the return goes through
+ * the jump table), then exit(main()).
  * Linked by polkatool with --memory-base 0x700000 --jt-index-base K (K = the guest kernel's
  * jump-table entry count, see binfmt_pvm). */
 	.section .polkavm_metadata, "a", %progbits
@@ -40,6 +41,9 @@ u_entry_md:
 	.balign	8
 	.globl	_start
 _start:
+	/* B2.5: sp -> argc, argv[], NULL, envp[], NULL, strings (binfmt_pvm pvm_create_tables) */
+	ld	a0, 0(sp)				/* argc */
+	addi	a1, sp, 8				/* argv */
 	andi	sp, sp, -16
 	call	main					/* -> ret = dynamic jump via the (shared) jump table */
 	li	t0, 93					/* __NR_exit(a0 = main's return value) */
