@@ -73,6 +73,23 @@ module wt_dcache_ctrl
   // memory arbiter until tag_valid/kill_req, i.e. the state that can starve the other ports.
   (* mark_debug = "true" *) state_e state_q;
 
+`ifndef SYNTHESIS
+  // Simulation watchdog (B2 host-resume deadlock, 2026-08-28): READ waits for the requester's
+  // tag_valid (or kill_req) while holding rd_req_o=1 to the memory arbiter. A requester that
+  // is muxed away mid-request (the cva6 port-0 PVM/PTW mux dropping with a beat in flight) left
+  // this FSM in READ forever and starved everyone else. Flag any READ that lasts 1000 cycles.
+  int unsigned dbg_read_cycles;
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) dbg_read_cycles <= 0;
+    else if (state_q != READ) dbg_read_cycles <= 0;
+    else begin
+      dbg_read_cycles <= dbg_read_cycles + 1;
+      if (dbg_read_cycles == 1000)
+        $error("%m: wt_dcache_ctrl stuck in READ for 1000 cycles without tag_valid/kill_req (requester muxed away?)");
+    end
+  end
+`endif
+
   logic [CVA6Cfg.DCACHE_TAG_WIDTH-1:0] address_tag_d, address_tag_q;
   logic [DCACHE_CL_IDX_WIDTH-1:0] address_idx_d, address_idx_q;
   logic [CVA6Cfg.DCACHE_OFFSET_WIDTH-1:0] address_off_d, address_off_q;

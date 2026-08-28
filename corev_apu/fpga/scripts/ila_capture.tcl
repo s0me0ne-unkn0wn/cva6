@@ -84,28 +84,32 @@ if {$phase eq "arm" || $phase eq "armstall" || $phase eq "armexit"} {
     set_property CONTROL.WINDOW_COUNT     1 [get_hw_ilas $ila]
 
     if {$phase eq "armexit"} {
-        # armexit (B2 host-resume deadlock, 2026-08-28): trigger on the FIRST host-boundary
-        # exit -- dbg_pvm_active is 1 for the whole kernel boot until the GROW ecalli, so a
-        # plain ==0 compare fires exactly there. Trigger at 1/4 of the window: 2048 cycles of
-        # guest before the exit + 6144 cycles of host code (a dozen instructions) and the wedge.
+        # armexit (B2 host-resume deadlock, 2026-08-28): trigger on the GROW host-call itself --
+        # dbg_pvm_is_hostcall==1 while dbg_pvm_pc == <pc> (the ecalli's PVM-pc, default 0xC0738 =
+        # 788280 in the v8 image; pass another as the 2nd tclarg). Transition-free and unique
+        # (pvm_active alone is 0 before the kernel starts, so it cannot be used as a level).
+        # Trigger at 1/4 of the window: 2048 cycles of guest before + 6144 after (host code + wedge).
+        set trig_pc 0C0738
+        if {$::argc >= 2} { set trig_pc [lindex $::argv 1] }
         set_property CONTROL.CAPTURE_MODE  ALWAYS     [get_hw_ilas $ila]
-        set_property CONTROL.TRIGGER_MODE  BASIC_ONLY [get_hw_ilas $ila]
         set_property CONTROL.TRIGGER_POSITION 2048    [get_hw_ilas $ila]
-        set aprobe [get_hw_probes -quiet "*dbg_pvm_active*" -of_objects [get_hw_ilas $ila]]
-        if {[llength $aprobe] == 0} { puts "\[ila\] ERROR: dbg_pvm_active probe not found"; catch {disconnect_hw_server}; exit 1 }
+        set hprobe [get_hw_probes -quiet "*dbg_pvm_is_hostcall*" -of_objects [get_hw_ilas $ila]]
+        set pprobe [get_hw_probes -quiet "*dbg_pvm_pc*" -of_objects [get_hw_ilas $ila]]
+        if {[llength $hprobe] == 0 || [llength $pprobe] == 0} { puts "\[ila\] ERROR: is_hostcall/pc probes not found"; catch {disconnect_hw_server}; exit 1 }
         foreach p [get_hw_probes -quiet -of_objects [get_hw_ilas $ila]] {
             set w [get_property WIDTH $p]
-            set_property TRIGGER_COMPARE_VALUE "eq${w}'hX" $p
+            set_property TRIGGER_COMPARE_VALUE "eq${w}'b[string repeat X $w]" $p
         }
-        set_property TRIGGER_COMPARE_VALUE "eq1'b0" [lindex $aprobe 0]
-        puts "\[ila\] armed EXIT trigger (dbg_pvm_active==0, position 2048)."
+        set_property TRIGGER_COMPARE_VALUE "eq1'b1" [lindex $hprobe 0]
+        set pw [get_property WIDTH [lindex $pprobe 0]]
+        set_property TRIGGER_COMPARE_VALUE "eq${pw}'h${trig_pc}" [lindex $pprobe 0]
+        puts "\[ila\] armed HOSTCALL trigger (is_hostcall==1 && pc==0x${trig_pc}, position 2048)."
     } elseif {$phase eq "arm"} {
         # Trigger = ALWAYS (free-running): every probe compares to "don't care".
         set_property CONTROL.CAPTURE_MODE  ALWAYS     [get_hw_ilas $ila]
-        set_property CONTROL.TRIGGER_MODE  BASIC_ONLY [get_hw_ilas $ila]
         foreach p [get_hw_probes -quiet -of_objects [get_hw_ilas $ila]] {
             set w [get_property WIDTH $p]
-            set_property TRIGGER_COMPARE_VALUE "eq${w}'hX" $p
+            set_property TRIGGER_COMPARE_VALUE "eq${w}'b[string repeat X $w]" $p
         }
         puts "\[ila\] armed FREE-RUNNING (trigger=always, capture=always)."
     } else {
@@ -113,7 +117,6 @@ if {$phase eq "arm" || $phase eq "armstall" || $phase eq "armexit"} {
         # = a DRAM beat awaiting rvalid that never returns. Names come from the
         # .ltx (the submodule reg names). If absent, falls back to free-running.
         set_property CONTROL.CAPTURE_MODE  ALWAYS     [get_hw_ilas $ila]
-        set_property CONTROL.TRIGGER_MODE  BASIC_ONLY [get_hw_ilas $ila]
         set rprobe [get_hw_probes -quiet "*running_q*" -of_objects [get_hw_ilas $ila]]
         set dprobe [get_hw_probes -quiet "*d_state_q*" -of_objects [get_hw_ilas $ila]]
         if {[llength $rprobe] > 0 && [llength $dprobe] > 0} {
@@ -124,7 +127,7 @@ if {$phase eq "arm" || $phase eq "armstall" || $phase eq "armexit"} {
             puts "\[ila\] stall-probe names not found; falling back to free-running always."
         }
     }
-    run_hw_ila -quiet [get_hw_ilas $ila]
+    if {[catch {run_hw_ila -quiet [get_hw_ilas $ila]} err]} { puts "\[ila\] ERROR arming: $err"; catch {disconnect_hw_server}; exit 1 }
     puts "\[ila\] ARMED. Probes: [list_probe_names $ila]"
     puts "\[ila\] Now paced-send the OpenSBI blob, let it hang, then re-run with -tclargs dump."
     # Closing the hw_manager does NOT stop the armed ILA in the fabric (it keeps
@@ -144,7 +147,11 @@ if {$phase eq "dump"} {
     write_hw_ila_data -force -csv_file $out_csv $data
     puts "\[ila\] wrote CSV: $out_csv"
 
-    # Human-readable text table (sample x probe, hex).
+    # Human-readable text table (sample x probe, hex) -- 8192 x 46 get_hw_probe_value calls take
+    # minutes, so only on request (`-tclargs dump txt`); scripts/pvm/ila_analyze.py reads the CSV.
+    set want_txt [expr {$::argc >= 2 && [lindex $::argv 1] eq "txt"}]
+    puts "\[ila\] trigger position: [get_property CONTROL.TRIGGER_POSITION [get_hw_ilas $ila]], depth: [get_property CORE.DATA_DEPTH [get_hw_ilas $ila]], status: [get_property STATUS.CORE_STATUS [get_hw_ilas $ila]]"
+    if {!$want_txt} { catch {disconnect_hw_server}; catch {close_hw_manager}; exit 0 }
     set probes [get_hw_probes -quiet -of_objects [get_hw_ilas $ila]]
     set nsamp  [get_property CORE.DATA_DEPTH [get_hw_ilas $ila]]
     set fh [open $out_txt w]

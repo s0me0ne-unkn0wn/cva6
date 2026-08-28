@@ -482,6 +482,8 @@ module cva6
   logic                    pvm_storeimm_resolved;   // a store_imm macro's store drained while pvm_active
   dcache_req_i_t pvm_dreq;
   logic pvm_d_req, pvm_d_tag_valid, pvm_d_kill, pvm_d_gnt, pvm_d_rvalid;
+  logic pvm_d_busy;                  // M3: a demand-fetch beat is in flight on dcache port 0
+  logic pvm_dport_own_q;             // M3: port 0 stays with the PVM fetch until that beat completes
   logic [CVA6Cfg.DCACHE_INDEX_WIDTH-1:0] pvm_d_addr_index;
   logic [CVA6Cfg.DCACHE_TAG_WIDTH-1:0]   pvm_d_addr_tag;
   logic [CVA6Cfg.XLEN-1:0]               pvm_d_rdata;
@@ -685,6 +687,7 @@ module cva6
         .d_addr_tag_o   (pvm_d_addr_tag),
         .d_tag_valid_o  (pvm_d_tag_valid),
         .d_kill_o       (pvm_d_kill),
+        .d_busy_o       (pvm_d_busy),
         .d_gnt_i        (pvm_d_gnt),
         .d_rvalid_i     (pvm_d_rvalid),
         .d_rdata_i      (pvm_d_rdata),
@@ -754,6 +757,7 @@ module cva6
     assign pvm_d_addr_tag = '0;
     assign pvm_d_tag_valid = 1'b0;
     assign pvm_d_kill = 1'b0;
+    assign pvm_d_busy = 1'b0;
   end
 
   // ===========================================================================
@@ -1835,8 +1839,20 @@ module cva6
   assign pvm_d_gnt    = dcache_req_from_cache[0].data_gnt;
   assign pvm_d_rvalid = dcache_req_from_cache[0].data_rvalid;
   assign pvm_d_rdata  = dcache_req_from_cache[0].data_rdata;
-  assign dcache_req_to_cache[0] = (pvm_fetch_from_dram & pvm_active) ? pvm_dreq
-                                                                     : dcache_req_ports_ex_cache[0];
+  // Port-0 ownership is STICKY across a host-boundary exit: pvm_active_q drops one cycle after
+  // the exception commit, which can land between a beat's gnt and its tag phase. Switching the
+  // mux there leaves wt_dcache_ctrl[0] in READ forever (it never sees tag_valid), and its
+  // high-priority speculative rd_req then starves the SRAM arbiter: the write buffer cannot
+  // drain, the host's next load to the same line collides with the in-flight write TX in the
+  // miss unit -> the core wedges (B2 host-resume deadlock, root-caused with the ILA 2026-08-28).
+  // So the PVM request keeps the port until pvm_front reports the beat complete (d_busy=0);
+  // the PTW is idle in M-mode Bare anyway, and on re-entry start_pulse kills any leftover.
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) pvm_dport_own_q <= 1'b0;
+    else         pvm_dport_own_q <= (pvm_fetch_from_dram & pvm_active) | (pvm_dport_own_q & pvm_d_busy);
+  end
+  assign dcache_req_to_cache[0] = ((pvm_fetch_from_dram & pvm_active) | pvm_dport_own_q) ? pvm_dreq
+                                                                                          : dcache_req_ports_ex_cache[0];
   assign dcache_req_to_cache[1] = dcache_req_ports_ex_cache[1];
   assign dcache_req_to_cache[2] = dcache_req_ports_acc_cache[0];
   assign dcache_req_to_cache[3] = dcache_req_ports_ex_cache[2].data_req ? dcache_req_ports_ex_cache [2] :

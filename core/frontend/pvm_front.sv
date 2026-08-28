@@ -54,6 +54,8 @@ module pvm_front
     output logic [DC_TAG-1:0] d_addr_tag_o,  // address_tag (phase B, physical)
     output logic            d_tag_valid_o,   // tag_valid (phase B)
     output logic            d_kill_o,        // kill_req (mode-transition / flush)
+    output logic            d_busy_o,        // a beat is in flight (granted, tag/rvalid pending): the
+                                             // port-0 mux must stay on us until it completes (B2 deadlock)
     input  logic            d_gnt_i,         // data_gnt
     input  logic            d_rvalid_i,      // data_rvalid
     input  logic [63:0]     d_rdata_i,       // data_rdata (64-bit beat)
@@ -280,6 +282,13 @@ module pvm_front
   // start_pulse (kill_req) would have released it, but the host needs a load before that.
   assign d_tag_valid_o  = (d_state_q == D_TAG) & fetch_from_dram_i;
   assign d_kill_o       = start_pulse;                   // fence any in-flight beat on (re)entry
+  // In flight = the dcache has granted a beat and still owes us the tag phase and/or rvalid.
+  // (ILA 2026-08-28: a host-boundary exit dropped pvm_active with the FSM in D_TAG; the cva6
+  // port-0 mux switched to the PTW that same cycle, so wt_dcache_ctrl never saw tag_valid and
+  // sat in READ forever, its high-priority speculative rd_req starving the SRAM arbiter -> the
+  // write buffer could not drain -> the host's load to the same line collided with the in-flight
+  // write TX -> core wedged. The mux now holds while d_busy_o.)
+  assign d_busy_o       = fetch_from_dram_i & (d_expect_q | (d_state_q == D_TAG) | (d_state_q == D_WAIT));
 
   always_ff @(posedge clk_i or negedge rst_ni) begin : p_fetch_read
     if (!rst_ni) begin
