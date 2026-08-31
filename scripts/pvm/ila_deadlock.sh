@@ -9,7 +9,7 @@
 #   5. dump the captured window                     (vivado ila_capture.tcl dump) -> CSV/TXT
 # Artifacts: ~/pvm/artifacts/ila/<ts>/  (uart, oocd, vivado logs, pvm_ila_capture.{csv,txt})
 set -u
-BIN=${1:?kernel_dram.bin}; BIT=${2:-/home/claude/pvm/cva6/corev_apu/fpga/work-fpga/ariane_xilinx.bit}; TRIGPC=${3:-0C0738}
+BIN=${1:?kernel_dram.bin}; BIT=${2:-/home/claude/pvm/cva6/corev_apu/fpga/work-fpga/ariane_xilinx.bit}; TRIGPC=${3:-0C0738}; PHASE=${4:-armexit}
 S=/home/claude/pvm/cva6/scripts/pvm; ROOT=/home/claude/pvm/cva6
 OUT=/home/claude/pvm/artifacts/ila/$(date +%Y%m%d_%H%M%S); mkdir -p $OUT
 exec > $OUT/run.log 2>&1
@@ -28,7 +28,7 @@ echo "[$(ts)] 2. load (halted)"
 openocd -f $S/ariane_jtag.cfg -c init -c halt -c "load_image $BIN 0x80000000 bin" -c "reg pc 0x80000000" -c shutdown > $OUT/oocd_load.log 2>&1
 echo "[$(ts)]    rc=$? $(grep -a 'downloaded' $OUT/oocd_load.log | tail -1)"
 echo "[$(ts)] 3. arm (exit trigger)"
-(cd $ROOT && vivado -nojournal -nolog -mode batch -source corev_apu/fpga/scripts/ila_capture.tcl -tclargs armexit $TRIGPC) > $OUT/arm.vivado.log 2>&1
+(cd $ROOT && vivado -nojournal -nolog -mode batch -source corev_apu/fpga/scripts/ila_capture.tcl -tclargs $PHASE $TRIGPC) > $OUT/arm.vivado.log 2>&1
 echo "[$(ts)]    rc=$? $(grep -av '^#' $OUT/arm.vivado.log | grep -a '\[ila\] armed\|\[ila\] ARMED\|ERROR' | head -3 | tr '\n' ' ')"
 pkill -x hw_server 2>/dev/null; sleep 1
 grep -aq '\[ila\] ARMED' $OUT/arm.vivado.log || { echo "[$(ts)] ARM FAILED -- aborting before resume"; kill $CAP 2>/dev/null; exit 3; }

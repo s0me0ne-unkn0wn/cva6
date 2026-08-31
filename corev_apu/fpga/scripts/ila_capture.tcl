@@ -76,14 +76,31 @@ proc list_probe_names {ila} {
     return $names
 }
 
-if {$phase eq "arm" || $phase eq "armstall" || $phase eq "armexit"} {
+if {$phase eq "arm" || $phase eq "armstall" || $phase eq "armexit" || $phase eq "armrace"} {
     # -------- PHASE 1: arm a free-running (or stall-triggered) capture -------
     # Keep the most recent <depth> cycles ending at the trigger (position 0 =
     # trigger at the start; for a persistent stall the whole window is the stall).
     set_property CONTROL.TRIGGER_POSITION 0 [get_hw_ilas $ila]
     set_property CONTROL.WINDOW_COUNT     1 [get_hw_ilas $ila]
 
-    if {$phase eq "armexit"} {
+    if {$phase eq "armrace"} {
+        # armrace (B2.7 GROW->mtvec race): capture the DANGEROUS WINDOW itself -- an M-level
+        # interrupt becomes pending (dbg_pvm_irq_valid==1) while the front holds an issued,
+        # not-yet-committed ecalli (dbg_pvm_is_hostcall==1). Fires on successful runs too;
+        # the capture shows how the commit-cycle classification resolves (or mis-resolves).
+        set_property CONTROL.CAPTURE_MODE  ALWAYS     [get_hw_ilas $ila]
+        set_property CONTROL.TRIGGER_POSITION 4096    [get_hw_ilas $ila]
+        set hprobe [get_hw_probes -quiet "*dbg_pvm_is_hostcall*" -of_objects [get_hw_ilas $ila]]
+        set iprobe [get_hw_probes -quiet "*dbg_pvm_irq_valid*" -of_objects [get_hw_ilas $ila]]
+        if {[llength $hprobe] == 0 || [llength $iprobe] == 0} { puts "\[ila\] ERROR: is_hostcall/irq_valid probes not found"; catch {disconnect_hw_server}; exit 1 }
+        foreach p [get_hw_probes -quiet -of_objects [get_hw_ilas $ila]] {
+            set w [get_property WIDTH $p]
+            set_property TRIGGER_COMPARE_VALUE "eq${w}'b[string repeat X $w]" $p
+        }
+        set_property TRIGGER_COMPARE_VALUE "eq1'b1" [lindex $hprobe 0]
+        set_property TRIGGER_COMPARE_VALUE "eq1'b1" [lindex $iprobe 0]
+        puts "\[ila\] armed RACE-WINDOW trigger (is_hostcall==1 && irq_valid==1, position 4096)."
+    } elseif {$phase eq "armexit"} {
         # armexit (B2 host-resume deadlock, 2026-08-28): trigger on the GROW host-call itself --
         # dbg_pvm_is_hostcall==1 while dbg_pvm_pc == <pc> (the ecalli's PVM-pc, default 0xC0738 =
         # 788280 in the v8 image; pass another as the 2nd tclarg). Transition-free and unique

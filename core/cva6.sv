@@ -783,6 +783,13 @@ module cva6
     (* mark_debug = "true" *) logic        dbg_pvm_is_branch;
     (* mark_debug = "true" *) logic        dbg_pvm_is_jump;
     (* mark_debug = "true" *) logic        dbg_pvm_is_hostcall;
+    (* mark_debug = "true" *) logic        dbg_pvm_use_vec;     // host-boundary class (combinational, held-to-commit)
+    (* mark_debug = "true" *) logic        dbg_pvm_stay;        // guest-internal class
+    (* mark_debug = "true" *) logic [1:0]  dbg_priv_lvl;        // csr_regfile privilege at this cycle
+    (* mark_debug = "true" *) logic        dbg_pvm_irq_take;    // async-IRQ injected into the issuing uop
+    (* mark_debug = "true" *) logic        dbg_pvm_irq_valid;   // an M-level irq is pending+enabled
+    (* mark_debug = "true" *) logic        dbg_excommit_valid;  // an exception commits this cycle
+    (* mark_debug = "true" *) logic        dbg_excommit_intr;   // ...and it is an interrupt (cause MSB)
     (* mark_debug = "true" *) logic        dbg_pvm_is_trap;
     (* mark_debug = "true" *) logic        dbg_pvm_illegal;
     (* mark_debug = "true" *) logic        dbg_pvm_unsupported;
@@ -805,6 +812,13 @@ module cva6
       dbg_pvm_is_branch       = pvm_is_branch;
       dbg_pvm_is_jump         = pvm_is_jump;
       dbg_pvm_is_hostcall     = pvm_is_hostcall;
+      dbg_pvm_use_vec         = pvm_use_vec;
+      dbg_pvm_stay            = pvm_stay;
+      dbg_priv_lvl            = priv_lvl;
+      dbg_pvm_irq_take        = pvm_irq_take;
+      dbg_pvm_irq_valid       = pvm_irq_valid;
+      dbg_excommit_valid      = ex_commit.valid;
+      dbg_excommit_intr       = ex_commit.cause[CVA6Cfg.XLEN-1];
       dbg_pvm_is_trap         = pvm_is_trap;
       dbg_pvm_illegal         = pvm_illegal;
       dbg_pvm_unsupported     = pvm_unsupported;
