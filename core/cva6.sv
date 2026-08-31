@@ -567,13 +567,45 @@ module cva6
   // Single source of truth for the ecalli split, so pvm_use_vec (host class) and pvm_stay
   // (guest-internal class) are SYNTACTICALLY disjoint and can't desync on a future edit.
   assign pvm_ecalli_at_m = pvm_is_hostcall & (priv_lvl == riscv::PRIV_LVL_M);
+  // The host-exit vs guest-stay class of an ecalli/trap exception uop (pvm_use_vec /
+  // pvm_stay_ecalli) is DECODE-derived: pvm_is_hostcall / pvm_is_trap / pvm_illegal /
+  // pvm_unsupported / pvm_done are COMBINATIONAL from pvm_front's current pc. Once the
+  // exception uop is accepted at issue, pvm_fetch halts and ADVANCES the pc / reloads the
+  // next window (the M3 prefetch), so those live signals can change BEFORE the uop reaches
+  // commit -- and a rare async-IRQ-induced flush stretches that issue->commit window. Routing
+  // the trap from the live signals then misclassifies: a GROW ecalli@M whose pvm_is_hostcall
+  // has already glitched to 0 by its commit cycle routes cause=ENV_CALL_MMODE to the GUEST
+  // mtvec instead of CSR_PVM_VEC -> "Oops - environment call from M-mode" (the intermittent
+  // B2 GROW race, root-caused by code review 2026-08-31; the ex_commit that carries the cause
+  // IS pipelined/held, so only the classification was skewed). Fix: latch the class at the
+  // accept cycle (is_hostcall etc. are still valid then -- that is what made it an exception
+  // uop) and hold it until the exception commits. Only ONE exception uop is ever outstanding
+  // (the front halts after accepting it), so a single holding register is exact.
+  logic pvm_use_vec_live, pvm_stay_ecalli_live, pvm_exc_accept;
+  logic pvm_use_vec_held_q, pvm_stay_ecalli_held_q, pvm_exc_pending_q;
+  assign pvm_use_vec_live     = pvm_ecalli_at_m | pvm_is_trap | pvm_illegal | pvm_unsupported | pvm_done;
+  assign pvm_stay_ecalli_live = pvm_is_hostcall & ~pvm_ecalli_at_m;
+  // an exception uop (ecalli / trap / illegal / unsupported / clean-halt / injected-IRQ) is
+  // accepted into the issue stage this cycle
+  assign pvm_exc_accept = CVA6Cfg.PvmPresent & pvm_active & issue_instr_issue_id[0] & pvm_sbe.valid;
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      pvm_use_vec_held_q <= 1'b0; pvm_stay_ecalli_held_q <= 1'b0; pvm_exc_pending_q <= 1'b0;
+    end else if (pvm_exc_accept) begin              // capture the decode-time class, mark pending
+      pvm_use_vec_held_q     <= pvm_use_vec_live;
+      pvm_stay_ecalli_held_q <= pvm_stay_ecalli_live;
+      pvm_exc_pending_q      <= 1'b1;
+    end else if (ex_commit.valid) begin             // the exception committed (or flushed): release
+      pvm_exc_pending_q      <= 1'b0;
+    end
+  end
   assign pvm_use_vec = CVA6Cfg.PvmPresent & pvm_active &
-                       (pvm_ecalli_at_m | pvm_is_trap | pvm_illegal | pvm_unsupported | pvm_done);
-  // pvm_stay_ecalli = a guest-internal supervisor call (ecalli@priv<M): suppress the pvm_active
-  // exit and redirect pvm_fetch to the guest trap vector. Held-to-commit, same coherence as
-  // pvm_use_vec (B4: pvm_front holds the exception uop's decode stable through commit, and
-  // priv_lvl_q still holds the from-priv at the trap's commit cycle).
-  assign pvm_stay_ecalli = CVA6Cfg.PvmPresent & pvm_active & pvm_is_hostcall & ~pvm_ecalli_at_m;
+                       (pvm_exc_pending_q ? pvm_use_vec_held_q : pvm_use_vec_live);
+  // pvm_stay_ecalli = a guest-internal supervisor call (ecalli@priv<M, e.g. a U-mode userspace
+  // syscall): suppress the pvm_active exit and redirect pvm_fetch to the guest trap vector.
+  // Same held-to-commit classification as pvm_use_vec (they are syntactically disjoint).
+  assign pvm_stay_ecalli = CVA6Cfg.PvmPresent & pvm_active &
+                       (pvm_exc_pending_q ? pvm_stay_ecalli_held_q : pvm_stay_ecalli_live);
   // pvm_fu_fault = a guest SYNCHRONOUS FU-exception (misaligned load/store, instr/load/store access
   // fault, page fault, breakpoint) raised by a functional unit (LSU/etc.) at commit while pvm_active.
   // The guest OS (NOMMU M-mode Linux) services these at its OWN mtvec=handle_exception (e.g. CONFIG_
