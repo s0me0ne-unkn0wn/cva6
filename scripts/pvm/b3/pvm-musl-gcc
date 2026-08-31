@@ -1,0 +1,19 @@
+#!/bin/bash
+# gcc wrapper for cva6-pvm musl userspace (lp64e, no relax, polkatool-linkable output).
+M=/home/claude/pvm/musl-pvm
+export PATH=/home/claude/pvm/cva6-sdk/buildroot/output/host/bin:$PATH
+BASE=(-march=rv64emac_zbb -mabi=lp64e -mcmodel=medany -mno-relax -fno-jump-tables
+      -nostdinc -isystem "$M/include")
+link=1
+for a in "$@"; do case "$a" in
+  -c|-E|-S|-M|-MM|--version|-v|-dumpversion|-dumpmachine|-print-*) link=0;;
+  -r|-Wl,-r|-Wl,--relocatable|-nostdlib) link=0;;   # partial links / caller manages the runtime
+esac; done
+if [ $link = 1 ]; then
+  LIBGCC=$(riscv64-buildroot-linux-gnu-gcc -march=rv64emac_zbb -mabi=lp64e -print-libgcc-file-name)
+  exec riscv64-buildroot-linux-gnu-gcc "${BASE[@]}" -nostdlib -static \
+    -Wl,--no-relax -Wl,--emit-relocs -Wl,--build-id=none -L"$M/lib" \
+    "$M/lib/crt1.o" "$@" "$M/lib/libc.a" "$LIBGCC"
+else
+  exec riscv64-buildroot-linux-gnu-gcc "${BASE[@]}" "$@"
+fi

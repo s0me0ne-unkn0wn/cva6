@@ -1,0 +1,396 @@
+diff -ruN '--exclude=obj' '--exclude=lib' '--exclude=config.mak' '--exclude=*.o' '--exclude=*.lo' musl-orig/arch/riscv64/crt_arch.h /home/claude/pvm/musl-1.2.5/arch/riscv64/crt_arch.h
+--- musl-orig/arch/riscv64/crt_arch.h	2024-03-01 03:07:33.000000000 +0100
++++ /home/claude/pvm/musl-1.2.5/arch/riscv64/crt_arch.h	2026-08-31 22:43:59.644572471 +0200
+@@ -1,19 +1,44 @@
++/* cva6-pvm RV64E: no gp(x3)/tp(x4) exist in the PVM register set, so no
++ * __global_pointer$ setup (we build with -mno-relax anyway) and no _DYNAMIC
++ * (static-only). The PVM ecalli metadata for the Linux syscall and the
++ * .polkavm_exports record for _start live here so every linked program has them. */
+ __asm__(
+-".section .sdata,\"aw\"\n"
++".pushsection .polkavm_metadata,\"a\",%progbits\n"
++"__pvm_sc_sym:\n"
++".asciz \"linux_syscall\"\n"
++"__pvm_sc_sym_end:\n"
++".globl __pvm_sc_md\n"
++"__pvm_sc_md:\n"
++".byte 2\n"
++".word 0\n"
++".word __pvm_sc_sym_end - __pvm_sc_sym - 1\n"
++".quad __pvm_sc_sym\n"
++".byte 6\n"
++".byte 2\n"
++".byte 1\n"
++".word 0\n"
++"__pvm_start_name:\n"
++".asciz \"_start\"\n"
++"__pvm_start_name_end:\n"
++"__pvm_start_md:\n"
++".byte 1\n"
++".word 0\n"
++".word __pvm_start_name_end - __pvm_start_name - 1\n"
++".quad __pvm_start_name\n"
++".byte 0\n"
++".byte 0\n"
++".popsection\n"
++".pushsection .polkavm_exports,\"R\",%note\n"
++".byte 1\n"
++".quad __pvm_start_md\n"
++".quad " START "\n"
++".popsection\n"
+ ".text\n"
+ ".global " START "\n"
+ ".type " START ",%function\n"
+ START ":\n"
+-".weak __global_pointer$\n"
+-".hidden __global_pointer$\n"
+-".option push\n"
+-".option norelax\n\t"
+-"lla gp, __global_pointer$\n"
+-".option pop\n\t"
+-"mv a0, sp\n"
+-".weak _DYNAMIC\n"
+-".hidden _DYNAMIC\n\t"
+-"lla a1, _DYNAMIC\n\t"
+-"andi sp, sp, -16\n\t"
+-"tail " START "_c"
++"	mv a0, sp\n"
++"	li a1, 0\n"
++"	andi sp, sp, -16\n"
++"	tail " START "_c"
+ );
+diff -ruN '--exclude=obj' '--exclude=lib' '--exclude=config.mak' '--exclude=*.o' '--exclude=*.lo' musl-orig/arch/riscv64/pthread_arch.h /home/claude/pvm/musl-1.2.5/arch/riscv64/pthread_arch.h
+--- musl-orig/arch/riscv64/pthread_arch.h	2024-03-01 03:07:33.000000000 +0100
++++ /home/claude/pvm/musl-1.2.5/arch/riscv64/pthread_arch.h	2026-08-31 22:40:56.135290636 +0200
+@@ -1,8 +1,10 @@
++/* cva6-pvm: no tp(x4) register in the PVM set; the thread pointer lives in a
++ * memory global (single-threaded static libc -- same trick as the guest kernel's
++ * `current`). Set by __set_thread_area.s. */
++extern uintptr_t __pvm_tp;
+ static inline uintptr_t __get_tp()
+ {
+-	uintptr_t tp;
+-	__asm__ __volatile__("mv %0, tp" : "=r"(tp));
+-	return tp;
++	return __pvm_tp;
+ }
+ 
+ #define TLS_ABOVE_TP
+diff -ruN '--exclude=obj' '--exclude=lib' '--exclude=config.mak' '--exclude=*.o' '--exclude=*.lo' musl-orig/arch/riscv64/syscall_arch.h /home/claude/pvm/musl-1.2.5/arch/riscv64/syscall_arch.h
+--- musl-orig/arch/riscv64/syscall_arch.h	2024-03-01 03:07:33.000000000 +0100
++++ /home/claude/pvm/musl-1.2.5/arch/riscv64/syscall_arch.h	2026-08-31 22:40:56.135145320 +0200
+@@ -1,73 +1,76 @@
+ #define __SYSCALL_LL_E(x) (x)
+ #define __SYSCALL_LL_O(x) (x)
+ 
++/* cva6-pvm: the kernel is a PolkaVM guest; a syscall is a PVM ecalli (polkatool lowers the
++ * .insn marker + metadata pointer into `ecalli 0`), and the RV64E kernel takes the syscall
++ * number in t0. __pvm_sc_md lives in crt_arch.h (crt1.o). */
+ #define __asm_syscall(...) \
+-	__asm__ __volatile__ ("ecall\n\t" \
++	__asm__ __volatile__ (".insn r 0xb, 0, 0, zero, zero, zero\n\t.quad __pvm_sc_md\n\t" \
+ 	: "=r"(a0) : __VA_ARGS__ : "memory"); \
+ 	return a0; \
+ 
+ static inline long __syscall0(long n)
+ {
+-	register long a7 __asm__("a7") = n;
++	register long t0 __asm__("t0") = n;
+ 	register long a0 __asm__("a0");
+-	__asm_syscall("r"(a7))
++	__asm_syscall("r"(t0))
+ }
+ 
+ static inline long __syscall1(long n, long a)
+ {
+-	register long a7 __asm__("a7") = n;
++	register long t0 __asm__("t0") = n;
+ 	register long a0 __asm__("a0") = a;
+-	__asm_syscall("r"(a7), "0"(a0))
++	__asm_syscall("r"(t0), "0"(a0))
+ }
+ 
+ static inline long __syscall2(long n, long a, long b)
+ {
+-	register long a7 __asm__("a7") = n;
++	register long t0 __asm__("t0") = n;
+ 	register long a0 __asm__("a0") = a;
+ 	register long a1 __asm__("a1") = b;
+-	__asm_syscall("r"(a7), "0"(a0), "r"(a1))
++	__asm_syscall("r"(t0), "0"(a0), "r"(a1))
+ }
+ 
+ static inline long __syscall3(long n, long a, long b, long c)
+ {
+-	register long a7 __asm__("a7") = n;
++	register long t0 __asm__("t0") = n;
+ 	register long a0 __asm__("a0") = a;
+ 	register long a1 __asm__("a1") = b;
+ 	register long a2 __asm__("a2") = c;
+-	__asm_syscall("r"(a7), "0"(a0), "r"(a1), "r"(a2))
++	__asm_syscall("r"(t0), "0"(a0), "r"(a1), "r"(a2))
+ }
+ 
+ static inline long __syscall4(long n, long a, long b, long c, long d)
+ {
+-	register long a7 __asm__("a7") = n;
++	register long t0 __asm__("t0") = n;
+ 	register long a0 __asm__("a0") = a;
+ 	register long a1 __asm__("a1") = b;
+ 	register long a2 __asm__("a2") = c;
+ 	register long a3 __asm__("a3") = d;
+-	__asm_syscall("r"(a7), "0"(a0), "r"(a1), "r"(a2), "r"(a3))
++	__asm_syscall("r"(t0), "0"(a0), "r"(a1), "r"(a2), "r"(a3))
+ }
+ 
+ static inline long __syscall5(long n, long a, long b, long c, long d, long e)
+ {
+-	register long a7 __asm__("a7") = n;
++	register long t0 __asm__("t0") = n;
+ 	register long a0 __asm__("a0") = a;
+ 	register long a1 __asm__("a1") = b;
+ 	register long a2 __asm__("a2") = c;
+ 	register long a3 __asm__("a3") = d;
+ 	register long a4 __asm__("a4") = e;
+-	__asm_syscall("r"(a7), "0"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4))
++	__asm_syscall("r"(t0), "0"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4))
+ }
+ 
+ static inline long __syscall6(long n, long a, long b, long c, long d, long e, long f)
+ {
+-	register long a7 __asm__("a7") = n;
++	register long t0 __asm__("t0") = n;
+ 	register long a0 __asm__("a0") = a;
+ 	register long a1 __asm__("a1") = b;
+ 	register long a2 __asm__("a2") = c;
+ 	register long a3 __asm__("a3") = d;
+ 	register long a4 __asm__("a4") = e;
+ 	register long a5 __asm__("a5") = f;
+-	__asm_syscall("r"(a7), "0"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5))
++	__asm_syscall("r"(t0), "0"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5))
+ }
+ 
+ #define VDSO_USEFUL
+diff -ruN '--exclude=obj' '--exclude=lib' '--exclude=config.mak' '--exclude=*.o' '--exclude=*.lo' musl-orig/src/env/__init_tls.c /home/claude/pvm/musl-1.2.5/src/env/__init_tls.c
+--- musl-orig/src/env/__init_tls.c	2024-03-01 03:07:33.000000000 +0100
++++ /home/claude/pvm/musl-1.2.5/src/env/__init_tls.c	2026-08-31 22:45:10.868562792 +0200
+@@ -77,7 +77,9 @@
+ typedef Elf64_Phdr Phdr;
+ #endif
+ 
+-extern weak hidden const size_t _DYNAMIC[];
++/* cva6-pvm static-only: polkatool cannot resolve weak-undefined symbols to 0 the way
++ * ld does, and _DYNAMIC never exists in our static links -- hardwire it to NULL. */
++#define _DYNAMIC ((const size_t *)0)
+ 
+ static void static_init_tls(size_t *aux)
+ {
+diff -ruN '--exclude=obj' '--exclude=lib' '--exclude=config.mak' '--exclude=*.o' '--exclude=*.lo' musl-orig/src/ldso/dl_iterate_phdr.c /home/claude/pvm/musl-1.2.5/src/ldso/dl_iterate_phdr.c
+--- musl-orig/src/ldso/dl_iterate_phdr.c	2024-03-01 03:07:33.000000000 +0100
++++ /home/claude/pvm/musl-1.2.5/src/ldso/dl_iterate_phdr.c	2026-08-31 22:45:10.868462738 +0200
+@@ -5,7 +5,9 @@
+ 
+ #define AUX_CNT 38
+ 
+-extern weak hidden const size_t _DYNAMIC[];
++/* cva6-pvm static-only: polkatool cannot resolve weak-undefined symbols to 0 the way
++ * ld does, and _DYNAMIC never exists in our static links -- hardwire it to NULL. */
++#define _DYNAMIC ((const size_t *)0)
+ 
+ static int static_dl_iterate_phdr(int(*callback)(struct dl_phdr_info *info, size_t size, void *data), void *data)
+ {
+diff -ruN '--exclude=obj' '--exclude=lib' '--exclude=config.mak' '--exclude=*.o' '--exclude=*.lo' musl-orig/src/process/riscv64/vfork.s /home/claude/pvm/musl-1.2.5/src/process/riscv64/vfork.s
+--- musl-orig/src/process/riscv64/vfork.s	2024-03-01 03:07:33.000000000 +0100
++++ /home/claude/pvm/musl-1.2.5/src/process/riscv64/vfork.s	2026-08-31 22:40:56.135385169 +0200
+@@ -1,12 +1,12 @@
+ .global vfork
+ .type vfork,@function
+ vfork:
+-	/* riscv does not have SYS_vfork, so we must use clone instead */
+-	/* note: riscv's clone = clone(flags, sp, ptidptr, tls, ctidptr) */
+-	li a7, 220
+-	li a0, 0x100 | 0x4000 | 17 /* flags = CLONE_VM | CLONE_VFORK | SIGCHLD */
++	/* riscv has no SYS_vfork: clone(CLONE_VM|CLONE_VFORK|SIGCHLD, sp).
++	 * cva6-pvm RV64E: nr in t0, syscall = the PVM ecalli marker. */
++	li t0, 220
++	li a0, 0x100 | 0x4000 | 17
+ 	mv a1, sp
+-	/* the other arguments are ignoreable */
+-	ecall
++	.insn r 0xb, 0, 0, zero, zero, zero
++	.quad __pvm_sc_md
+ 	.hidden __syscall_ret
+ 	j __syscall_ret
+diff -ruN '--exclude=obj' '--exclude=lib' '--exclude=config.mak' '--exclude=*.o' '--exclude=*.lo' musl-orig/src/setjmp/riscv64/longjmp.S /home/claude/pvm/musl-1.2.5/src/setjmp/riscv64/longjmp.S
+--- musl-orig/src/setjmp/riscv64/longjmp.S	2024-03-01 03:07:33.000000000 +0100
++++ /home/claude/pvm/musl-1.2.5/src/setjmp/riscv64/longjmp.S	2026-08-31 22:40:56.135891599 +0200
+@@ -9,16 +9,6 @@
+ longjmp:
+ 	ld s0,    0(a0)
+ 	ld s1,    8(a0)
+-	ld s2,    16(a0)
+-	ld s3,    24(a0)
+-	ld s4,    32(a0)
+-	ld s5,    40(a0)
+-	ld s6,    48(a0)
+-	ld s7,    56(a0)
+-	ld s8,    64(a0)
+-	ld s9,    72(a0)
+-	ld s10,   80(a0)
+-	ld s11,   88(a0)
+ 	ld sp,    96(a0)
+ 	ld ra,    104(a0)
+ 
+diff -ruN '--exclude=obj' '--exclude=lib' '--exclude=config.mak' '--exclude=*.o' '--exclude=*.lo' musl-orig/src/setjmp/riscv64/setjmp.S /home/claude/pvm/musl-1.2.5/src/setjmp/riscv64/setjmp.S
+--- musl-orig/src/setjmp/riscv64/setjmp.S	2024-03-01 03:07:33.000000000 +0100
++++ /home/claude/pvm/musl-1.2.5/src/setjmp/riscv64/setjmp.S	2026-08-31 22:40:56.135811618 +0200
+@@ -9,16 +9,6 @@
+ setjmp:
+ 	sd s0,    0(a0)
+ 	sd s1,    8(a0)
+-	sd s2,    16(a0)
+-	sd s3,    24(a0)
+-	sd s4,    32(a0)
+-	sd s5,    40(a0)
+-	sd s6,    48(a0)
+-	sd s7,    56(a0)
+-	sd s8,    64(a0)
+-	sd s9,    72(a0)
+-	sd s10,   80(a0)
+-	sd s11,   88(a0)
+ 	sd sp,    96(a0)
+ 	sd ra,    104(a0)
+ 
+diff -ruN '--exclude=obj' '--exclude=lib' '--exclude=config.mak' '--exclude=*.o' '--exclude=*.lo' musl-orig/src/signal/riscv64/restore.s /home/claude/pvm/musl-1.2.5/src/signal/riscv64/restore.s
+--- musl-orig/src/signal/riscv64/restore.s	2024-03-01 03:07:33.000000000 +0100
++++ /home/claude/pvm/musl-1.2.5/src/signal/riscv64/restore.s	2026-08-31 22:40:56.135423487 +0200
+@@ -4,5 +4,6 @@
+ .global __restore_rt
+ .type __restore_rt, %function
+ __restore_rt:
+-	li a7, 139 # SYS_rt_sigreturn
+-	ecall
++	li t0, 139 # SYS_rt_sigreturn (RV64E: nr in t0)
++	.insn r 0xb, 0, 0, zero, zero, zero
++	.quad __pvm_sc_md
+diff -ruN '--exclude=obj' '--exclude=lib' '--exclude=config.mak' '--exclude=*.o' '--exclude=*.lo' musl-orig/src/thread/riscv64/clone.s /home/claude/pvm/musl-1.2.5/src/thread/riscv64/clone.s
+--- musl-orig/src/thread/riscv64/clone.s	2024-03-01 03:07:33.000000000 +0100
++++ /home/claude/pvm/musl-1.2.5/src/thread/riscv64/clone.s	2026-08-31 22:40:56.135490484 +0200
+@@ -1,34 +1,33 @@
+ # __clone(func, stack, flags, arg, ptid, tls, ctid)
+-#           a0,    a1,    a2,  a3,   a4,  a5,   a6
+-
+-# syscall(SYS_clone, flags, stack, ptid, tls, ctid)
+-#                a7     a0,    a1,   a2,  a3,   a4
++#  lp64e:    a0,    a1,    a2,  a3,   a4,  a5, 0(sp)
++# syscall(SYS_clone, flags, stack, ptid, tls, ctid) -- RV64E: nr in t0
+ 
+ .global __clone
+ .type  __clone, %function
+ __clone:
+-	# Save func and arg to stack
++	# Save func and arg to the child stack
+ 	addi a1, a1, -16
+ 	sd a0, 0(a1)
+ 	sd a3, 8(a1)
+ 
+-	# Call SYS_clone
+-	mv a0, a2
+-	mv a2, a4
+-	mv a3, a5
+-	mv a4, a6
+-	li a7, 220 # SYS_clone
+-	ecall
++	mv a0, a2      # flags
++	mv a2, a4      # ptid
++	mv a3, a5      # tls
++	ld a4, 0(sp)   # ctid (7th arg, on the stack under lp64e)
++	li t0, 220     # SYS_clone
++	.insn r 0xb, 0, 0, zero, zero, zero
++	.quad __pvm_sc_md
+ 
+ 	beqz a0, 1f
+ 	# Parent
+ 	ret
+ 
+ 	# Child
+-1:      ld a1, 0(sp)
++1:	ld a1, 0(sp)
+ 	ld a0, 8(sp)
+ 	jalr a1
+ 
+ 	# Exit
+-	li a7, 93 # SYS_exit
+-	ecall
++	li t0, 93 # SYS_exit
++	.insn r 0xb, 0, 0, zero, zero, zero
++	.quad __pvm_sc_md
+diff -ruN '--exclude=obj' '--exclude=lib' '--exclude=config.mak' '--exclude=*.o' '--exclude=*.lo' musl-orig/src/thread/riscv64/__set_thread_area.s /home/claude/pvm/musl-1.2.5/src/thread/riscv64/__set_thread_area.s
+--- musl-orig/src/thread/riscv64/__set_thread_area.s	2024-03-01 03:07:33.000000000 +0100
++++ /home/claude/pvm/musl-1.2.5/src/thread/riscv64/__set_thread_area.s	2026-08-31 22:40:56.135337373 +0200
+@@ -1,6 +1,14 @@
++.data
++.balign 8
++.global __pvm_tp
++__pvm_tp:
++	.quad 0
++
++.text
+ .global __set_thread_area
+-.type   __set_thread_area, %function
++.type __set_thread_area, %function
+ __set_thread_area:
+-	mv tp, a0
++	la t1, __pvm_tp
++	sd a0, 0(t1)
+ 	li a0, 0
+ 	ret
+diff -ruN '--exclude=obj' '--exclude=lib' '--exclude=config.mak' '--exclude=*.o' '--exclude=*.lo' musl-orig/src/thread/riscv64/syscall_cp.s /home/claude/pvm/musl-1.2.5/src/thread/riscv64/syscall_cp.s
+--- musl-orig/src/thread/riscv64/syscall_cp.s	2024-03-01 03:07:33.000000000 +0100
++++ /home/claude/pvm/musl-1.2.5/src/thread/riscv64/syscall_cp.s	2026-08-31 22:40:56.135457542 +0200
+@@ -8,21 +8,21 @@
+ .global __syscall_cp_asm
+ .hidden __syscall_cp_asm
+ .type __syscall_cp_asm, %function
++/* lp64e: (cancel_ptr, nr, u1, u2, u3, u4 in a0-a5; u5, u6 on the stack). */
+ __syscall_cp_asm:
+ __cp_begin:
+-	lw t0, 0(a0)
+-	bnez t0, __cp_cancel
++	lw t1, 0(a0)
++	bnez t1, __cp_cancel
+ 
+ 	mv t0, a1
+ 	mv a0, a2
+ 	mv a1, a3
+ 	mv a2, a4
+ 	mv a3, a5
+-	mv a4, a6
+-	mv a5, a7
+-	ld a6, 0(sp)
+-	mv a7, t0
+-	ecall
++	ld a4, 0(sp)
++	ld a5, 8(sp)
++	.insn r 0xb, 0, 0, zero, zero, zero
++	.quad __pvm_sc_md
+ __cp_end:
+ 	ret
+ __cp_cancel:
+diff -ruN '--exclude=obj' '--exclude=lib' '--exclude=config.mak' '--exclude=*.o' '--exclude=*.lo' musl-orig/src/thread/riscv64/__unmapself.s /home/claude/pvm/musl-1.2.5/src/thread/riscv64/__unmapself.s
+--- musl-orig/src/thread/riscv64/__unmapself.s	2024-03-01 03:07:33.000000000 +0100
++++ /home/claude/pvm/musl-1.2.5/src/thread/riscv64/__unmapself.s	2026-08-31 22:40:56.135543511 +0200
+@@ -1,7 +1,9 @@
+ .global __unmapself
+ .type __unmapself, %function
+ __unmapself:
+-	li a7, 215 # SYS_munmap
+-	ecall
+-	li a7, 93  # SYS_exit
+-	ecall
++	li t0, 215 # SYS_munmap
++	.insn r 0xb, 0, 0, zero, zero, zero
++	.quad __pvm_sc_md
++	li t0, 93  # SYS_exit
++	.insn r 0xb, 0, 0, zero, zero, zero
++	.quad __pvm_sc_md

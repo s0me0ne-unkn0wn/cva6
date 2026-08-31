@@ -346,6 +346,29 @@ MCAUSE   = 0x342  # M-mode trap cause; an ecalli@S presents ENV_CALL_SMODE(9) (c
 MIE      = 0x304  # M-mode interrupt-enable (MSIE bit3 / MTIE bit7)
 
 
+def emit_rotimm_test():
+    """rot-imm decode gate (B3: libgcc/Zbb rori): ops 158 (ROT_R_64_IMM) / 160 (ROT_R_32_IMM),
+    encoded like the plain reg+imm ALU family (byte1 = (rs<<4)|rd, then a 1-byte imm here).
+      r2 = 0x40 ; r3 = ror64(r2, 1) = 0x20 ; r3 += 3  -> '#' (0x23)
+      r4 = 0x52 ; r5 = ror32(r4, 1) = 0x29           -> ')'
+      putchar(r3) ; putchar(r5) ; trap.  Expect "#)"."""
+    ROT_R_64_IMM = 0x9E  # 158
+    ROT_R_32_IMM = 0xA0  # 160
+    ADD_IMM_32   = 0x83  # 131
+    code = (
+        [LOAD_IMM, 0x02, 0x40]                    # r2 = 0x40                @0  (3B)
+        + [ROT_R_64_IMM, (2 << 4) | 3, 0x01]      # r3 = ror64(r2,1) = 0x20  @3  (3B)
+        + [ADD_IMM_32, (3 << 4) | 3, 0x03]        # r3 += 3 -> 0x23 '#'      @6  (3B)
+        + [LOAD_IMM, 0x04, 0x52]                  # r4 = 0x52                @9  (3B)
+        + [ROT_R_32_IMM, (4 << 4) | 5, 0x01]      # r5 = ror32(r4,1) = 0x29  @12 (3B)
+        + [LOAD_IMM_64, 0x08] + le(UART_THR, 8)   # r8 = UART                @15 (10B)
+        + [STORE_IND_U8, (8 << 4) | 3, 0x00]      # [r8] = r3 -> '#'         @25 (3B)
+        + [STORE_IND_U8, (8 << 4) | 5, 0x00]      # [r8] = r5 -> ')'         @28 (3B)
+        + [TRAP]                                  #                          @31 (1B)
+    )
+    starts = [0, 3, 6, 9, 12, 15, 25, 28, 31]
+    return code, starts
+
 def emit_irq_test():
     """Async-IRQ-to-guest gate (CFG2[38]): a pending machine interrupt must be delivered
     to a PVM guest that spins with interrupts enabled -- WITHOUT the inject the guest loops
@@ -1519,6 +1542,8 @@ def main():
         code, starts = emit_csr_test()
     elif mode == "csri":
         code, starts = emit_csri_test()
+    elif mode == "rotimm":
+        code, starts = emit_rotimm_test()
     elif mode == "irq":
         code, starts = emit_irq_test()
     elif mode == "mtvec":

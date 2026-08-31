@@ -20,7 +20,7 @@
 // arithmetic, reg+imm loads/stores, jump_ind, reg-reg branches, load_imm,
 // load_imm_64, ecalli, trap, privileged CSR/mret/sret/wfi/sfence). Ops needing
 // multi-uop macro-expansion or reverse-operand routing (store_imm*, branch_*_imm,
-// load_imm_jump[_ind], neg_add_imm, *_alt shifts, rot_*_imm) are flagged
+// load_imm_jump[_ind], neg_add_imm) are flagged (alt shifts + rot-imm wired 2026-08-31)
 // `unsupported_o` for a later increment.
 
 module pvm_decoder
@@ -265,7 +265,8 @@ module pvm_decoder
       PVM_OP_XOR_IMM, PVM_OP_MUL_IMM_32, PVM_OP_MUL_IMM_64,
       PVM_OP_SET_LT_U_IMM, PVM_OP_SET_LT_S_IMM,
       PVM_OP_SHLO_L_IMM_32, PVM_OP_SHLO_R_IMM_32, PVM_OP_SHAR_R_IMM_32,
-      PVM_OP_SHLO_L_IMM_64, PVM_OP_SHLO_R_IMM_64, PVM_OP_SHAR_R_IMM_64: begin
+      PVM_OP_SHLO_L_IMM_64, PVM_OP_SHLO_R_IMM_64, PVM_OP_SHAR_R_IMM_64,
+      PVM_OP_ROT_R_64_IMM, PVM_OP_ROT_R_32_IMM: begin
         rd_o = g_lo; rs1_o = g_hi; imm_o = imm_ri; use_imm_o = 1'b1; fu_o = ALU;
         unique case (opcode_i)
           PVM_OP_ADD_IMM_32:   op_o = ADDW;
@@ -277,6 +278,8 @@ module pvm_decoder
           PVM_OP_MUL_IMM_64:   begin op_o = MUL;  fu_o = MULT; end
           PVM_OP_SET_LT_U_IMM: op_o = SLTU;
           PVM_OP_SET_LT_S_IMM: op_o = SLTS;
+          PVM_OP_ROT_R_64_IMM: op_o = ROR;   // B3: libgcc (Zbb) uses rori; reg-form ROT was already wired
+          PVM_OP_ROT_R_32_IMM: op_o = RORW;
           PVM_OP_SHLO_L_IMM_32:op_o = SLLW;
           PVM_OP_SHLO_R_IMM_32:op_o = SRLW;
           PVM_OP_SHAR_R_IMM_32:op_o = SRAW;
@@ -415,7 +418,8 @@ module pvm_decoder
       //     -- the polkavm2 "alt" visitor signature is (d, s2:reg, s1:imm) with s1 <</>> s2,
       //        i.e. the IMMEDIATE is shifted by the REGISTER -> SLL/SRL scratch by reg.
       PVM_OP_NEG_ADD_IMM_32, PVM_OP_NEG_ADD_IMM_64, PVM_OP_SET_GT_U_IMM, PVM_OP_SET_GT_S_IMM,
-      PVM_OP_SHLO_L_IMM_ALT_32, PVM_OP_SHLO_L_IMM_ALT_64, PVM_OP_SHLO_R_IMM_ALT_64: begin
+      PVM_OP_SHLO_L_IMM_ALT_32, PVM_OP_SHLO_L_IMM_ALT_64, PVM_OP_SHLO_R_IMM_ALT_64,
+      PVM_OP_ROT_R_64_IMM_ALT, PVM_OP_ROT_R_32_IMM_ALT: begin
         two_uop_o = 1'b1;
         if (!phase_i) begin
           fu_o = ALU; op_o = ADD; rd_o = PVM_SCRATCH; rs1_o = 5'd0;
@@ -429,6 +433,8 @@ module pvm_decoder
             PVM_OP_SET_GT_S_IMM:      op_o = SLTS;  // 143: (reg>imm)signed == SLTS(scratch=imm, reg)
             PVM_OP_SHLO_L_IMM_ALT_32: op_o = SLLW;
             PVM_OP_SHLO_L_IMM_ALT_64: op_o = SLL;
+            PVM_OP_ROT_R_64_IMM_ALT:  op_o = ROR;   // d = imm ror reg (reverse routing)
+            PVM_OP_ROT_R_32_IMM_ALT:  op_o = RORW;
             default:                  op_o = SRL;  // SHLO_R_IMM_ALT_64
           endcase
         end

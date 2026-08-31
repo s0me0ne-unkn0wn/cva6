@@ -144,6 +144,14 @@ run-csri: loader.S link.ld gen_pvm_img.py
 # mstatus.MIE and spins; the HW must inject the machine software interrupt at a uop
 # boundary and redirect to the guest mtvec handler, which prints '@'. Without the inject
 # the guest spins to the timeout (FAIL). -DPVM_IRQ turns on CFG2[38] in the loader.
+run-rotimm: loader.S link.ld gen_pvm_img.py
+	@CL=$$(python3 gen_pvm_img.py '' rotimm.hex rotimm | grep CODE_LEN | grep -oE '[0-9]+'); \
+	 $(CC) $(CFLAGS) -DCODE_LEN=$$CL -T link.ld -o loader_rotimm.elf loader.S; \
+	 echo ">> rot-imm decode (B3 libgcc rori; expect '#)'):"; \
+	 OUT=$$($(HARNESS) +PVM_IMG=$(abspath rotimm.hex) +tohost_addr=$(TOHOST) +time_out=200000 $(abspath loader_rotimm.elf) 2>&1); \
+	 echo "$$OUT" | grep -aE 'SUCCESS'; \
+	 echo "$$OUT" | grep -qa '#)' && echo "   rot-imm OK ('#)' returned)" || { echo "   *** rot-imm FAILED ***"; exit 1; }
+
 run-irq: loader.S link.ld gen_pvm_img.py
 	@CL=$$(python3 gen_pvm_img.py '' irq.hex irq | grep CODE_LEN | grep -oE '[0-9]+'); \
 	 $(CC) $(CFLAGS) -DPVM_IRQ -DCODE_LEN=$$CL -T link.ld -o loader_irq.elf loader.S; \

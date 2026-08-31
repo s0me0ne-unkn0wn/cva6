@@ -41,3 +41,16 @@ Toolchain rules (all learned the hard way):
 
 Host side: `verif/tests/custom/pvm_run/loader_kernel.S` (`host_trap`: GROW, K side-band; the resume
 path is CSR/ALU/store only -- see the deadlock note in its comments and in `core/frontend/pvm_front.sv`).
+
+## B3: musl + busybox (2026-09-01)
+Real userspace: musl-1.2.5 ported to rv64e/lp64e/PVM (`../b3/musl-1.2.5-pvm-lp64e.patch`,
+13 files: syscall nr in t0 + the ecalli marker, no gp/tp -- the thread pointer is the
+`__pvm_tp` global, setjmp s0/s1 only, lp64e stack args in clone/syscall_cp, `_DYNAMIC`
+hardwired to NULL, `--with-malloc=oldmalloc` -- mallocng's get_meta asserts under our mmap,
+open question). Build: `../b3/pvm-musl-gcc` wrapper (partial-link passthrough, crt1 first);
+busybox 1.37 allnoconfig + `../b3/busybox_pvm_frag.config` via sed+oldconfig (KCONFIG_ALLCONFIG
+does NOT work in busybox; ash needs !NOMMU -> use hush). Probes: `hello_musl.c` (printf),
+`init_musl.c` (vfork+execv+waitpid) + `busybox_musl.elfsrc` (regenerate: busybox_unstripped).
+Proven on Genesys2: `busybox uname -a` -> "Linux ariane-fpga 6.19.6 riscv64", echo, and a
+standalone hush running `echo && uname -m`. Decoder: rot-imm ops (158-161) wired for Zbb libgcc
+(`run-rotimm` gate); polkatool: the direct-call macro split at O0/O1.
