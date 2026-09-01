@@ -46,11 +46,19 @@ path is CSR/ALU/store only -- see the deadlock note in its comments and in `core
 Real userspace: musl-1.2.5 ported to rv64e/lp64e/PVM (`../b3/musl-1.2.5-pvm-lp64e.patch`,
 13 files: syscall nr in t0 + the ecalli marker, no gp/tp -- the thread pointer is the
 `__pvm_tp` global, setjmp s0/s1 only, lp64e stack args in clone/syscall_cp, `_DYNAMIC`
-hardwired to NULL, `--with-malloc=oldmalloc` -- mallocng's get_meta asserts under our mmap,
-open question). Build: `../b3/pvm-musl-gcc` wrapper (partial-link passthrough, crt1 first);
+hardwired to NULL, default mallocng -- the earlier get_meta asserts were the latest64-vs-jam_v1
+ISA skew in disguise, fixed by --instruction-set jam_v1, see below). Build: `../b3/pvm-musl-gcc` wrapper (partial-link passthrough, crt1 first);
 busybox 1.37 allnoconfig + `../b3/busybox_pvm_frag.config` via sed+oldconfig (KCONFIG_ALLCONFIG
 does NOT work in busybox; ash needs !NOMMU -> use hush). Probes: `hello_musl.c` (printf),
 `init_musl.c` (vfork+execv+waitpid) + `busybox_musl.elfsrc` (regenerate: busybox_unstripped).
 Proven on Genesys2: `busybox uname -a` -> "Linux ariane-fpga 6.19.6 riscv64", echo, and a
 standalone hush running `echo && uname -m`. Decoder: rot-imm ops (158-161) wired for Zbb libgcc
 (`run-rotimm` gate); polkatool: the direct-call macro split at O0/O1.
+
+## B4 addendum (2026-09-02)
+Userspace polkatool links MUST pass `--instruction-set jam_v1` (polkatool defaults to
+latest64 whose unary opcode group -- clz/ctz/cpop/sext/zext/rev8 -- is renumbered vs the
+RTL's jam_v1_privileged table; the kernel links `-i jam_v1_privileged`). Symptoms of the
+skew: mallocng get_meta a_crash, hush $((math)) "unexpected )". Guard:
+`scripts/pvm/check_isa_tables.py` + the run-sext/run-sextbr sim gates. busybox builds with
+CONFIG_BUSYBOX_EXEC_PATH="/prog2" (no procfs for /proc/self/exe); ash needs !NOMMU -> hush.
