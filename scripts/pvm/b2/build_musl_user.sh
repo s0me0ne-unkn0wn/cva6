@@ -18,7 +18,7 @@ riscv64-buildroot-linux-gnu-gcc -march=rv64emac_zbb -mabi=lp64e -mcmodel=medany 
   -nostdlib -nostartfiles -static -Wl,--no-relax -Wl,--emit-relocs -Wl,--build-id=none \
   -o "$NAME.elf" $M/lib/crt1.o "$NAME.c" $M/lib/libc.a "$LIBGCC"
 fi
-"$P" link --opt-level 0 --strip --memory-base "$MB" --jt-index-base "$K" -o "$NAME.polkavm" "$NAME.elf"
+"$P" link --instruction-set jam_v1 --opt-level 0 --strip --memory-base "$MB" --jt-index-base "$K" -o "$NAME.polkavm" "$NAME.elf"
 "$P" emit-image --memory-base "$MB" --jt-index-base "$K" -o "$NAME.pvmi" "$NAME.polkavm"
 rm -f "$NAME.elf"
 ls -la "$NAME.pvmi"

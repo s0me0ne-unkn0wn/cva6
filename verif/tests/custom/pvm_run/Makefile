@@ -152,6 +152,22 @@ run-rotimm: loader.S link.ld gen_pvm_img.py
 	 echo "$$OUT" | grep -aE 'SUCCESS'; \
 	 echo "$$OUT" | grep -qa '#)' && echo "   rot-imm OK ('#)' returned)" || { echo "   *** rot-imm FAILED ***"; exit 1; }
 
+run-sext: loader.S link.ld gen_pvm_img.py
+	@CL=$$(python3 gen_pvm_img.py '' sext.hex sext | grep CODE_LEN | grep -oE '[0-9]+'); \
+	 $(CC) $(CFLAGS) -DCODE_LEN=$$CL -T link.ld -o loader_sext.elf loader.S; \
+	 echo ">> sign_extend_8/16 (B4 hush math; expect '11'):"; \
+	 OUT=$$($(HARNESS) +PVM_IMG=$(abspath sext.hex) +tohost_addr=$(TOHOST) +time_out=200000 $(abspath loader_sext.elf) 2>&1); \
+	 echo "$$OUT" | grep -aE 'SUCCESS'; \
+	 echo "$$OUT" | grep -qa '11' && echo "   sext OK ('11' returned)" || { echo "   *** sext FAILED ***"; exit 1; }
+
+run-sextbr: loader.S link.ld gen_pvm_img.py
+	@for v in 0 1; do \
+	 CL=$$(python3 gen_pvm_img.py '' sextbr$$v.hex sextbr$$v | grep CODE_LEN | grep -oE '[0-9]+'); \
+	 $(CC) $(CFLAGS) -DCODE_LEN=$$CL -T link.ld -o loader_sextbr$$v.elf loader.S; \
+	 OUT=$$($(HARNESS) +PVM_IMG=$(abspath sextbr$$v.hex) +tohost_addr=$(TOHOST) +time_out=200000 $(abspath loader_sextbr$$v.elf) 2>&1); \
+	 echo "$$OUT" | grep -qa 'F' && echo "   sextbr$$v OK (branch not taken)" || { echo "   *** sextbr$$v FAILED ***"; exit 1; }; \
+	 done
+
 run-irq: loader.S link.ld gen_pvm_img.py
 	@CL=$$(python3 gen_pvm_img.py '' irq.hex irq | grep CODE_LEN | grep -oE '[0-9]+'); \
 	 $(CC) $(CFLAGS) -DPVM_IRQ -DCODE_LEN=$$CL -T link.ld -o loader_irq.elf loader.S; \

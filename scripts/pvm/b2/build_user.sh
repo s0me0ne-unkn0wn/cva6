@@ -22,7 +22,7 @@ if [ -f "$NAME.c" ]; then
 else
   riscv64-linux-gnu-gcc $CF -o "$NAME.elf" "$NAME.S"
 fi
-"$P" link --opt-level 0 --strip "${MBARG[@]}" "${KARG[@]}" -o "$NAME.polkavm" "$NAME.elf"
+"$P" link --instruction-set jam_v1 --opt-level 0 --strip "${MBARG[@]}" "${KARG[@]}" -o "$NAME.polkavm" "$NAME.elf"
 "$P" emit-image "${MBARG[@]}" "${KARG[@]}" -o "$NAME.pvmi" "$NAME.polkavm"
 rm -f "$NAME.elf"
 ls -la "$NAME.pvmi"

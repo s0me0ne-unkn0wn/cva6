@@ -369,6 +369,59 @@ def emit_rotimm_test():
     starts = [0, 3, 6, 9, 12, 15, 25, 28, 31]
     return code, starts
 
+def emit_sextbr_test(imm_len):
+    """B4 hush-math repro: r3 = sext8(0xA9) (= -87); branch_ge_s_imm r3, 0 must NOT be
+    taken. imm_len 0 = zero-length imm_X (polkatool's encoding of 0), 1 = explicit 0x00.
+    Fall-through 'F' = correct, taken 'T' = the busybox bug."""
+    SIGN_EXTEND_8 = 0x6B    # 107
+    BR_GE_S_IMM   = 0x59    # 89
+    b1 = (imm_len << 4) | 3
+    br = [BR_GE_S_IMM, b1] + ([0x00] if imm_len else []) + [8]
+    blen = len(br)
+    code = (
+        [LOAD_IMM, 0x02, 0xA9]            # r2 = 0xA9                  @0 (3B)
+        + [SIGN_EXTEND_8, (2 << 4) | 3]   # r3 = sext8(r2) = -87       @3 (2B)
+        + br                              # if r3 >=s 0 -> +8          @5 (blen)
+        + [LOAD_IMM, 0x07, ord('F')]      # fall: r7='F' (correct)     @5+blen (3B)
+        + [ECALLI, 0x00]                  #                            (2B)
+        + [TRAP]                          #                            (1B)
+        + [LOAD_IMM, 0x07, ord('T')]      # taken: r7='T' (bug)        @5+blen+6+? -> +8 from br
+        + [ECALLI, 0x00]
+        + [TRAP]
+    )
+    b = 5 + blen
+    starts = [0, 3, 5, b, b+3, b+5, b+6, b+9, b+11]
+    return code, starts
+
+def emit_sext_test():
+    """sign_extend_8/16 gate (B4 hush math: gcc lowers `c & 0x80; if (!c)` to sext.b+bgez).
+    r2=0xA9; r3=sext8(r2) must be 0xFFFF...FFA9 (negative). r4 = r3 >>a 8 -> all-ones;
+    (r4 & 0x11) + 0x30 -> '1' if sign-extended, '0' if zero-extended. Same for sext16
+    with 0x8000 -> '1'/'0'. Expect "11"; the zero-extend bug prints "00"."""
+    SIGN_EXTEND_8  = 0x6B  # 107
+    SIGN_EXTEND_16 = 0x6C  # 108
+    SAR_64_IMM     = 0x99  # 153 shift_arithmetic_right_imm_64 (136 = set_lt_u_imm!)
+    AND_IMM        = 0x84  # 132
+    ADD_IMM_32     = 0x83  # 131
+    code = (
+        [LOAD_IMM, 0x02, 0xA9, 0x00]              # r2 = 0xA9                 @0  (4B)
+        + [SIGN_EXTEND_8, (2 << 4) | 3]           # r3 = sext8(r2)            @4  (2B)
+        + [SAR_64_IMM, (3 << 4) | 3, 0x08]        # r3 >>= (arith) 8          @6  (3B)
+        + [AND_IMM, (3 << 4) | 3, 0x01]           # r3 &= 1                   @9  (3B)
+        + [ADD_IMM_32, (3 << 4) | 3, 0x30]        # r3 += '0'                 @12 (3B)
+        + [LOAD_IMM, 0x04, 0x00, 0x80]            # r4 = 0x8000               @15 (4B)
+        + [SIGN_EXTEND_16, (4 << 4) | 5]          # r5 = sext16(r4)           @19 (2B)
+        + [SAR_64_IMM, (5 << 4) | 5, 0x10]        # r5 >>= (arith) 16         @21 (3B)
+        + [AND_IMM, (5 << 4) | 5, 0x01]           # r5 &= 1                   @24 (3B)
+        + [ADD_IMM_32, (5 << 4) | 5, 0x30]        # r5 += '0'                 @27 (3B)
+        + [LOAD_IMM_64, 0x08] + le(UART_THR, 8)   # r8 = UART                 @30 (10B)
+        + [STORE_IND_U8, (8 << 4) | 3, 0x00]      # putchar(r3)               @40 (3B)
+        + [STORE_IND_U8, (8 << 4) | 5, 0x00]      # putchar(r5)               @43 (3B)
+        + [TRAP]                                  #                           @46 (1B)
+    )
+    starts = [0, 4, 6, 9, 12, 15, 19, 21, 24, 27, 30, 40, 43, 46]
+    return code, starts
+
 def emit_irq_test():
     """Async-IRQ-to-guest gate (CFG2[38]): a pending machine interrupt must be delivered
     to a PVM guest that spins with interrupts enabled -- WITHOUT the inject the guest loops
@@ -1542,6 +1595,12 @@ def main():
         code, starts = emit_csr_test()
     elif mode == "csri":
         code, starts = emit_csri_test()
+    elif mode == "sextbr0":
+        code, starts = emit_sextbr_test(0)
+    elif mode == "sextbr1":
+        code, starts = emit_sextbr_test(1)
+    elif mode == "sext":
+        code, starts = emit_sext_test()
     elif mode == "rotimm":
         code, starts = emit_rotimm_test()
     elif mode == "irq":
