@@ -19,6 +19,7 @@ kval() { "$P" emit-image -o "$OUT/k.pvmi" "$OUT/vmlinux_b2.polkavm" >/dev/null 2
          python3 -c "import struct;b=open('$OUT/k.pvmi','rb').read();w=struct.unpack_from('<16I',b,0);print(w[8]//w[9])"; }
 SPEC=$OUT/initramfs_spec_$PROG.txt
 { printf 'dir /dev 0755 0 0\nnod /dev/console 0600 0 0 c 5 1\nfile /init %s/%s.pvmi 0755 0 0\n' "$PWD" "$PROG"
+  printf 'dir /etc 0755 0 0\nfile /etc/motd %s/motd.txt 0644 0 0\ndir /tmp 1777 0 0\n' "$PWD"   # B4.1: real files for ls/cat
   i=2; for e in "${EXTRA[@]}"; do printf 'file /prog%d %s/%s.pvmi 0755 0 0\n' "$i" "$PWD" "$e"; i=$((i+1)); done; } > "$SPEC"
 SB=$((MB)); for e in "$PROG" "${EXTRA[@]}"; do case "$e" in *_musl) B=./build_musl_user.sh;; *) B=./build_user.sh;; esac; [ -f "$e.pvmi" ] || $B "$e" $(printf 0x%x $SB) 0 >/dev/null; SB=$((SB+SLOT_SIZE)); done   # placeholders for pass 1
 bash ./build_b2.sh "$SPEC" >/dev/null; grep -q "LINK_RC=0" $OUT/build_b2.log || { echo "kernel build 1 failed (see $OUT/build_b2.log)"; exit 1; }
