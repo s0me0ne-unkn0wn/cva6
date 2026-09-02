@@ -1,0 +1,109 @@
+Hello World!
+Entering PolkaVM...
+[#]
+LP[    0.000000] Linux version 6.19.6 (claude@ws1) (riscv64-buildroot-linux-gnu-gcc.br_real (Buildroot 2026.02-1-g8e05aca177) 14.3.0, GNU ld (GNU Binutils) 2.44) #152 Wed Sep  2 02:22:43 CEST 2026
+[    0.000000] Machine model: eth,cva6-bare
+[    0.000000] earlycon: ns16550 at MMIO32 0x0000000010000000 (options '115200')
+[    0.000000] printk: legacy bootconsole [ns16550] enabled
+[    0.000000] OF: reserved mem: 0x0000000000700000..0x00000000007fffff (1024 KiB) nomap non-reusable pvm_user_data@700000
+[    0.000000] Zone ranges:
+[    0.000000]   DMA32    [mem 0x0000000000010000-0x000000000080ffff]
+[    0.000000]   Normal   empty
+[    0.000000] Movable zone start for each node
+[    0.000000] Early memory node ranges
+[    0.000000]   node   0: [mem 0x0000000000010000-0x00000000006fffff]
+[    0.000000]   node   0: [mem 0x0000000000700000-0x00000000007fffff]
+[    0.000000]   node   0: [mem 0x0000000000800000-0x000000000080ffff]
+[    0.000000] Initmem setup node 0 [mem 0x0000000000010000-0x000000000080ffff]
+[    0.000000] On node 0, zone DMA32: 16 pages in unavailable ranges
+[    0.000000] On node 0, zone DMA32: 1008 pages in unavailable ranges
+[    0.000000] Failed to add a Kernel rodata resource at 10000
+[    0.000000] riscv: base ISA extensions acm
+[    0.000000] riscv: ELF capabilities acm
+[    0.000000] Ticket spinlock: enabled
+[    0.000000] Kernel command line: earlycon console=ttyS0,115200n8 unaligned_scalar_speed=slow
+[    0.000000] printk: log buffer data + meta data: 131072 + 458752 = 589824 bytes
+[    0.000000] Dentry cache hash table entries: 1024 (order: 1, 8192 bytes, linear)
+[    0.000000] Inode-cache hash table entries: 512 (order: 0, 4096 bytes, linear)
+[    0.000000] Built 1 zonelists, mobility grouping off.  Total pages: 2048
+[    0.000000] mem auto-init: stack:all(zero), heap alloc:off, heap free:off
+[    0.000000] SLUB: HWalign=64, Order=0-3, MinObjects=0, CPUs=1, Nodes=1
+[    0.000000] NR_IRQS: 64, nr_irqs: 64, preallocated irqs: 0
+[    0.000000] riscv-intc: 64 local interrupts mapped
+[    0.000000] clint: clint@2000000: timer running at 25000000 Hz
+[    0.000000] clocksource: clint_clocksource: mask: 0xffffffffffffffff max_cycles: 0x5c40939b5, max_idle_ns: 440795202646 ns
+[    0.000146] sched_clock: 64 bits at 25MHz, resolution 40ns, wraps every 4398046511100ns
+[    0.048469] Console: colour dummy device 80x25
+[    0.064881] Calibrating delay loop (skipped), value calculated using timer frequency.. 50.00 BogoMIPS (lpj=250000)
+[    0.085908] pid_max: default: 32768 minimum: 301
+[    0.121183] Mount-cache hash table entries: 512 (order: 0, 4096 bytes, linear)
+[    0.138021] Mountpoint-cache hash table entries: 512 (order: 0, 4096 bytes, linear)
+[    0.472258] Memory: 4712K/8192K available (75K kernel code, 994K rwdata, 594K rodata, 18014398509481978K init, 194K bss, 3056K reserved, 0K cma-reserved)
+[    0.550575] devtmpfs: initialized
+[    0.882072] clocksource: jiffies: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 19112604462750000 ns
+[    0.905994] posixtimers hash table entries: 512 (order: 0, 4096 bytes, linear)
+[    0.924749] futex hash table entries: 256 (8192 bytes on 1 NUMA nodes, total 8 KiB, linear).
+[    1.081368] scalar unaligned access speed set to 'slow' (2) by command line
+[    1.464164] pps_core: LinuxPPS API ver. 1 registered
+[    1.476525] pps_core: Software ver. 5.3.6 - Copyright 2005-2007 Rodolfo Giometti <giometti@linux.it>
+[    1.521650] clocksource: Switched to clocksource clint_clocksource
+[    4.769656] workingset: timestamp_bits=62 max_order=11 bucket_order=0
+[    4.818638] io scheduler mq-deadline registered
+[    4.830731] io scheduler kyber registered
+[   26.730786] Serial: 8250/16550 driver, 4 ports, IRQ sharing disabled
+[   27.246995] of_serial 10000000.uart: error -ENXIO: IRQ index 0 not found
+[   27.365891] printk: legacy console [ttyS0] disabled
+[   27.509964] 10000000.uart: ttyS0 at MMIO 0x10000000 (irq = 0, base_baud = 3125000) is a TI16750
+[   27.538356] printk: legacy console [ttyS0] enabled
+[   27.538356] printk: legacy console [ttyS0] enabled
+[   27.559460] printk: legacy bootconsole [ns16550] disabled
+[   27.559460] printk: legacy bootconsole [ns16550] disabled
+[   30.108935] clk: Disabling unused clocks
+[   30.176955] This architecture does not have kernel memory protection.
+[   30.190669] Run /init as init process
+G[   30.345273] binfmt_pvm: exec '/init' -> code @80820000+19864 (BASE 205220, code_len 1882797->2138040), data ro 700000+3720 rw 720000+1872, jt +1555@41509, argc 1 envc 2, entry PVM-pc 0x205436 sp 0x4faf40
+B4 busybox launcher: start
+G[   30.869981] binfmt_pvm: exec '/prog2' -> code @80820000+110771 (BASE 24b3d0, code_len 2138040->2516099), data ro 740000+22088 rw 760000+5880, jt +9711@43064, argc 3 envc 2, entry PVM-pc 0x24b401 sp 0x532f20
+Linux ariane-fpga 6.19.6 #152 Wed Sep  2 02:22:43 CEST 2026 riscv64
+B4 launcher: busybox uname -> exit 0
+G[   31.427339] binfmt_pvm: exec '/prog2' -> code @80820000+110771 (BASE 2b3140, code_len 2516099->2941427), data ro 740000+22088 rw 760000+5880, jt +9711@43064, argc 4 envc 2, entry PVM-pc 0x2b3171 sp 0x532f20
+drwxr-xr-x    2         0 dev
+-rwxr-xr-x    1     29606 init
+drwxr-xr-x    2         0 etc
+drwxrwxrwt    2         0 tmp
+-rwxr-xr-x    1    176765 prog2
+-rwxr-xr-x    1    176765 prog3
+drwxr-xr-x    5         0 ..
+drwxr-xr-x    5         0 .
+B4 launcher: busybox ls -> exit 0
+G[   32.093863] binfmt_pvm: exec '/prog2' -> code @80820000+110771 (BASE 209fc0, code_len 2941427->2248819), data ro 740000+22088 rw 760000+5880, jt +9711@43064, argc 3 envc 2, entry PVM-pc 0x209ff1 sp 0x526f20
+   ___ _   _____  ___    _   ___   ____  __
+  / __| | / / _ |/ _ \  | | / / |__/ /  |/  /
+ / /__| |/ / __ / // /  | |/ /| /|_/ / /|_/ /
+ \____/___/_/ |_\____/  |___/ |_|  /_/  /_/
+ CVA6 executing PolkaVM bytecode natively.
+ This file came from the initramfs (B4.1).
+B4 launcher: busybox cat -> exit 0
+B4 rx: type a line!
+hello-pvm-console
+B4 rx: got "hello-pvm-console" (17 bytes)
+B4: starting interactive hush
+G[   33.801906] binfmt_pvm: exec '/prog2' -> code @80820000+110771 (BASE 269aa0, code_len 2248819->2640723), data ro 740000+22088 rw 760000+5880, jt +9711@43064, argc 2 envc 2, entry PVM-pc 0x269ad1 sp 0x51af30
+
+
+BusyBox v1.37.0 (2026-09-02 01:47:51 CEST) hush - the humble shell
+
+/ # uname -m
+riscv64
+/ # echo guest math: $((6*7))
+guest math: 42
+/ # cat /etc/motd
+G[   48.084745] binfmt_pvm: exec '/prog3' -> code @80820000+110771 (BASE 2d54e0, code_len 2640723->3081619), data ro 780000+22088 rw 7a0000+5880, jt +9711@52775, argc 2 envc 4, entry PVM-pc 0x2d5511 sp 0x542f00
+   ___ _   _____  ___    _   ___   ____  __
+  / __| | / / _ |/ _ \  | | / / |__/ /  |/  /
+ / /__| |/ / __ / // /  | |/ /| /|_/ / /|_/ /
+ \____/___/_/ |_\____/  |___/ |_|  /_/  /_/
+ CVA6 executing PolkaVM bytecode natively.
+ This file came from the initramfs (B4.1).
+ls /etc | wc -l
+exit

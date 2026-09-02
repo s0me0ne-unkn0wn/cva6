@@ -12,6 +12,7 @@ sleep 6
 snd "uname -m"
 sleep 3; snd 'echo guest math: $((6*7))'
 sleep 3; snd "cat /etc/motd"
-sleep 4; snd "exit"
+sleep 5; snd "ls /etc | wc -l"
+sleep 5; snd "exit"
 wait_for "launcher: done"
 echo "FEED done"
